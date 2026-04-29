@@ -1,0 +1,6469 @@
+import sqlite3
+from datetime import date, datetime, timedelta
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit.components.v1 as components
+
+DB = "controle_viagens.db"
+
+# =========================================================
+# 1. INICIALIZAÇÃO DO ESTADO DE SIMULAÇÃO (NOVO)
+# =========================================================
+if 'simulacao_ativa' not in st.session_state:
+    st.session_state.simulacao_ativa = False
+if 'p_simulado' not in st.session_state:
+    st.session_state.p_simulado = {}
+
+# =========================
+# 2. FUNÇÕES DE APOIO
+# =========================
+def format_br(valor, prefixo="", casas_decimais=2):
+    if valor is None or valor == "": return ""
+    try:
+        if casas_decimais == 0: return f"{int(float(valor)):,}".replace(",", ".")
+        s = f"{float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"{prefixo}{s}"
+    except: return valor
+
+def brl(valor): return format_br(valor, "R$ ")
+
+def alerta_gravado():
+    st.success("✅ Gravado com sucesso!")
+
+def format_pct(valor, casas_decimais=2):
+    try:
+        s = f"{float(valor):.{casas_decimais}f}".replace(".", ",")
+        s = s.rstrip("0").rstrip(",")
+        return f"{s}%"
+    except:
+        return f"{valor}%"
+
+def normalizar_tipo_combustivel(valor):
+    txt = str(valor or "").upper().strip()
+    if not txt:
+        return ""
+    return " ".join(txt.split())
+
+def conn():
+    c = sqlite3.connect(DB, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
+
+# =========================
+# 3. INICIALIZAÇÃO DO BANCO E PARÂMETROS
+# =========================
+def init_db():
+    with conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS parametros (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            consumo REAL DEFAULT 2.5, manut REAL DEFAULT 0.25, 
+            pneu REAL DEFAULT 0.12, depre REAL DEFAULT 0.30, 
+            motora_fixo REAL DEFAULT 2500.0, motora_pct REAL DEFAULT 10.0,
+            seguro REAL DEFAULT 2750.0, financiamento REAL DEFAULT 0.0, pagto_ipva REAL DEFAULT 0.0,
+            meta_faturamento REAL DEFAULT 50000.0,
+            valor_frete_mensal_fixo REAL DEFAULT 0.0,
+            qtde_pneu REAL DEFAULT 1.0,
+            vl_gasto_pneu_km REAL DEFAULT 0.12,
+            data_filtro_ini TEXT DEFAULT '2026-01-01',
+            data_filtro_fim TEXT DEFAULT '2026-12-31',
+            cmp_valor_litro_diesel REAL DEFAULT 0.0,
+            cmp_consumo_001 REAL DEFAULT 2.5,
+            cmp_consumo_002 REAL DEFAULT 2.5,
+            cmp_consumo_003 REAL DEFAULT 2.5,
+            cmp_custo_escritorio REAL DEFAULT 0.0,
+            imposto_pct REAL DEFAULT 0.0)""")
+        c.execute("INSERT OR IGNORE INTO parametros (id) VALUES (1)")
+        # ... (restante das suas tabelas como veiculos, viagens, etc)
+        c.execute("CREATE TABLE IF NOT EXISTS veiculos (id INTEGER PRIMARY KEY AUTOINCREMENT, descricao TEXT, modelo TEXT, ano TEXT, cor TEXT, placa TEXT UNIQUE, renavan TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS viagens (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, cliente TEXT, origem TEXT, destino TEXT, km REAL, toneladas REAL, valor_ton REAL, pedagio REAL, gasto_extra REAL DEFAULT 0.0, pagto_estadia REAL DEFAULT 0.0, descricao_gasto_extra TEXT, diesel REAL, consumo REAL, arla REAL DEFAULT 0.0, consumo_arla REAL DEFAULT 0.0, obs TEXT, nf TEXT, veiculo_placa TEXT, qtd_viagens INTEGER DEFAULT 1)")
+        c.execute("CREATE TABLE IF NOT EXISTS cidades (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT UNIQUE)")
+        c.execute("CREATE TABLE IF NOT EXISTS rotas (id INTEGER PRIMARY KEY AUTOINCREMENT, origem TEXT, destino TEXT, nome_empresa_origem TEXT, nome_empresa_destino TEXT, km REAL, valor_ton REAL DEFAULT 0.0, valor_km REAL DEFAULT 0.0, UNIQUE(origem, destino))")
+        c.execute("CREATE TABLE IF NOT EXISTS abastecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, local TEXT, doc_nf TEXT, km_inicial REAL, tipo_combustivel TEXT, qtde_litros REAL, valor_unit REAL, total_gasto REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS oficinas (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, cnpj TEXT, endereco TEXT, bairro TEXT, cidade TEXT, responsavel TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS fornecedores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codigo TEXT UNIQUE,
+            nome TEXT,
+            cnpj TEXT,
+            insc_est TEXT,
+            endereco TEXT,
+            cidade TEXT,
+            bairro TEXT,
+            cep TEXT,
+            telefone TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS obrigacoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descricao_obrigacao TEXT UNIQUE
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS contas_pagar (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fornecedor_id INTEGER,
+            n_nf TEXT,
+            data_entrada TEXT,
+            valor_total_nf REAL,
+            obrigacao_id INTEGER,
+            dados_nf TEXT,
+            quantidade_parcelas INTEGER,
+            vencimentos_parcelas TEXT,
+            valor_parcela REAL,
+            tipo_lancamento TEXT DEFAULT 'NAO_MENSAL',
+            dia_vencimento_mensal INTEGER,
+            data_vencimento_base TEXT,
+            parcelas_pagas TEXT,
+            dias_alerta INTEGER DEFAULT 7
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS me_lembra (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data_ativacao TEXT,
+            data_vencimento TEXT,
+            descricao TEXT,
+            descricao_veiculo TEXT,
+            frota TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS me_lembra_descricoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descricao TEXT UNIQUE,
+            frota TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS me_lembra_frotas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frota TEXT UNIQUE
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS controle_trocas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo_servico TEXT,
+            data_servico TEXT,
+            veiculo_placa TEXT,
+            km_atual REAL,
+            km_proxima REAL,
+            detalhes TEXT,
+            data_vencimento TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS parametros_historico (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vigencia_data TEXT UNIQUE,
+            consumo REAL,
+            manut REAL,
+            pneu REAL,
+            depre REAL,
+            motora_fixo REAL,
+            motora_pct REAL,
+            seguro REAL,
+            financiamento REAL,
+            pagto_ipva REAL,
+            cmp_custo_escritorio REAL,
+            imposto_pct REAL,
+            valor_frete_mensal_fixo REAL,
+            qtde_pneu REAL,
+            vl_gasto_pneu_km REAL
+        )""")
+        
+        c.execute("""CREATE TABLE IF NOT EXISTS manutencoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            data_entrada TEXT, data_fim TEXT, veiculo_placa TEXT, 
+            oficina_id INTEGER, defeito TEXT, servico TEXT, 
+            valor_mo REAL, valor_pecas REAL, garantia TEXT, 
+            km_servico REAL, mecanico TEXT, obs TEXT)""")
+
+        # Atualização de colunas (PRAGMA)
+        cursor = c.execute("PRAGMA table_info(manutencoes)")
+        colunas_existentes = [coluna[1] for coluna in cursor.fetchall()]
+        novas_colunas = {'num_os': 'TEXT', 'num_nf': 'TEXT', 'data_vencimento_garantia': 'TEXT', 'observacao_adicional': 'TEXT'}
+        for col, tipo in novas_colunas.items():
+            if col not in colunas_existentes:
+                c.execute(f"ALTER TABLE manutencoes ADD COLUMN {col} {tipo}")
+
+        cursor_ml = c.execute("PRAGMA table_info(me_lembra)")
+        colunas_ml = [coluna[1] for coluna in cursor_ml.fetchall()]
+        if "descricao_veiculo" not in colunas_ml:
+            c.execute("ALTER TABLE me_lembra ADD COLUMN descricao_veiculo TEXT")
+        if "frota" not in colunas_ml:
+            c.execute("ALTER TABLE me_lembra ADD COLUMN frota TEXT")
+
+        cursor_mld = c.execute("PRAGMA table_info(me_lembra_descricoes)")
+        colunas_mld = [coluna[1] for coluna in cursor_mld.fetchall()]
+        if "frota" not in colunas_mld:
+            c.execute("ALTER TABLE me_lembra_descricoes ADD COLUMN frota TEXT")
+
+        cursor_cp = c.execute("PRAGMA table_info(contas_pagar)")
+        colunas_cp = [coluna[1] for coluna in cursor_cp.fetchall()]
+        if "tipo_lancamento" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN tipo_lancamento TEXT DEFAULT 'NAO_MENSAL'")
+        if "dia_vencimento_mensal" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN dia_vencimento_mensal INTEGER")
+        if "data_vencimento_base" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN data_vencimento_base TEXT")
+        if "parcelas_pagas" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN parcelas_pagas TEXT")
+        if "dias_alerta" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN dias_alerta INTEGER DEFAULT 7")
+
+        cursor_viagens = c.execute("PRAGMA table_info(viagens)")
+        colunas_viagens = [coluna[1] for coluna in cursor_viagens.fetchall()]
+        novas_colunas_viagens = {
+            "arla": "REAL DEFAULT 0.0",
+            "consumo_arla": "REAL DEFAULT 0.0",
+            "pagto_estadia": "REAL DEFAULT 0.0",
+        }
+        for col, tipo in novas_colunas_viagens.items():
+            if col not in colunas_viagens:
+                c.execute(f"ALTER TABLE viagens ADD COLUMN {col} {tipo}")
+
+        cursor_param = c.execute("PRAGMA table_info(parametros)")
+        colunas_param = [coluna[1] for coluna in cursor_param.fetchall()]
+        if "qtde_pneu" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN qtde_pneu REAL DEFAULT 1.0")
+        if "vl_gasto_pneu_km" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN vl_gasto_pneu_km REAL DEFAULT 0.12")
+        if "cmp_valor_litro_diesel" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_valor_litro_diesel REAL DEFAULT 0.0")
+        if "cmp_consumo_001" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_consumo_001 REAL DEFAULT 2.5")
+        if "cmp_consumo_002" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_consumo_002 REAL DEFAULT 2.5")
+        if "cmp_consumo_003" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_consumo_003 REAL DEFAULT 2.5")
+        if "cmp_custo_escritorio" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_custo_escritorio REAL DEFAULT 0.0")
+        if "pagto_ipva" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN pagto_ipva REAL DEFAULT 0.0")
+        if "imposto_pct" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN imposto_pct REAL DEFAULT 0.0")
+        if "valor_frete_mensal_fixo" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN valor_frete_mensal_fixo REAL DEFAULT 0.0")
+        cursor_param_hist = c.execute("PRAGMA table_info(parametros_historico)")
+        colunas_param_hist = [coluna[1] for coluna in cursor_param_hist.fetchall()]
+        if "qtde_pneu" not in colunas_param_hist:
+            c.execute("ALTER TABLE parametros_historico ADD COLUMN qtde_pneu REAL")
+        if "vl_gasto_pneu_km" not in colunas_param_hist:
+            c.execute("ALTER TABLE parametros_historico ADD COLUMN vl_gasto_pneu_km REAL")
+        total_hist = c.execute("SELECT COUNT(*) FROM parametros_historico").fetchone()[0]
+        if int(total_hist or 0) == 0:
+            c.execute(
+                """INSERT INTO parametros_historico (
+                       vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                       seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                       qtde_pneu, vl_gasto_pneu_km
+                   )
+                   SELECT '1900-01-01', consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                          seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                          qtde_pneu, vl_gasto_pneu_km
+                   FROM parametros
+                   WHERE id=1"""
+            )
+
+init_db()
+
+# =========================================================
+# 4. DEFINIÇÃO DA VARIÁVEL MESTRE 'p' (LÓGICA DA SIMULAÇÃO)
+# =========================================================
+with conn() as c:
+    p_row = c.execute("SELECT * FROM parametros WHERE id=1").fetchone()
+    p_real = dict(p_row) if p_row else {}
+
+# Se a simulação estiver ativa e houver dados salvos na memória:
+if st.session_state.simulacao_ativa and st.session_state.p_simulado:
+    p = st.session_state.p_simulado
+    st.sidebar.warning("⚠️ MODO SIMULAÇÃO ATIVO")
+else:
+    p = p_real
+
+# Agora as variáveis abaixo já usam o 'p' correto (Real ou Simulado)
+data_ini_carregar = datetime.strptime(p.get('data_filtro_ini', '2026-01-01'), '%Y-%m-%d').date()
+data_fim_carregar = datetime.strptime(p.get('data_filtro_fim', '2026-12-31'), '%Y-%m-%d').date()
+
+# ... (restante do código: st.set_page_config, listas de cidades, abas, etc)
+
+
+
+
+
+
+import sqlite3
+from datetime import date, datetime, timedelta
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit.components.v1 as components
+
+DB = "controle_viagens.db"
+
+# =========================
+# 1. FUNÇÕES DE APOIO
+# =========================
+def format_br(valor, prefixo="", casas_decimais=2):
+    if valor is None or valor == "": return ""
+    try:
+        if casas_decimais == 0: return f"{int(float(valor)):,}".replace(",", ".")
+        s = f"{float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"{prefixo}{s}"
+    except: return valor
+
+def brl(valor): return format_br(valor, "R$ ")
+
+def conn():
+    c = sqlite3.connect(DB, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
+
+# =========================
+# 2. INICIALIZAÇÃO DO BANCO
+# =========================
+# --- INÍCIO DO BLOCO INIT_DB ---
+
+if 'simulacao_ativa' not in st.session_state:
+    st.session_state.simulacao_ativa = False
+if 'p_simulado' not in st.session_state:
+    st.session_state.p_simulado = {}
+
+
+def init_db():
+    with conn() as c:
+        # 1. Criação das tabelas base (se não existirem)
+        c.execute("""CREATE TABLE IF NOT EXISTS parametros (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            consumo REAL DEFAULT 2.5, manut REAL DEFAULT 0.25, 
+            pneu REAL DEFAULT 0.12, depre REAL DEFAULT 0.30, 
+            motora_fixo REAL DEFAULT 2500.0, motora_pct REAL DEFAULT 10.0,
+            seguro REAL DEFAULT 2750.0, financiamento REAL DEFAULT 0.0, pagto_ipva REAL DEFAULT 0.0,
+            meta_faturamento REAL DEFAULT 50000.0,
+            valor_frete_mensal_fixo REAL DEFAULT 0.0,
+            qtde_pneu REAL DEFAULT 1.0,
+            vl_gasto_pneu_km REAL DEFAULT 0.12,
+            data_filtro_ini TEXT DEFAULT '2026-01-01',
+            data_filtro_fim TEXT DEFAULT '2026-12-31',
+            cmp_valor_litro_diesel REAL DEFAULT 0.0,
+            cmp_consumo_001 REAL DEFAULT 2.5,
+            cmp_consumo_002 REAL DEFAULT 2.5,
+            cmp_consumo_003 REAL DEFAULT 2.5,
+            cmp_custo_escritorio REAL DEFAULT 0.0,
+            imposto_pct REAL DEFAULT 0.0)""")
+        
+        c.execute("INSERT OR IGNORE INTO parametros (id) VALUES (1)")
+        c.execute("CREATE TABLE IF NOT EXISTS veiculos (id INTEGER PRIMARY KEY AUTOINCREMENT, descricao TEXT, modelo TEXT, ano TEXT, cor TEXT, placa TEXT UNIQUE, renavan TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS viagens (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, cliente TEXT, origem TEXT, destino TEXT, km REAL, toneladas REAL, valor_ton REAL, valor_km REAL DEFAULT 0.0, tipo_cobranca TEXT DEFAULT 'TONELADA', pedagio REAL, gasto_extra REAL DEFAULT 0.0, pagto_estadia REAL DEFAULT 0.0, descricao_gasto_extra TEXT, diesel REAL, consumo REAL, arla REAL DEFAULT 0.0, consumo_arla REAL DEFAULT 0.0, obs TEXT, nf TEXT, veiculo_placa TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS cidades (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT UNIQUE)")
+        c.execute("CREATE TABLE IF NOT EXISTS rotas (id INTEGER PRIMARY KEY AUTOINCREMENT, origem TEXT, destino TEXT, nome_empresa_origem TEXT, nome_empresa_destino TEXT, km REAL, valor_ton REAL DEFAULT 0.0, UNIQUE(origem, destino))")
+        c.execute("CREATE TABLE IF NOT EXISTS abastecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, local TEXT, doc_nf TEXT, km_inicial REAL, tipo_combustivel TEXT, qtde_litros REAL, valor_unit REAL, total_gasto REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS oficinas (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, cnpj TEXT, endereco TEXT, bairro TEXT, cidade TEXT, responsavel TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS fornecedores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codigo TEXT UNIQUE,
+            nome TEXT,
+            cnpj TEXT,
+            insc_est TEXT,
+            endereco TEXT,
+            cidade TEXT,
+            bairro TEXT,
+            cep TEXT,
+            telefone TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS obrigacoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descricao_obrigacao TEXT UNIQUE
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS contas_pagar (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fornecedor_id INTEGER,
+            n_nf TEXT,
+            data_entrada TEXT,
+            valor_total_nf REAL,
+            obrigacao_id INTEGER,
+            dados_nf TEXT,
+            quantidade_parcelas INTEGER,
+            vencimentos_parcelas TEXT,
+            valor_parcela REAL,
+            tipo_lancamento TEXT DEFAULT 'NAO_MENSAL',
+            dia_vencimento_mensal INTEGER,
+            data_vencimento_base TEXT,
+            parcelas_pagas TEXT,
+            dias_alerta INTEGER DEFAULT 7
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS me_lembra (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data_ativacao TEXT,
+            data_vencimento TEXT,
+            descricao TEXT,
+            descricao_veiculo TEXT,
+            frota TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS me_lembra_descricoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descricao TEXT UNIQUE,
+            frota TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS me_lembra_frotas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frota TEXT UNIQUE
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS controle_trocas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo_servico TEXT,
+            data_servico TEXT,
+            veiculo_placa TEXT,
+            km_atual REAL,
+            km_proxima REAL,
+            detalhes TEXT,
+            data_vencimento TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS parametros_historico (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vigencia_data TEXT UNIQUE,
+            consumo REAL,
+            manut REAL,
+            pneu REAL,
+            depre REAL,
+            motora_fixo REAL,
+            motora_pct REAL,
+            seguro REAL,
+            financiamento REAL,
+            pagto_ipva REAL,
+            cmp_custo_escritorio REAL,
+            imposto_pct REAL,
+            valor_frete_mensal_fixo REAL,
+            qtde_pneu REAL,
+            vl_gasto_pneu_km REAL
+        )""")
+        
+        # Tabela de Manutenção
+        c.execute("""CREATE TABLE IF NOT EXISTS manutencoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            data_entrada TEXT, data_fim TEXT, veiculo_placa TEXT, 
+            oficina_id INTEGER, defeito TEXT, servico TEXT, 
+            valor_mo REAL, valor_pecas REAL, garantia TEXT, 
+            km_servico REAL, mecanico TEXT, obs TEXT)""")
+# --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS MANUTENÇÃO ---
+        cursor = c.execute("PRAGMA table_info(manutencoes)")
+        colunas_existentes = [coluna[1] for coluna in cursor.fetchall()]
+        
+        novas_colunas = {
+            'num_os': 'TEXT',
+            'num_nf': 'TEXT',
+            'data_vencimento_garantia': 'TEXT',
+            'observacao_adicional': 'TEXT'
+        }
+
+        for col, tipo in novas_colunas.items():
+            if col not in colunas_existentes:
+                c.execute(f"ALTER TABLE manutencoes ADD COLUMN {col} {tipo}")
+
+        # --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS DE VIAGENS ---
+        cursor_viagens = c.execute("PRAGMA table_info(viagens)")
+        colunas_viagens = [coluna[1] for coluna in cursor_viagens.fetchall()]
+        novas_colunas_viagens = {
+            "qtd_viagens": "INTEGER DEFAULT 1",
+            "valor_km": "REAL DEFAULT 0.0",
+            "tipo_cobranca": "TEXT DEFAULT 'TONELADA'",
+            "gasto_extra": "REAL DEFAULT 0.0",
+            "pagto_estadia": "REAL DEFAULT 0.0",
+            "descricao_gasto_extra": "TEXT",
+            "arla": "REAL DEFAULT 0.0",
+            "consumo_arla": "REAL DEFAULT 0.0",
+        }
+        for col, tipo in novas_colunas_viagens.items():
+            if col not in colunas_viagens:
+                c.execute(f"ALTER TABLE viagens ADD COLUMN {col} {tipo}")
+
+        # --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS DE ROTAS ---
+        cursor_rotas = c.execute("PRAGMA table_info(rotas)")
+        colunas_rotas = [coluna[1] for coluna in cursor_rotas.fetchall()]
+        if "valor_km" not in colunas_rotas:
+            c.execute("ALTER TABLE rotas ADD COLUMN valor_km REAL DEFAULT 0.0")
+        if "nome_empresa_origem" not in colunas_rotas:
+            c.execute("ALTER TABLE rotas ADD COLUMN nome_empresa_origem TEXT")
+        if "nome_empresa_destino" not in colunas_rotas:
+            c.execute("ALTER TABLE rotas ADD COLUMN nome_empresa_destino TEXT")
+
+        # --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS DE ME LEMBRA ---
+        cursor_ml = c.execute("PRAGMA table_info(me_lembra)")
+        colunas_ml = [coluna[1] for coluna in cursor_ml.fetchall()]
+        if "descricao_veiculo" not in colunas_ml:
+            c.execute("ALTER TABLE me_lembra ADD COLUMN descricao_veiculo TEXT")
+        if "frota" not in colunas_ml:
+            c.execute("ALTER TABLE me_lembra ADD COLUMN frota TEXT")
+
+        cursor_mld = c.execute("PRAGMA table_info(me_lembra_descricoes)")
+        colunas_mld = [coluna[1] for coluna in cursor_mld.fetchall()]
+        if "frota" not in colunas_mld:
+            c.execute("ALTER TABLE me_lembra_descricoes ADD COLUMN frota TEXT")
+
+        cursor_cp = c.execute("PRAGMA table_info(contas_pagar)")
+        colunas_cp = [coluna[1] for coluna in cursor_cp.fetchall()]
+        if "tipo_lancamento" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN tipo_lancamento TEXT DEFAULT 'NAO_MENSAL'")
+        if "dia_vencimento_mensal" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN dia_vencimento_mensal INTEGER")
+        if "data_vencimento_base" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN data_vencimento_base TEXT")
+        if "parcelas_pagas" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN parcelas_pagas TEXT")
+        if "dias_alerta" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN dias_alerta INTEGER DEFAULT 7")
+
+        # --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS DE PARÂMETROS ---
+        cursor_param = c.execute("PRAGMA table_info(parametros)")
+        colunas_param = [coluna[1] for coluna in cursor_param.fetchall()]
+        if "qtde_pneu" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN qtde_pneu REAL DEFAULT 1.0")
+        if "vl_gasto_pneu_km" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN vl_gasto_pneu_km REAL DEFAULT 0.12")
+        if "cmp_valor_litro_diesel" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_valor_litro_diesel REAL DEFAULT 0.0")
+        if "cmp_consumo_001" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_consumo_001 REAL DEFAULT 2.5")
+        if "cmp_consumo_002" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_consumo_002 REAL DEFAULT 2.5")
+        if "cmp_consumo_003" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_consumo_003 REAL DEFAULT 2.5")
+        if "cmp_custo_escritorio" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN cmp_custo_escritorio REAL DEFAULT 0.0")
+        if "pagto_ipva" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN pagto_ipva REAL DEFAULT 0.0")
+        if "imposto_pct" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN imposto_pct REAL DEFAULT 0.0")
+        if "valor_frete_mensal_fixo" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN valor_frete_mensal_fixo REAL DEFAULT 0.0")
+
+
+# Executa a função para garantir que o banco está atualizado
+init_db()
+# --- FIM DO BLOCO INIT_DB ---
+
+# =========================
+# 3. LEITURA DE PARÂMETROS E VARIAVEIS GLOBAIS
+# =========================
+with conn() as c:
+    p_row = c.execute("SELECT * FROM parametros WHERE id=1").fetchone()
+    p_real = dict(p_row) if p_row else {}
+    if st.session_state.simulacao_ativa:
+        if not st.session_state.p_simulado:
+            st.session_state.p_simulado = p_real.copy()
+        # Merge garante fallback para campos novos que ainda não existam na simulação.
+        p = {**p_real, **st.session_state.p_simulado}
+    else:
+        p = p_real
+    
+    data_ini_carregar = datetime.strptime(p.get('data_filtro_ini', '2026-01-01'), '%Y-%m-%d').date()
+    data_fim_carregar = datetime.strptime(p.get('data_filtro_fim', '2026-12-31'), '%Y-%m-%d').date()
+
+    lista_cidades = [cid['nome'] for cid in c.execute("SELECT nome FROM cidades ORDER BY nome ASC").fetchall()]
+    veiculos_db = c.execute("SELECT placa, descricao FROM veiculos ORDER BY descricao ASC").fetchall()
+    apenas_placas = [v['placa'] for v in veiculos_db]
+    lista_veiculos_full = [f"{v['placa']} - {v['descricao']}" for v in veiculos_db]
+    
+    oficinas_db = c.execute("SELECT id, nome FROM oficinas ORDER BY nome ASC").fetchall()
+    dict_oficinas = {o['nome']: o['id'] for o in oficinas_db}
+    fornecedores_db = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
+    obrigacoes_db = c.execute("SELECT id, descricao_obrigacao FROM obrigacoes ORDER BY descricao_obrigacao ASC").fetchall()
+    
+    last_v = c.execute("SELECT diesel, consumo, arla, consumo_arla FROM viagens ORDER BY id DESC LIMIT 1").fetchone()
+    diesel_param = float(p.get("cmp_valor_litro_diesel", 0.0))
+    consumo_param = float(p.get("consumo", 2.5))
+    v_diesel_sug = diesel_param if diesel_param > 0 else (float(last_v['diesel']) if last_v else 6.00)
+    v_cons_sug = consumo_param if consumo_param > 0 else (float(last_v['consumo']) if last_v else 2.5)
+    v_arla_sug = float(last_v['arla']) if last_v else 0.0
+    v_cons_arla_sug = float(last_v['consumo_arla']) if last_v else 0.0
+
+# INTERFACE
+st.set_page_config(page_title="Controle ART Amaral Rota Transportes", layout="wide", page_icon="🚛")
+st.title("🚛 Gestão ART Amaral Rota Transportes")
+
+c_f1, c_f2 = st.columns(2)
+if "filtro_ini_top" not in st.session_state:
+    st.session_state.filtro_ini_top = data_ini_carregar
+if "filtro_fim_top" not in st.session_state:
+    st.session_state.filtro_fim_top = data_fim_carregar
+
+c_f1.date_input("Início", format="DD/MM/YYYY", key="filtro_ini_top")
+c_f2.date_input("Fim", format="DD/MM/YYYY", key="filtro_fim_top")
+filtro_ini = st.session_state.filtro_ini_top
+filtro_fim = st.session_state.filtro_fim_top
+
+def fator_rateio_mensal_por_periodo(data_inicio, data_fim):
+    if data_inicio is None or data_fim is None or data_fim < data_inicio:
+        return 0.0
+    return ((data_fim - data_inicio).days + 1) / 30.0
+
+PARAM_CAMPOS_HIST = [
+    "consumo",
+    "manut",
+    "pneu",
+    "depre",
+    "motora_fixo",
+    "motora_pct",
+    "seguro",
+    "financiamento",
+    "pagto_ipva",
+    "cmp_custo_escritorio",
+    "imposto_pct",
+    "valor_frete_mensal_fixo",
+    "qtde_pneu",
+    "vl_gasto_pneu_km",
+]
+
+
+def carregar_historico_parametros():
+    with conn() as c:
+        df_hist = pd.read_sql(
+            """SELECT vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                      seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                      qtde_pneu, vl_gasto_pneu_km
+               FROM parametros_historico
+               ORDER BY date(vigencia_data) ASC, id ASC""",
+            c,
+        )
+    if df_hist.empty:
+        base = {campo: float(p.get(campo, 0.0) or 0.0) for campo in PARAM_CAMPOS_HIST}
+        base["vigencia_data"] = "1900-01-01"
+        df_hist = pd.DataFrame([base])
+    df_hist["vigencia_data"] = pd.to_datetime(df_hist["vigencia_data"], errors="coerce").dt.normalize()
+    for campo in PARAM_CAMPOS_HIST:
+        df_hist[campo] = pd.to_numeric(df_hist.get(campo, 0.0), errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
+    return df_hist.sort_values("vigencia_data").reset_index(drop=True)
+
+
+def aplicar_parametros_por_data(df_origem, col_data="data"):
+    if df_origem is None or df_origem.empty:
+        return df_origem
+    df_saida = df_origem.copy()
+    df_saida["_data_ref_param"] = pd.to_datetime(df_saida[col_data], errors="coerce").dt.normalize()
+    df_saida["_data_ref_param"] = df_saida["_data_ref_param"].fillna(pd.Timestamp("1900-01-01"))
+    if st.session_state.simulacao_ativa:
+        for campo in PARAM_CAMPOS_HIST:
+            df_saida[f"param_{campo}"] = float(p.get(campo, 0.0) or 0.0)
+        return df_saida
+    df_hist = carregar_historico_parametros()
+    rename_hist = {campo: f"hist_{campo}" for campo in PARAM_CAMPOS_HIST}
+    hist_merge = df_hist[["vigencia_data"] + PARAM_CAMPOS_HIST].rename(columns=rename_hist).copy()
+    df_saida = pd.merge_asof(
+        df_saida.sort_values("_data_ref_param"),
+        hist_merge.sort_values("vigencia_data"),
+        left_on="_data_ref_param",
+        right_on="vigencia_data",
+        direction="backward",
+    ).sort_index()
+    for campo in PARAM_CAMPOS_HIST:
+        df_saida[f"param_{campo}"] = pd.to_numeric(df_saida.get(f"hist_{campo}", 0.0), errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
+        if f"hist_{campo}" in df_saida.columns:
+            df_saida = df_saida.drop(columns=[f"hist_{campo}"])
+    if "vigencia_data" in df_saida.columns:
+        df_saida = df_saida.drop(columns=["vigencia_data"])
+    if "_data_ref_param" in df_saida.columns:
+        df_saida = df_saida.drop(columns=["_data_ref_param"])
+    return df_saida
+
+
+def serie_parametro_diaria(campo, data_inicio, data_fim):
+    if data_inicio is None or data_fim is None or data_fim < data_inicio:
+        return pd.Series(dtype=float)
+    idx = pd.date_range(start=data_inicio, end=data_fim, freq="D")
+    base = pd.DataFrame({"data_ref": idx})
+    if st.session_state.simulacao_ativa:
+        return pd.Series(float(p.get(campo, 0.0) or 0.0), index=idx)
+    hist = carregar_historico_parametros()
+    hist = hist[["vigencia_data", campo]].sort_values("vigencia_data")
+    merged = pd.merge_asof(
+        base.sort_values("data_ref"),
+        hist,
+        left_on="data_ref",
+        right_on="vigencia_data",
+        direction="backward",
+    )
+    return pd.to_numeric(merged[campo], errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
+
+
+def valor_mensal_rateado_periodo(campo, data_inicio, data_fim):
+    serie = serie_parametro_diaria(campo, data_inicio, data_fim)
+    if serie.empty:
+        return 0.0
+    return float(serie.sum() / 30.0)
+
+
+def valor_anual_rateado_periodo(campo, data_inicio, data_fim):
+    serie = serie_parametro_diaria(campo, data_inicio, data_fim)
+    if serie.empty:
+        return 0.0
+    return float(serie.sum() / 365.0)
+
+
+def frete_fixo_mensal_atual():
+    if st.session_state.simulacao_ativa:
+        return float(p.get("valor_frete_mensal_fixo", 0.0) or 0.0)
+    hoje = date.today()
+    serie = serie_parametro_diaria("valor_frete_mensal_fixo", hoje, hoje)
+    if serie.empty:
+        return 0.0
+    return float(serie.iloc[0] or 0.0)
+
+def frete_fixo_rateado_periodo(data_inicio, data_fim):
+    return valor_mensal_rateado_periodo("valor_frete_mensal_fixo", data_inicio, data_fim)
+
+valor_frete_fixo_periodo = frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
+
+# Alerta em popup ao abrir o sistema quando houver item vencido no ME LEMBRA
+if "popup_vencido_exibido" not in st.session_state:
+    st.session_state.popup_vencido_exibido = False
+if "popup_trocas_exibido" not in st.session_state:
+    st.session_state.popup_trocas_exibido = False
+if "popup_cp_exibido" not in st.session_state:
+    st.session_state.popup_cp_exibido = False
+
+if not st.session_state.popup_vencido_exibido:
+    try:
+        hoje_ml = date.today()
+        with conn() as c:
+            df_alerta_ml = pd.read_sql(
+                """SELECT descricao, descricao_veiculo, frota, data_vencimento
+                   FROM me_lembra
+                   WHERE data_vencimento IS NOT NULL
+                     AND date(data_vencimento) <= date('now','localtime','+30 day')
+                   ORDER BY date(data_vencimento) ASC""",
+                c,
+            )
+
+        if not df_alerta_ml.empty:
+            df_alerta_ml["data_vencimento"] = pd.to_datetime(df_alerta_ml["data_vencimento"], errors="coerce").dt.date
+            df_alerta_ml["dias_para_vencer"] = df_alerta_ml["data_vencimento"].apply(
+                lambda d: (d - hoje_ml).days if pd.notna(d) else None
+            )
+            df_alerta_ml["status"] = df_alerta_ml["dias_para_vencer"].apply(
+                lambda dias: "Já venceu os 30 dias" if dias is not None and dias < -30 else (
+                    "Vencido" if dias is not None and dias < 0 else "Vence em até 30 dias"
+                )
+            )
+            df_alerta_ml["situacao_popup"] = df_alerta_ml["dias_para_vencer"].apply(
+                lambda dias: "-" if dias is None else (
+                    "Vence hoje" if dias == 0 else (
+                        f"Faltam {dias} dia(s) para vencer" if dias > 0 else (
+                            f"Já venceu os 30 dias (há {abs(dias)} dia(s))" if abs(dias) > 30 else f"Vencido há {abs(dias)} dia(s)"
+                        )
+                    )
+                )
+            )
+            df_alerta_ml["descricao_veiculo"] = df_alerta_ml["descricao_veiculo"].fillna("").astype(str)
+            qtd_vencidos_ml = int((df_alerta_ml["dias_para_vencer"] < 0).sum())
+            qtd_venc_30_ml = int(((df_alerta_ml["dias_para_vencer"] >= 0) & (df_alerta_ml["dias_para_vencer"] <= 30)).sum())
+            qtd_total_alerta_ml = len(df_alerta_ml)
+        else:
+            qtd_vencidos_ml = 0
+            qtd_venc_30_ml = 0
+            qtd_total_alerta_ml = 0
+
+        if qtd_total_alerta_ml > 0:
+            if hasattr(st, "dialog"):
+                @st.dialog("⚠️ Alerta de Vencimento - ME LEMBRA")
+                def popup_alerta_ml():
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #f5c2c7;background:#fff5f5;padding:14px;border-radius:12px;margin-bottom:12px;">
+                            <div style="font-size:20px;font-weight:700;color:#b42318;">⚠️ Atenção</div>
+                            <div style="color:#7a271a;font-size:15px;">
+                                Existem <strong>{qtd_total_alerta_ml}</strong> item(ns) com vencimento em 30 dias ou menos.
+                            </div>
+                        </div>
+                        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                            <div style="background:#ffe2e0;color:#7a271a;padding:10px 12px;border-radius:10px;font-weight:600;">
+                                Vencidos: {qtd_vencidos_ml}
+                            </div>
+                            <div style="background:#fff4ce;color:#8a5a00;padding:10px 12px;border-radius:10px;font-weight:600;">
+                                A vencer em até 30 dias: {qtd_venc_30_ml}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("**Itens que estão vencidos ou vencem em até 30 dias:**")
+                    st.dataframe(
+                        df_alerta_ml[["descricao", "descricao_veiculo", "frota", "data_vencimento", "situacao_popup", "status"]],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "descricao": st.column_config.TextColumn("Item"),
+                            "descricao_veiculo": st.column_config.TextColumn("Descrição Veículo"),
+                            "frota": st.column_config.TextColumn("Frota"),
+                            "data_vencimento": st.column_config.DateColumn("Data Vencimento", format="DD/MM/YYYY"),
+                            "situacao_popup": st.column_config.TextColumn("Situação"),
+                            "status": st.column_config.TextColumn("Status"),
+                        },
+                    )
+                    if st.button("OK, ENTENDI", type="primary", use_container_width=True):
+                        st.session_state.popup_vencido_exibido = True
+                        st.rerun()
+
+                popup_alerta_ml()
+            else:
+                itens_txt = []
+                for _, r in df_alerta_ml.head(10).iterrows():
+                    venc = r["data_vencimento"].strftime("%d/%m/%Y") if pd.notna(r["data_vencimento"]) else "-"
+                    itens_txt.append(f"{r['descricao']} ({venc}) - {r['situacao_popup']}")
+                itens_popup = " | ".join(itens_txt)
+                components.html(
+                    f"""
+                    <script>
+                        alert("ATENÇÃO: Existem {qtd_total_alerta_ml} item(ns) no ME LEMBRA com vencimento em 30 dias ou menos. Vencidos: {qtd_vencidos_ml} | A vencer em até 30 dias: {qtd_venc_30_ml}. Itens: {itens_popup}");
+                    </script>
+                    """,
+                    height=0,
+                )
+                st.session_state.popup_vencido_exibido = True
+        else:
+            st.session_state.popup_vencido_exibido = True
+    except Exception:
+        st.session_state.popup_vencido_exibido = True
+
+# Alerta em popup ao abrir o sistema para vencimentos na aba de TROCAS
+if not st.session_state.popup_trocas_exibido:
+    try:
+        hoje_trocas_popup = date.today()
+        with conn() as c:
+            df_alerta_trocas = pd.read_sql(
+                """SELECT tipo_servico, veiculo_placa, data_vencimento
+                   FROM controle_trocas
+                   WHERE data_vencimento IS NOT NULL
+                     AND date(data_vencimento) <= date('now','localtime','+30 day')
+                   ORDER BY date(data_vencimento) ASC""",
+                c,
+            )
+
+        if not df_alerta_trocas.empty:
+            df_alerta_trocas["data_vencimento"] = pd.to_datetime(df_alerta_trocas["data_vencimento"], errors="coerce").dt.date
+            df_alerta_trocas["dias_para_vencer"] = df_alerta_trocas["data_vencimento"].apply(
+                lambda d: (d - hoje_trocas_popup).days if pd.notna(d) else None
+            )
+            df_alerta_trocas["status"] = df_alerta_trocas["dias_para_vencer"].apply(
+                lambda dias: "Já venceu os 30 dias" if dias is not None and dias < -30 else (
+                    "Vencido" if dias is not None and dias < 0 else "Vence em até 30 dias"
+                )
+            )
+            df_alerta_trocas["situacao_popup"] = df_alerta_trocas["dias_para_vencer"].apply(
+                lambda dias: "-" if dias is None else (
+                    "Vence hoje" if dias == 0 else (
+                        f"Faltam {dias} dia(s) para vencer" if dias > 0 else (
+                            f"Já venceu os 30 dias (há {abs(dias)} dia(s))" if abs(dias) > 30 else f"Vencido há {abs(dias)} dia(s)"
+                        )
+                    )
+                )
+            )
+            qtd_vencidos_trocas = int((df_alerta_trocas["dias_para_vencer"] < 0).sum())
+            qtd_venc_30_trocas = int(((df_alerta_trocas["dias_para_vencer"] >= 0) & (df_alerta_trocas["dias_para_vencer"] <= 30)).sum())
+            qtd_total_alerta_trocas = len(df_alerta_trocas)
+        else:
+            qtd_vencidos_trocas = 0
+            qtd_venc_30_trocas = 0
+            qtd_total_alerta_trocas = 0
+
+        if qtd_total_alerta_trocas > 0:
+            if hasattr(st, "dialog"):
+                @st.dialog("⚠️ Alerta de Vencimento - TROCAS")
+                def popup_alerta_trocas():
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #f5c2c7;background:#fff5f5;padding:14px;border-radius:12px;margin-bottom:12px;">
+                            <div style="font-size:20px;font-weight:700;color:#b42318;">⚠️ Atenção</div>
+                            <div style="color:#7a271a;font-size:15px;">
+                                Existem <strong>{qtd_total_alerta_trocas}</strong> item(ns) no controle de trocas com vencimento em 30 dias ou menos.
+                            </div>
+                        </div>
+                        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                            <div style="background:#ffe2e0;color:#7a271a;padding:10px 12px;border-radius:10px;font-weight:600;">
+                                Vencidos: {qtd_vencidos_trocas}
+                            </div>
+                            <div style="background:#fff4ce;color:#8a5a00;padding:10px 12px;border-radius:10px;font-weight:600;">
+                                A vencer em até 30 dias: {qtd_venc_30_trocas}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("**Itens de trocas que estão vencidos ou vencem em até 30 dias:**")
+                    st.dataframe(
+                        df_alerta_trocas[["tipo_servico", "veiculo_placa", "data_vencimento", "situacao_popup", "status"]],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "tipo_servico": st.column_config.TextColumn("Tipo de Serviço"),
+                            "veiculo_placa": st.column_config.TextColumn("Veículo"),
+                            "data_vencimento": st.column_config.DateColumn("Data Vencimento", format="DD/MM/YYYY"),
+                            "situacao_popup": st.column_config.TextColumn("Situação"),
+                            "status": st.column_config.TextColumn("Status"),
+                        },
+                    )
+                    if st.button("OK, ENTENDI", type="primary", use_container_width=True, key="btn_ok_popup_trocas"):
+                        st.session_state.popup_trocas_exibido = True
+                        st.rerun()
+
+                popup_alerta_trocas()
+            else:
+                itens_trocas_txt = []
+                for _, r in df_alerta_trocas.head(10).iterrows():
+                    venc = r["data_vencimento"].strftime("%d/%m/%Y") if pd.notna(r["data_vencimento"]) else "-"
+                    itens_trocas_txt.append(f"{r['tipo_servico']} - {r['veiculo_placa']} ({venc}) - {r['situacao_popup']}")
+                itens_trocas_popup = " | ".join(itens_trocas_txt)
+                components.html(
+                    f"""
+                    <script>
+                        alert("ATENÇÃO: Existem {qtd_total_alerta_trocas} item(ns) no CONTROLE DE TROCAS com vencimento em 30 dias ou menos. Vencidos: {qtd_vencidos_trocas} | A vencer em até 30 dias: {qtd_venc_30_trocas}. Itens: {itens_trocas_popup}");
+                    </script>
+                    """,
+                    height=0,
+                )
+                st.session_state.popup_trocas_exibido = True
+        else:
+            st.session_state.popup_trocas_exibido = True
+    except Exception:
+        st.session_state.popup_trocas_exibido = False
+
+# Alerta em popup ao abrir o sistema para vencimentos na aba CONTAS A PAGAR
+if not st.session_state.popup_cp_exibido:
+    try:
+        def _cp_popup_parse_valor(txt):
+            if txt is None:
+                return 0.0
+            s = str(txt).strip().replace("R$", "").replace(" ", "")
+            if not s:
+                return 0.0
+            if "," in s and "." in s:
+                s = s.replace(".", "").replace(",", ".")
+            elif "," in s:
+                s = s.replace(",", ".")
+            try:
+                return float(s)
+            except Exception:
+                return 0.0
+
+        def _cp_popup_extrair_parcelas(vencimentos_texto):
+            parcelas = []
+            if not vencimentos_texto:
+                return parcelas
+            for idx, item in enumerate(str(vencimentos_texto).split(";")):
+                trecho = item.strip()
+                if not trecho:
+                    continue
+                numero = None
+                restante = trecho
+                if ":" in trecho:
+                    pref, possivel_restante = trecho.split(":", 1)
+                    if pref.strip().isdigit():
+                        numero = int(pref.strip())
+                        restante = possivel_restante
+                data_txt = restante
+                valor_txt = ""
+                if "|" in restante:
+                    data_txt, valor_txt = restante.split("|", 1)
+                data_parcela = pd.to_datetime(str(data_txt).strip(), dayfirst=True, errors="coerce")
+                if pd.isna(data_parcela):
+                    continue
+                if numero is None:
+                    numero = idx + 1
+                parcelas.append(
+                    {
+                        "parcela": numero,
+                        "data": data_parcela.date(),
+                        "valor": _cp_popup_parse_valor(valor_txt),
+                    }
+                )
+            return parcelas
+
+        def _cp_popup_parse_parcelas_pagas(parcelas_pagas_texto):
+            pagas = set()
+            if not parcelas_pagas_texto:
+                return pagas
+            for token in str(parcelas_pagas_texto).replace(",", ";").split(";"):
+                t = token.strip()
+                if t.isdigit():
+                    pagas.add(int(t))
+            return pagas
+
+        def _cp_popup_proximo_mensal(hoje_ref, dia_venc, data_base):
+            data_base_dt = pd.to_datetime(data_base, errors="coerce")
+            if pd.notna(data_base_dt):
+                data_base_date = data_base_dt.date()
+                if data_base_date >= hoje_ref:
+                    return data_base_date
+                dia_ref = int(data_base_date.day)
+            else:
+                dia_ref = int(dia_venc or 1)
+            dia_ref = max(1, min(31, dia_ref))
+            ano = hoje_ref.year
+            mes = hoje_ref.month
+            dias_mes = int(pd.Period(f"{ano}-{mes:02d}").days_in_month)
+            venc_atual = date(ano, mes, min(dia_ref, dias_mes))
+            if venc_atual < hoje_ref:
+                if mes == 12:
+                    ano += 1
+                    mes = 1
+                else:
+                    mes += 1
+                dias_mes = int(pd.Period(f"{ano}-{mes:02d}").days_in_month)
+                venc_atual = date(ano, mes, min(dia_ref, dias_mes))
+            return venc_atual
+
+        with conn() as c:
+            df_cp_popup = pd.read_sql(
+                """SELECT cp.id,
+                          f.nome AS fornecedor,
+                          o.descricao_obrigacao,
+                          cp.n_nf,
+                          cp.valor_total_nf,
+                          cp.valor_parcela,
+                          cp.vencimentos_parcelas,
+                          cp.tipo_lancamento,
+                          cp.dia_vencimento_mensal,
+                          cp.data_vencimento_base,
+                          cp.parcelas_pagas,
+                          cp.dias_alerta
+                   FROM contas_pagar cp
+                   LEFT JOIN fornecedores f ON f.id = cp.fornecedor_id
+                   LEFT JOIN obrigacoes o ON o.id = cp.obrigacao_id""",
+                c,
+            )
+
+        hoje_cp = date.today()
+        alertas_cp = []
+        if not df_cp_popup.empty:
+            for _, r in df_cp_popup.iterrows():
+                tipo = str(r.get("tipo_lancamento") or "NAO_MENSAL")
+                dias_alerta = max(0, int(r.get("dias_alerta") or 7))
+                fornecedor = str(r.get("fornecedor") or "-")
+                obrigacao = str(r.get("descricao_obrigacao") or "-")
+                nf_ref = str(r.get("n_nf") or "-")
+
+                if tipo == "MENSAL_FIXO":
+                    prox = _cp_popup_proximo_mensal(
+                        hoje_cp,
+                        r.get("dia_vencimento_mensal"),
+                        r.get("data_vencimento_base"),
+                    )
+                    dias = (prox - hoje_cp).days
+                    if -30 <= dias <= dias_alerta:
+                        alertas_cp.append(
+                            {
+                                "Fornecedor": fornecedor,
+                                "Obrigação": obrigacao,
+                                "NF": nf_ref,
+                                "Parcela": "-",
+                                "Vencimento": prox,
+                                "Valor": float(r.get("valor_parcela") or r.get("valor_total_nf") or 0.0),
+                                "Dias": dias,
+                            }
+                        )
+                else:
+                    parcelas = _cp_popup_extrair_parcelas(r.get("vencimentos_parcelas"))
+                    parcelas_pagas = _cp_popup_parse_parcelas_pagas(r.get("parcelas_pagas"))
+                    for p_item in parcelas:
+                        parcela_num = int(p_item["parcela"]) if p_item["parcela"] is not None else None
+                        if parcela_num is not None and parcela_num in parcelas_pagas:
+                            continue
+                        dias = (p_item["data"] - hoje_cp).days
+                        if -30 <= dias <= dias_alerta:
+                            alertas_cp.append(
+                                {
+                                    "Fornecedor": fornecedor,
+                                    "Obrigação": obrigacao,
+                                    "NF": nf_ref,
+                                    "Parcela": parcela_num if parcela_num is not None else "-",
+                                    "Vencimento": p_item["data"],
+                                    "Valor": float(p_item["valor"] or r.get("valor_parcela") or 0.0),
+                                    "Dias": dias,
+                                }
+                            )
+
+        if alertas_cp:
+            df_alerta_cp = pd.DataFrame(alertas_cp).sort_values(by=["Dias", "Vencimento"], ascending=[True, True]).reset_index(drop=True)
+            df_alerta_cp["Situação"] = df_alerta_cp["Dias"].apply(
+                lambda d: "Vence hoje" if d == 0 else (f"Vence em {d} dia(s)" if d > 0 else f"Vencido há {abs(d)} dia(s)")
+            )
+            qtd_total_cp = len(df_alerta_cp)
+            qtd_vencidos_cp = int((df_alerta_cp["Dias"] < 0).sum())
+            qtd_a_vencer_cp = int((df_alerta_cp["Dias"] >= 0).sum())
+
+            if hasattr(st, "dialog"):
+                @st.dialog("⚠️ Alerta de Vencimento - CONTAS A PAGAR")
+                def popup_alerta_cp():
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #f5c2c7;background:#fff5f5;padding:14px;border-radius:12px;margin-bottom:12px;">
+                            <div style="font-size:20px;font-weight:700;color:#b42318;">⚠️ Atenção</div>
+                            <div style="color:#7a271a;font-size:15px;">
+                                Existem <strong>{qtd_total_cp}</strong> parcela(s)/lançamento(s) em alerta de vencimento.
+                            </div>
+                        </div>
+                        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                            <div style="background:#ffe2e0;color:#7a271a;padding:10px 12px;border-radius:10px;font-weight:600;">
+                                Vencidos: {qtd_vencidos_cp}
+                            </div>
+                            <div style="background:#fff4ce;color:#8a5a00;padding:10px 12px;border-radius:10px;font-weight:600;">
+                                A vencer: {qtd_a_vencer_cp}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("**Contas a pagar em alerta:**")
+                    st.dataframe(
+                        df_alerta_cp[["Fornecedor", "Obrigação", "NF", "Parcela", "Vencimento", "Valor", "Situação"]],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
+                            "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f"),
+                        },
+                    )
+                    if st.button("OK, ENTENDI", type="primary", use_container_width=True, key="btn_ok_popup_cp"):
+                        st.session_state.popup_cp_exibido = True
+                        st.rerun()
+
+                popup_alerta_cp()
+            else:
+                itens_cp_txt = []
+                for _, r in df_alerta_cp.head(10).iterrows():
+                    venc = r["Vencimento"].strftime("%d/%m/%Y") if pd.notna(r["Vencimento"]) else "-"
+                    itens_cp_txt.append(f"{r['Fornecedor']} | {r['Obrigação']} ({venc}) - {r['Situação']}")
+                itens_cp_popup = " | ".join(itens_cp_txt)
+                components.html(
+                    f"""
+                    <script>
+                        alert("ATENÇÃO: Existem {qtd_total_cp} alerta(s) em CONTAS A PAGAR. Vencidos: {qtd_vencidos_cp} | A vencer: {qtd_a_vencer_cp}. Itens: {itens_cp_popup}");
+                    </script>
+                    """,
+                    height=0,
+                )
+                st.session_state.popup_cp_exibido = True
+        else:
+            st.session_state.popup_cp_exibido = True
+    except Exception:
+        st.session_state.popup_cp_exibido = True
+
+with conn() as c:
+    df_db = pd.read_sql(
+        "SELECT * FROM viagens WHERE date(data) BETWEEN ? AND ? ORDER BY date(data) ASC, id ASC",
+        c,
+        params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
+    )
+if not df_db.empty:
+    df_db["data"] = pd.to_datetime(df_db["data"]).dt.date
+    if "tipo_cobranca" not in df_db.columns:
+        df_db["tipo_cobranca"] = "TONELADA"
+    if "valor_km" not in df_db.columns:
+        df_db["valor_km"] = 0.0
+    if "gasto_extra" not in df_db.columns:
+        df_db["gasto_extra"] = 0.0
+    if "pagto_estadia" not in df_db.columns:
+        df_db["pagto_estadia"] = 0.0
+    if "descricao_gasto_extra" not in df_db.columns:
+        df_db["descricao_gasto_extra"] = ""
+    df_db["km"] = pd.to_numeric(df_db["km"], errors="coerce").fillna(0.0)
+    df_db["toneladas"] = pd.to_numeric(df_db["toneladas"], errors="coerce").fillna(0.0)
+    df_db["valor_ton"] = pd.to_numeric(df_db["valor_ton"], errors="coerce").fillna(0.0)
+    df_db["valor_km"] = pd.to_numeric(df_db["valor_km"], errors="coerce").fillna(0.0)
+    df_db["gasto_extra"] = pd.to_numeric(df_db["gasto_extra"], errors="coerce").fillna(0.0)
+    df_db["pagto_estadia"] = pd.to_numeric(df_db["pagto_estadia"], errors="coerce").fillna(0.0)
+    df_db["descricao_gasto_extra"] = df_db["descricao_gasto_extra"].fillna("").astype(str)
+    df_db["tipo_cobranca"] = df_db["tipo_cobranca"].astype(str).str.upper().str.strip()
+    df_db["Total Frete"] = df_db.apply(
+        lambda r: (r["km"] * r["valor_km"]) if r["tipo_cobranca"] == "KM" else (r["toneladas"] * r["valor_ton"]),
+        axis=1,
+    )
+
+# =========================
+# DEFINIÇÃO DAS ABAS
+# =========================
+aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14, aba17, aba18 = st.tabs([
+    "🏠 Dashboard Executivo",
+    "📌 Movimento Viagens", "📋 Viagens Executadas", "📊 Análise", "🛠️ Manutenção", "🗂️ Cadastro",
+    "📑 Relatório", "⛽ Abastecimento", "🎯 Metas", "🛢️ Trocas",
+    "💵 Frete Líquido Sem Custo Fixo", "🧾 Contas a Pagar", "🔔 ME LEMBRA"
+])
+
+with aba_cadastro:
+    aba5, aba6, aba7, aba10, aba12, aba15, aba16, aba19 = st.tabs([
+        "🏢 Oficinas", "🏙️ Cidades", "🛣️ KM Rotas", "⚙️ Parâmetros",
+        "🚚 Veículos", "🏭 Fornecedores", "📌 Obrigação", "⛽ Comparativo Diesel"
+    ])
+
+with aba_home:
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            font-family: "Trebuchet MS", "Gill Sans", "Verdana", sans-serif;
+        }
+        .dash-shell {
+            background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+            border: 1px solid #dbe7f3;
+            border-radius: 18px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .dash-hero {
+            background: linear-gradient(120deg, #0b3c5d 0%, #1b6ca8 48%, #00a6a6 100%);
+            padding: 22px 24px;
+            border-radius: 18px;
+            color: #ffffff;
+            box-shadow: 0 10px 24px rgba(11, 60, 93, 0.28);
+            margin-bottom: 14px;
+            animation: risein 0.5s ease-out;
+        }
+        .dash-hero h2 {
+            margin: 0 0 4px 0;
+            font-size: 29px;
+            font-weight: 800;
+        }
+        .dash-hero p {
+            margin: 0 0 8px 0;
+            font-size: 14px;
+            opacity: 0.95;
+        }
+        .dash-pill {
+            display: inline-block;
+            padding: 7px 12px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            margin-top: 6px;
+            background: rgba(255, 255, 255, 0.16);
+            border: 1px solid rgba(255, 255, 255, 0.35);
+        }
+        .kpi-card {
+            background: #ffffff;
+            border: 1px solid #d7e5f2;
+            border-radius: 14px;
+            padding: 12px 14px;
+            box-shadow: 0 6px 12px rgba(12, 44, 74, 0.06);
+            min-height: 110px;
+            animation: risein 0.5s ease-out;
+        }
+        .kpi-label {
+            color: #37516c;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            font-weight: 700;
+        }
+        .kpi-value {
+            color: #102a43;
+            font-size: 23px;
+            font-weight: 800;
+            margin-top: 3px;
+            margin-bottom: 5px;
+        }
+        .kpi-foot {
+            color: #486581;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .meta-wrap {
+            background: #ffffff;
+            border: 1px solid #d7e5f2;
+            border-radius: 14px;
+            padding: 12px 14px;
+            margin: 8px 0 4px 0;
+        }
+        .meta-track {
+            width: 100%;
+            height: 12px;
+            border-radius: 99px;
+            background: #e6eef7;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+        .meta-fill {
+            height: 100%;
+            border-radius: 99px;
+            background: linear-gradient(90deg, #0ea5a5 0%, #f59e0b 70%, #ef4444 100%);
+            transition: width 0.4s ease;
+        }
+        .alert-chip {
+            display: inline-block;
+            border-radius: 10px;
+            padding: 8px 11px;
+            margin-right: 8px;
+            margin-top: 8px;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .chip-a {
+            background: #fff4e5;
+            color: #9a3412;
+            border: 1px solid #fdba74;
+        }
+        .chip-b {
+            background: #fff1f2;
+            color: #9f1239;
+            border: 1px solid #fda4af;
+        }
+        @keyframes risein {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if df_db.empty:
+        st.info("Sem dados de viagens no período selecionado. Cadastre viagens para visualizar os indicadores.")
+    else:
+        df_dash = df_db.copy()
+        if "qtd_viagens" not in df_dash.columns:
+            df_dash["qtd_viagens"] = 1
+        if "tipo_cobranca" not in df_dash.columns:
+            df_dash["tipo_cobranca"] = "TONELADA"
+        if "valor_km" not in df_dash.columns:
+            df_dash["valor_km"] = 0.0
+        if "gasto_extra" not in df_dash.columns:
+            df_dash["gasto_extra"] = 0.0
+        if "pagto_estadia" not in df_dash.columns:
+            df_dash["pagto_estadia"] = 0.0
+        if "diesel" not in df_dash.columns:
+            df_dash["diesel"] = 0.0
+        if "consumo" not in df_dash.columns:
+            df_dash["consumo"] = 0.0
+        if "arla" not in df_dash.columns:
+            df_dash["arla"] = 0.0
+        if "consumo_arla" not in df_dash.columns:
+            df_dash["consumo_arla"] = 0.0
+
+        df_dash["tipo_cobranca"] = df_dash["tipo_cobranca"].fillna("TONELADA").astype(str).str.upper().str.strip()
+        df_dash["km"] = pd.to_numeric(df_dash["km"], errors="coerce").fillna(0.0)
+        df_dash["toneladas"] = pd.to_numeric(df_dash["toneladas"], errors="coerce").fillna(0.0)
+        df_dash["valor_ton"] = pd.to_numeric(df_dash["valor_ton"], errors="coerce").fillna(0.0)
+        df_dash["valor_km"] = pd.to_numeric(df_dash["valor_km"], errors="coerce").fillna(0.0)
+        df_dash["qtd_viagens"] = pd.to_numeric(df_dash["qtd_viagens"], errors="coerce").fillna(1.0)
+        df_dash["qtd_viagens"] = df_dash["qtd_viagens"].apply(lambda x: max(1, int(round(float(x)))))
+        df_dash["pedagio"] = pd.to_numeric(df_dash["pedagio"], errors="coerce").fillna(0.0)
+        df_dash["gasto_extra"] = pd.to_numeric(df_dash["gasto_extra"], errors="coerce").fillna(0.0)
+        df_dash["pagto_estadia"] = pd.to_numeric(df_dash["pagto_estadia"], errors="coerce").fillna(0.0)
+        df_dash["diesel"] = pd.to_numeric(df_dash["diesel"], errors="coerce").fillna(0.0)
+        df_dash["consumo"] = pd.to_numeric(df_dash["consumo"], errors="coerce").fillna(0.0)
+        df_dash["arla"] = pd.to_numeric(df_dash["arla"], errors="coerce").fillna(0.0)
+        df_dash["consumo_arla"] = pd.to_numeric(df_dash["consumo_arla"], errors="coerce").fillna(0.0)
+
+        df_dash["frete_base"] = df_dash.apply(
+            lambda r: (r["km"] * r["valor_km"]) if r["tipo_cobranca"] == "KM" else (r["toneladas"] * r["valor_ton"]),
+            axis=1,
+        )
+        df_dash["receita_total"] = ((df_dash["frete_base"] + df_dash["pagto_estadia"]) * df_dash["qtd_viagens"]).fillna(0.0)
+        df_dash["km_total"] = (df_dash["km"] * df_dash["qtd_viagens"]).fillna(0.0)
+        df_dash["litros_diesel"] = (df_dash["km_total"] / df_dash["consumo"].where(df_dash["consumo"] > 0)).fillna(0.0)
+        df_dash["custo_diesel"] = (df_dash["litros_diesel"] * df_dash["diesel"]).fillna(0.0)
+        df_dash["litros_arla"] = (df_dash["km_total"] / df_dash["consumo_arla"].where(df_dash["consumo_arla"] > 0)).fillna(0.0)
+        df_dash["custo_arla"] = (df_dash["litros_arla"] * df_dash["arla"]).fillna(0.0)
+        df_dash["custo_pedagio"] = (df_dash["pedagio"] * df_dash["qtd_viagens"]).fillna(0.0)
+        df_dash["custo_extra"] = (df_dash["gasto_extra"] * df_dash["qtd_viagens"]).fillna(0.0)
+        df_dash = aplicar_parametros_por_data(df_dash, col_data="data")
+        imposto_pct_dash_series = (pd.to_numeric(df_dash["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)
+        df_dash["custo_imposto"] = (df_dash["receita_total"] * imposto_pct_dash_series).fillna(0.0)
+        df_dash["lucro_operacional"] = (
+            df_dash["receita_total"]
+            - df_dash["custo_diesel"]
+            - df_dash["custo_arla"]
+            - df_dash["custo_pedagio"]
+            - df_dash["custo_extra"]
+            - df_dash["custo_imposto"]
+        ).fillna(0.0)
+
+        total_receita_dash = float(df_dash["receita_total"].sum())
+        total_km_dash = float(df_dash["km_total"].sum())
+        total_viagens_dash = int(df_dash["qtd_viagens"].sum())
+        total_custo_dash = float(
+            (
+                df_dash["custo_diesel"]
+                + df_dash["custo_arla"]
+                + df_dash["custo_pedagio"]
+                + df_dash["custo_extra"]
+                + df_dash["custo_imposto"]
+            ).sum()
+        )
+        total_lucro_dash = float(df_dash["lucro_operacional"].sum())
+        custo_imposto_frete_fixo_dash = float(
+            (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+             * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+        )
+        total_receita_dash += valor_frete_fixo_periodo
+        total_custo_dash += custo_imposto_frete_fixo_dash
+        total_lucro_dash += (valor_frete_fixo_periodo - custo_imposto_frete_fixo_dash)
+        margem_dash = (total_lucro_dash / total_receita_dash * 100.0) if total_receita_dash > 0 else 0.0
+        ticket_medio_dash = (total_receita_dash / total_viagens_dash) if total_viagens_dash > 0 else 0.0
+
+        meta_faturamento = float(p.get("meta_faturamento", 50000.0))
+        perc_meta = (total_receita_dash / meta_faturamento * 100.0) if meta_faturamento > 0 else 0.0
+        delta_meta = total_receita_dash - meta_faturamento
+        perc_meta_lim = max(0.0, min(perc_meta, 100.0))
+        custo_pct_receita = (total_custo_dash / total_receita_dash * 100.0) if total_receita_dash > 0 else 0.0
+
+        hoje_dash = date.today().isoformat()
+        with conn() as c:
+            alertas_ml_dash = c.execute(
+                """
+                SELECT COUNT(*) AS qtd
+                FROM me_lembra
+                WHERE data_vencimento IS NOT NULL
+                  AND date(data_vencimento) <= date(?, '+30 day')
+                """,
+                (hoje_dash,),
+            ).fetchone()
+            alertas_trocas_dash = c.execute(
+                """
+                SELECT COUNT(*) AS qtd
+                FROM controle_trocas
+                WHERE data_vencimento IS NOT NULL
+                  AND date(data_vencimento) <= date(?, '+30 day')
+                """,
+                (hoje_dash,),
+            ).fetchone()
+        qtd_alertas_ml = int(alertas_ml_dash["qtd"] if alertas_ml_dash else 0)
+        qtd_alertas_trocas = int(alertas_trocas_dash["qtd"] if alertas_trocas_dash else 0)
+        st.markdown(
+            f"""
+            <div class="dash-shell">
+                <div class="dash-hero">
+                    <h2>Painel Executivo ART Amaral Rota Transportes</h2>
+                    <p>Período analisado: <strong>{filtro_ini.strftime('%d/%m/%Y')}</strong> até <strong>{filtro_fim.strftime('%d/%m/%Y')}</strong></p>
+                    <span class="dash-pill">Meta atingida: {perc_meta:.1f}%</span>
+                    <span class="dash-pill">Margem atual: {margem_dash:.1f}%</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        c_k1, c_k2, c_k3, c_k4 = st.columns(4)
+        c_k1.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-label">Receita do Período</div>
+                <div class="kpi-value">{brl(total_receita_dash)}</div>
+                <div class="kpi-foot">Ticket médio: {brl(ticket_medio_dash)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        c_k2.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-label">Lucro Operacional</div>
+                <div class="kpi-value">{brl(total_lucro_dash)}</div>
+                <div class="kpi-foot">Margem líquida: {margem_dash:.1f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        c_k3.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-label">Custo Operacional</div>
+                <div class="kpi-value">{brl(total_custo_dash)}</div>
+                <div class="kpi-foot">Peso na receita: {custo_pct_receita:.1f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        c_k4.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-label">Produção</div>
+                <div class="kpi-value">{format_br(total_viagens_dash, casas_decimais=0)} viagens</div>
+                <div class="kpi-foot">KM rodado: {format_br(total_km_dash, casas_decimais=0)} km</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f"""
+            <div class="meta-wrap">
+                <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+                    <div style="font-weight:800;color:#12344d;">Meta de Faturamento</div>
+                    <div style="font-weight:700;color:#486581;">Meta: {brl(meta_faturamento)} | Realizado: {brl(total_receita_dash)} | Meta: {brl(delta_meta)}</div>
+                </div>
+                <div class="meta-track"><div class="meta-fill" style="width:{perc_meta_lim:.2f}%;"></div></div>
+                <div style="margin-top:8px;color:#36556f;font-weight:700;font-size:12px;">{perc_meta:.1f}% da meta atingida no período atual</div>
+                <span class="alert-chip chip-a">ME LEMBRA em 30 dias: {qtd_alertas_ml}</span>
+                <span class="alert-chip chip-b">TROCAS em 30 dias: {qtd_alertas_trocas}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        df_tend = df_dash.copy()
+        origem_norm_dash = df_tend["origem"].fillna("").astype(str).str.strip().str.upper()
+        destino_norm_dash = df_tend["destino"].fillna("").astype(str).str.strip().str.upper()
+        df_tend = df_tend.loc[origem_norm_dash != destino_norm_dash].copy()
+
+        if not df_tend.empty:
+            df_tend["data_dt"] = pd.to_datetime(df_tend["data"], errors="coerce")
+            df_tend["mes_periodo"] = df_tend["data_dt"].dt.to_period("M")
+            df_tend["mes"] = df_tend["mes_periodo"].astype(str)
+            df_tend = aplicar_parametros_por_data(df_tend, col_data="data")
+            df_tend["custo_pneu"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_pneu"], errors="coerce").fillna(0.0)
+            df_tend["custo_manut"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_manut"], errors="coerce").fillna(0.0)
+            df_tend["custo_depre"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_depre"], errors="coerce").fillna(0.0)
+            df_tend["custo_comissao"] = df_tend["receita_total"] * (pd.to_numeric(df_tend["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)
+            df_tend["custo_imposto"] = df_tend["receita_total"] * (pd.to_numeric(df_tend["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)
+
+            df_tend_g = (
+                df_tend.groupby("mes", as_index=False)
+                .agg(
+                    receita=("receita_total", "sum"),
+                    custo_diesel=("custo_diesel", "sum"),
+                    custo_pedagio=("custo_pedagio", "sum"),
+                    custo_extra=("custo_extra", "sum"),
+                    custo_pneu=("custo_pneu", "sum"),
+                    custo_manut=("custo_manut", "sum"),
+                    custo_depre=("custo_depre", "sum"),
+                    custo_comissao=("custo_comissao", "sum"),
+                    custo_imposto=("custo_imposto", "sum"),
+                )
+                .sort_values("mes")
+            )
+
+            def dias_mes_no_filtro(mes_txt):
+                p_mes = pd.Period(mes_txt, freq="M")
+                ini_mes = p_mes.start_time.date()
+                fim_mes = p_mes.end_time.date()
+                ini_ref = max(filtro_ini, ini_mes)
+                fim_ref = min(filtro_fim, fim_mes)
+                if fim_ref < ini_ref:
+                    return 0
+                return (fim_ref - ini_ref).days + 1
+
+            df_tend_g["dias_no_filtro"] = df_tend_g["mes"].apply(dias_mes_no_filtro)
+            df_tend_g["fator_rateio"] = df_tend_g["dias_no_filtro"] / 30.0
+            df_tend_g["frete_fixo_rateado"] = df_tend_g["mes"].apply(
+                lambda m: valor_mensal_rateado_periodo(
+                    "valor_frete_mensal_fixo",
+                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                )
+            )
+            df_tend_g["receita"] = df_tend_g["receita"] + df_tend_g["frete_fixo_rateado"]
+            df_tend_g["custo_comissao_frete_fixo"] = df_tend_g["mes"].apply(
+                lambda m: float(
+                    (serie_parametro_diaria(
+                        "valor_frete_mensal_fixo",
+                        max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                        min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                    ) / 30.0
+                     * (serie_parametro_diaria(
+                        "motora_pct",
+                        max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                        min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                    ) / 100.0)).sum()
+                )
+            )
+            df_tend_g["custo_imposto_frete_fixo"] = df_tend_g["mes"].apply(
+                lambda m: float(
+                    (serie_parametro_diaria(
+                        "valor_frete_mensal_fixo",
+                        max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                        min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                    ) / 30.0
+                     * (serie_parametro_diaria(
+                        "imposto_pct",
+                        max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                        min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                    ) / 100.0)).sum()
+                )
+            )
+            df_tend_g["custo_mot_fixo_rateado"] = df_tend_g["mes"].apply(
+                lambda m: valor_mensal_rateado_periodo(
+                    "motora_fixo",
+                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                )
+            )
+            df_tend_g["custo_seguro_rateado"] = df_tend_g["mes"].apply(
+                lambda m: valor_mensal_rateado_periodo(
+                    "seguro",
+                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                )
+            )
+            df_tend_g["custo_fin_rateado"] = df_tend_g["mes"].apply(
+                lambda m: valor_mensal_rateado_periodo(
+                    "financiamento",
+                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                )
+            )
+            # IPVA informado como valor anual: rateio proporcional por dia.
+            df_tend_g["custo_ipva_rateado"] = df_tend_g["mes"].apply(
+                lambda m: valor_anual_rateado_periodo(
+                    "pagto_ipva",
+                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                )
+            )
+            df_tend_g["custo_escr_rateado"] = df_tend_g["mes"].apply(
+                lambda m: valor_mensal_rateado_periodo(
+                    "cmp_custo_escritorio",
+                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
+                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
+                )
+            )
+
+            df_tend_g["custos"] = (
+                df_tend_g["custo_diesel"]
+                + df_tend_g["custo_pedagio"]
+                + df_tend_g["custo_extra"]
+                + df_tend_g["custo_pneu"]
+                + df_tend_g["custo_manut"]
+                + df_tend_g["custo_depre"]
+                + df_tend_g["custo_comissao"]
+                + df_tend_g["custo_imposto"]
+                + df_tend_g["custo_comissao_frete_fixo"]
+                + df_tend_g["custo_imposto_frete_fixo"]
+                + df_tend_g["custo_mot_fixo_rateado"]
+                + df_tend_g["custo_seguro_rateado"]
+                + df_tend_g["custo_fin_rateado"]
+                + df_tend_g["custo_ipva_rateado"]
+                + df_tend_g["custo_escr_rateado"]
+            )
+            df_tend_g["lucro"] = df_tend_g["receita"] - df_tend_g["custos"]
+        else:
+            df_tend_g = pd.DataFrame(columns=["mes", "receita", "custos", "lucro"])
+
+        df_rotas_dash = (
+            df_dash.groupby(["origem", "destino"], as_index=False)
+            .agg(receita=("receita_total", "sum"), lucro=("lucro_operacional", "sum"), viagens=("qtd_viagens", "sum"), km=("km_total", "sum"))
+        )
+        if not df_rotas_dash.empty and valor_frete_fixo_periodo > 0:
+                total_receita_rotas_dash = float(df_rotas_dash["receita"].sum())
+                if total_receita_rotas_dash > 0:
+                    proporcao_rotas_dash = df_rotas_dash["receita"] / total_receita_rotas_dash
+                    receita_fixa_rateada_dash = valor_frete_fixo_periodo * proporcao_rotas_dash
+                    custo_imposto_fixo_total_dash = float(
+                        (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+                         * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+                    )
+                    custo_imposto_fixo_rateado_dash = custo_imposto_fixo_total_dash * proporcao_rotas_dash
+                    df_rotas_dash["receita"] = df_rotas_dash["receita"] + receita_fixa_rateada_dash
+                    df_rotas_dash["lucro"] = df_rotas_dash["lucro"] + (receita_fixa_rateada_dash - custo_imposto_fixo_rateado_dash)
+        if not df_rotas_dash.empty:
+            df_rotas_dash["rota"] = df_rotas_dash["origem"].astype(str) + " → " + df_rotas_dash["destino"].astype(str)
+            top_rotas = df_rotas_dash.sort_values("receita", ascending=False).head(8).sort_values("receita", ascending=True)
+            top_lucro = df_rotas_dash.sort_values("lucro", ascending=False).head(1)
+            if not top_lucro.empty:
+                r_lucro = top_lucro.iloc[0]
+                st.caption(
+                    f"Rota destaque de lucro: {r_lucro['rota']} | Lucro: {brl(float(r_lucro['lucro']))} | Receita: {brl(float(r_lucro['receita']))}"
+                )
+        else:
+            top_rotas = pd.DataFrame(columns=["rota", "receita", "lucro"])
+
+        t1, t2, t3 = st.tabs(["📈 Performance", "💸 Custos", "🛣️ Rotas"])
+
+        with t1:
+            st.caption("Leitura do gráfico: `Lucro` segue a mesma lógica da aba Análise (com rateio de custos e fixos).")
+
+            df_perf = df_tend_g.copy()
+            if df_perf.empty:
+                st.info("Sem dados mensais para exibir a evolução no período.")
+            else:
+                meses_dt = pd.to_datetime(df_perf["mes"] + "-01", errors="coerce")
+                df_perf["mes_label"] = meses_dt.dt.strftime("%m/%Y")
+                df_perf["margem_pct"] = (df_perf["lucro"] / df_perf["receita"].where(df_perf["receita"] > 0) * 100.0).fillna(0.0)
+
+                def fmt_curto_brl(v):
+                    val = float(v or 0.0)
+                    av = abs(val)
+                    if av >= 1_000_000:
+                        return f"R$ {val/1_000_000:.2f} mi"
+                    if av >= 1_000:
+                        return f"R$ {val/1_000:.1f} mil"
+                    return brl(val)
+
+                df_perf["receita_txt"] = df_perf["receita"].apply(fmt_curto_brl)
+                df_perf["custos_txt"] = df_perf["custos"].apply(fmt_curto_brl)
+                df_perf["lucro_txt"] = df_perf["lucro"].apply(fmt_curto_brl)
+                df_perf["receita_hover"] = df_perf["receita"].apply(brl)
+                df_perf["custos_hover"] = df_perf["custos"].apply(brl)
+                df_perf["lucro_hover"] = df_perf["lucro"].apply(brl)
+
+                tipo_grafico_perf = st.selectbox(
+                    "Tipo de gráfico",
+                    ["Combinado", "Barras", "Linhas", "Área"],
+                    index=0,
+                    key="dash_tipo_grafico_perf",
+                )
+
+                fig_tend = go.Figure()
+                if tipo_grafico_perf == "Barras":
+                    fig_tend.add_trace(
+                        go.Bar(
+                            x=df_perf["mes_label"], y=df_perf["receita"], name="Receita",
+                            marker_color="#0077b6", text=df_perf["receita_txt"], textposition="outside",
+                            customdata=df_perf["receita_hover"], hovertemplate="Mês: %{x}<br>Receita: %{customdata}<extra></extra>",
+                        )
+                    )
+                    fig_tend.add_trace(
+                        go.Bar(
+                            x=df_perf["mes_label"], y=df_perf["custos"], name="Custos",
+                            marker_color="#f4a261", text=df_perf["custos_txt"], textposition="outside",
+                            customdata=df_perf["custos_hover"], hovertemplate="Mês: %{x}<br>Custos: %{customdata}<extra></extra>",
+                        )
+                    )
+                    fig_tend.add_trace(
+                        go.Bar(
+                            x=df_perf["mes_label"], y=df_perf["lucro"], name="Lucro",
+                            marker_color="#2a9d8f", text=df_perf["lucro_txt"], textposition="outside",
+                            customdata=df_perf["lucro_hover"], hovertemplate="Mês: %{x}<br>Lucro: %{customdata}<extra></extra>",
+                        )
+                    )
+                elif tipo_grafico_perf == "Linhas":
+                    fig_tend.add_trace(
+                        go.Scatter(
+                            x=df_perf["mes_label"], y=df_perf["receita"], name="Receita",
+                            mode="lines+markers+text", text=df_perf["receita_txt"], textposition="top center",
+                            customdata=df_perf["receita_hover"], hovertemplate="Mês: %{x}<br>Receita: %{customdata}<extra></extra>",
+                            line=dict(color="#0077b6", width=3), marker=dict(size=8),
+                        )
+                    )
+                    fig_tend.add_trace(
+                        go.Scatter(
+                            x=df_perf["mes_label"], y=df_perf["custos"], name="Custos",
+                            mode="lines+markers+text", text=df_perf["custos_txt"], textposition="top center",
+                            customdata=df_perf["custos_hover"], hovertemplate="Mês: %{x}<br>Custos: %{customdata}<extra></extra>",
+                            line=dict(color="#f4a261", width=3), marker=dict(size=8),
+                        )
+                    )
+                    fig_tend.add_trace(
+                        go.Scatter(
+                            x=df_perf["mes_label"], y=df_perf["lucro"], name="Lucro",
+                            mode="lines+markers+text", text=df_perf["lucro_txt"], textposition="top center",
+                            customdata=df_perf["lucro_hover"], hovertemplate="Mês: %{x}<br>Lucro: %{customdata}<extra></extra>",
+                            line=dict(color="#2a9d8f", width=3), marker=dict(size=8),
+                        )
+                    )
+                elif tipo_grafico_perf == "Área":
+                    fig_tend.add_trace(
+                        go.Scatter(
+                            x=df_perf["mes_label"], y=df_perf["receita"], name="Receita",
+                            mode="lines", stackgroup="one",
+                            customdata=df_perf["receita_hover"], hovertemplate="Mês: %{x}<br>Receita: %{customdata}<extra></extra>",
+                            line=dict(color="#0077b6", width=2),
+                        )
+                    )
+                    fig_tend.add_trace(
+                        go.Scatter(
+                            x=df_perf["mes_label"], y=df_perf["custos"], name="Custos",
+                            mode="lines", stackgroup="two",
+                            customdata=df_perf["custos_hover"], hovertemplate="Mês: %{x}<br>Custos: %{customdata}<extra></extra>",
+                            line=dict(color="#f4a261", width=2),
+                        )
+                    )
+                    fig_tend.add_trace(
+                        go.Scatter(
+                            x=df_perf["mes_label"], y=df_perf["lucro"], name="Lucro",
+                            mode="lines", stackgroup="three",
+                            customdata=df_perf["lucro_hover"], hovertemplate="Mês: %{x}<br>Lucro: %{customdata}<extra></extra>",
+                            line=dict(color="#2a9d8f", width=2),
+                        )
+                    )
+                else:
+                    fig_tend.add_trace(
+                        go.Bar(
+                            x=df_perf["mes_label"],
+                            y=df_perf["receita"],
+                            name="Receita",
+                            marker_color="#0077b6",
+                            text=df_perf["receita_txt"],
+                            textposition="outside",
+                            customdata=df_perf["receita_hover"],
+                            hovertemplate="Mês: %{x}<br>Receita: %{customdata}<extra></extra>",
+                        )
+                    )
+                    fig_tend.add_trace(
+                        go.Bar(
+                            x=df_perf["mes_label"],
+                            y=df_perf["custos"],
+                            name="Custos",
+                            marker_color="#f4a261",
+                            text=df_perf["custos_txt"],
+                            textposition="outside",
+                            customdata=df_perf["custos_hover"],
+                            hovertemplate="Mês: %{x}<br>Custos: %{customdata}<extra></extra>",
+                        )
+                    )
+                    fig_tend.add_trace(
+                        go.Scatter(
+                            x=df_perf["mes_label"],
+                            y=df_perf["lucro"],
+                            name="Lucro",
+                            mode="lines+markers+text",
+                            text=df_perf["lucro_txt"],
+                            textposition="top center",
+                            customdata=df_perf["lucro_hover"],
+                            hovertemplate="Mês: %{x}<br>Lucro: %{customdata}<extra></extra>",
+                            line=dict(color="#2a9d8f", width=3),
+                            marker=dict(size=8),
+                        )
+                    )
+                fig_tend.update_layout(
+                    title="Evolução Mensal de Receita, Custos e Lucro",
+                    template="plotly_white",
+                    barmode="group" if tipo_grafico_perf in ["Combinado", "Barras"] else None,
+                    legend=dict(orientation="h", y=1.1, x=0),
+                    margin=dict(l=10, r=10, t=70, b=10),
+                    yaxis_title="Valor (R$)",
+                    hovermode="x unified",
+                    height=430,
+                )
+                st.plotly_chart(fig_tend, use_container_width=True)
+
+                media_receita = float(df_perf["receita"].mean()) if not df_perf.empty else 0.0
+                media_custos = float(df_perf["custos"].mean()) if not df_perf.empty else 0.0
+                media_lucro = float(df_perf["lucro"].mean()) if not df_perf.empty else 0.0
+                media_margem = float(df_perf["margem_pct"].mean()) if not df_perf.empty else 0.0
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Média Receita/Mês", brl(media_receita))
+                r2.metric("Média Custos/Mês", brl(media_custos))
+                r3.metric("Média Lucro/Mês", brl(media_lucro))
+                r4.metric("Média Margem", f"{media_margem:.2f}%")
+
+                st.markdown("**Resumo Mensal (valores exatos)**")
+                st.dataframe(
+                    df_perf[["mes_label", "receita", "custos", "lucro", "margem_pct"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "mes_label": st.column_config.TextColumn("Mês"),
+                        "receita": st.column_config.NumberColumn("Receita", format="R$ %.2f"),
+                        "custos": st.column_config.NumberColumn("Custos", format="R$ %.2f"),
+                        "lucro": st.column_config.NumberColumn("Lucro", format="R$ %.2f"),
+                        "margem_pct": st.column_config.NumberColumn("Margem (%)", format="%.2f%%"),
+                    },
+                )
+
+        with t2:
+            custos_labels = ["Diesel", "Arla", "Pedágio", "Gasto Extra", "Imposto"]
+            custos_vals = [
+                float(df_dash["custo_diesel"].sum()),
+                float(df_dash["custo_arla"].sum()),
+                float(df_dash["custo_pedagio"].sum()),
+                float(df_dash["custo_extra"].sum()),
+                float(df_dash["custo_imposto"].sum()),
+            ]
+            fig_custos = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=custos_labels,
+                        values=custos_vals,
+                        hole=0.56,
+                        marker=dict(colors=["#e76f51", "#ffb703", "#219ebc", "#6c757d", "#2a9d8f"]),
+                        textinfo="label+percent",
+                    )
+                ]
+            )
+            fig_custos.update_layout(
+                title="Composição dos Custos Operacionais",
+                template="plotly_white",
+                margin=dict(l=10, r=10, t=60, b=10),
+                height=390,
+            )
+            st.plotly_chart(fig_custos, use_container_width=True)
+
+        with t3:
+            if top_rotas.empty:
+                st.info("Ainda não há dados de rota suficientes para comparação.")
+            else:
+                fig_rotas = go.Figure()
+                fig_rotas.add_trace(
+                    go.Bar(
+                        x=top_rotas["receita"],
+                        y=top_rotas["rota"],
+                        orientation="h",
+                        marker=dict(color="#00a6a6"),
+                        name="Receita",
+                    )
+                )
+                fig_rotas.add_trace(
+                    go.Scatter(
+                        x=top_rotas["lucro"],
+                        y=top_rotas["rota"],
+                        mode="markers",
+                        marker=dict(color="#0b3c5d", size=11),
+                        name="Lucro",
+                    )
+                )
+                fig_rotas.update_layout(
+                    title="Top Rotas por Receita e Ponto de Lucro",
+                    template="plotly_white",
+                    xaxis_title="R$",
+                    yaxis_title="",
+                    margin=dict(l=10, r=10, t=60, b=10),
+                    height=390,
+                )
+                st.plotly_chart(fig_rotas, use_container_width=True)
+
+# Abas 1 a 12 permanecem iguais
+with aba1:
+    if "msg_frete" in st.session_state:
+        st.success(st.session_state.pop("msg_frete"))
+
+    if not lista_cidades: st.warning("Cadastre cidades primeiro.")
+    elif not lista_veiculos_full: st.warning("Cadastre um veículo primeiro.")
+    else:
+        col_sel1, col_sel2, col_sel3 = st.columns(3); o_v = col_sel1.selectbox("Origem", lista_cidades, index=None, placeholder="Origem"); d_dest = col_sel2.selectbox("Destino", lista_cidades, index=None, placeholder="Destino"); veic_sel = col_sel3.selectbox("Veículo", lista_veiculos_full, index=None, placeholder="Veículo")
+        km_sug, vt_sug, vk_sug, trecho_existe = 0.0, 0.0, 0.0, False
+        if o_v and d_dest:
+            with conn() as c:
+                rota = c.execute("SELECT km, valor_ton, valor_km FROM rotas WHERE (origem=? AND destino=?) OR (origem=? AND destino=?)", (o_v, d_dest, d_dest, o_v)).fetchone()
+                if rota: km_sug, vt_sug, vk_sug, trecho_existe = rota['km'], rota['valor_ton'], rota['valor_km'], True
+            if not trecho_existe:
+                st.warning("Rota Não cadastrada")
+        ca, cb, cc = st.columns(3); d_v, cl_v, nf_v = ca.date_input("Data", format="DD/MM/YYYY"), cb.text_input("Cliente", value="CONTATTO"), cc.text_input("N.NF")
+        c0, c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(9)
+        tipo_cobranca_v = c0.selectbox("Tipo Cálculo", ["TONELADA", "KM"], key="cad_tipo_calc")
+        modo_ton = (tipo_cobranca_v == "TONELADA")
+        km_v = c1.number_input("KM", value=km_sug, disabled=True)
+        kg_txt = c2.text_input("KG", key="cad_frete_kg", disabled=not modo_ton)
+        components.html(
+            """
+            <script>
+            (function () {
+              const doc = window.parent.document;
+              const input = doc.querySelector('input[aria-label="KG"]');
+              if (!input || input.dataset.kgMaskAttached === "1") return;
+              input.dataset.kgMaskAttached = "1";
+              input.dataset.kgMaskUpdating = "0";
+
+              const proto = window.parent.HTMLInputElement.prototype;
+              const valueSetter = Object.getOwnPropertyDescriptor(proto, "value").set;
+
+              function formatKg(value) {
+                const digits = (value || "").replace(/\\D/g, "");
+                if (!digits) return "";
+                return Number(digits).toLocaleString("pt-BR");
+              }
+
+              input.addEventListener("input", function () {
+                if (input.dataset.kgMaskUpdating === "1") return;
+                const formatted = formatKg(input.value);
+                if (formatted === input.value) return;
+
+                input.dataset.kgMaskUpdating = "1";
+                valueSetter.call(input, formatted);
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                input.dataset.kgMaskUpdating = "0";
+              });
+            })();
+            </script>
+            """,
+            height=0,
+        )
+        # Valor/Tonelada vem da aba de rotas; aqui fica apenas para consulta.
+        vt_v = c3.number_input("Val Ton", value=vt_sug, disabled=True)
+        vk_v = c4.number_input("Val KM", value=vk_sug, step=0.01, disabled=modo_ton)
+        pd_v = c5.number_input("Pedágio", value=0.0)
+        c6.markdown("&nbsp;", unsafe_allow_html=True)
+        gx_v = c7.number_input("Gasto Extra", min_value=0.0, value=0.0, step=0.01)
+        est_v = c8.number_input("Pagto Estadia", min_value=0.0, value=0.0, step=0.01)
+        desc_gx_v = st.text_input("Descrição Gasto Extra")
+        cf1, cf2, cf3, cf4 = st.columns(4)
+        di_v = cf1.number_input("VL/L/Diesel", value=v_diesel_sug)
+        cons_v = cf2.number_input("Gasto Diesel P/KM", value=v_cons_sug)
+        arla_v = cf3.number_input("VL/Litro Arla", min_value=0.0, value=v_arla_sug, step=0.01)
+        cons_arla_v = cf4.number_input("Gasto Arla P/KM", min_value=0.0, value=v_cons_arla_sug, step=0.01)
+
+        kg_digitos = "".join(ch for ch in str(kg_txt or "") if ch.isdigit())
+        kg_v = float(kg_digitos) if kg_digitos else 0.0
+        tn_v_calc = (kg_v / 1000.0) if modo_ton else 0.0
+        total_frete_prev = (km_v * vk_v) if not modo_ton else (tn_v_calc * vt_v)
+        st.info(f"Total Frete Previsto ({tipo_cobranca_v}): {brl(total_frete_prev)}")
+        if modo_ton:
+            st.caption("Tipo TONELADA: informe apenas o KG. O Valor/Ton é lido da rota cadastrada.")
+        else:
+            st.caption("Tipo KM: informe apenas o Valor KM.")
+
+        if st.button("💾 Gravar", key="btn_salvar_frete"):
+            condicao_valor = (vk_v > 0) if not modo_ton else (kg_v > 0 and vt_v > 0)
+            if trecho_existe and o_v and d_dest and veic_sel and condicao_valor:
+                placa = veic_sel.split(" - ")[0]
+                with conn() as c:
+                    c.execute(
+                        """INSERT INTO viagens
+                           (data, cliente, origem, destino, km, toneladas, valor_ton, valor_km, tipo_cobranca, pedagio, gasto_extra, pagto_estadia, descricao_gasto_extra, diesel, consumo, arla, consumo_arla, nf, veiculo_placa, qtd_viagens)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            d_v.isoformat(),
+                            cl_v,
+                            o_v,
+                            d_dest,
+                            km_v,
+                            tn_v_calc if modo_ton else 0.0,
+                            vt_v if modo_ton else 0.0,
+                            vk_v if not modo_ton else 0.0,
+                            tipo_cobranca_v,
+                            pd_v,
+                            gx_v,
+                            est_v,
+                            desc_gx_v.strip(),
+                            di_v,
+                            cons_v,
+                            arla_v,
+                            cons_arla_v,
+                            nf_v,
+                            placa,
+                            1,
+                        ),
+                    )
+                st.session_state.msg_frete = "✅ Gravado com sucesso!"
+                st.rerun()
+            else:
+                st.warning("Preencha os valores obrigatórios da modalidade selecionada para salvar.")
+
+with aba2:
+    if not df_db.empty:
+        with conn() as c:
+            df_rotas_ref_exec = pd.read_sql("SELECT origem, destino, valor_ton FROM rotas", c)
+        mapa_valor_ton_exec = {}
+        if not df_rotas_ref_exec.empty:
+            df_rotas_ref_exec["origem"] = df_rotas_ref_exec["origem"].fillna("").astype(str).str.strip().str.upper()
+            df_rotas_ref_exec["destino"] = df_rotas_ref_exec["destino"].fillna("").astype(str).str.strip().str.upper()
+            df_rotas_ref_exec["valor_ton"] = pd.to_numeric(df_rotas_ref_exec["valor_ton"], errors="coerce").fillna(0.0)
+            for _, r_rota in df_rotas_ref_exec.iterrows():
+                chave_ida = (r_rota["origem"], r_rota["destino"])
+                chave_volta = (r_rota["destino"], r_rota["origem"])
+                mapa_valor_ton_exec[chave_ida] = float(r_rota["valor_ton"])
+                if chave_volta not in mapa_valor_ton_exec:
+                    mapa_valor_ton_exec[chave_volta] = float(r_rota["valor_ton"])
+
+        def buscar_valor_ton_rota_exec(origem, destino):
+            chave = (str(origem or "").strip().upper(), str(destino or "").strip().upper())
+            return mapa_valor_ton_exec.get(chave)
+
+        st.markdown(
+            """
+            <style>
+            /* Melhor leitura e rolagem da grade do histórico */
+            div[data-testid="stDataFrame"] {
+                padding-bottom: 10px;
+                font-size: 12px !important;
+                --gdg-font-size: 12px;
+            }
+            div[data-testid="stDataFrame"] ::-webkit-scrollbar {
+                height: 12px;
+                width: 12px;
+            }
+            div[data-testid="stDataFrame"] ::-webkit-scrollbar-thumb {
+                background: #b8b8b8;
+                border-radius: 10px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # 1. Criar uma cópia para não afetar o original
+        df_exibir = df_db.copy()
+        
+        # 2. GARANTIR QUE AS COLUNAS EXISTAM (Evita o KeyError)
+        if "qtd_viagens" not in df_exibir.columns:
+            df_exibir["qtd_viagens"] = 1  # Se não existir no banco, assume 1 para todos
+        if "tipo_cobranca" not in df_exibir.columns:
+            df_exibir["tipo_cobranca"] = "TONELADA"
+        if "valor_km" not in df_exibir.columns:
+            df_exibir["valor_km"] = 0.0
+        if "valor_ton" not in df_exibir.columns:
+            df_exibir["valor_ton"] = 0.0
+        if "diesel" not in df_exibir.columns:
+            df_exibir["diesel"] = 0.0
+        if "consumo" not in df_exibir.columns:
+            df_exibir["consumo"] = 0.0
+        if "arla" not in df_exibir.columns:
+            df_exibir["arla"] = 0.0
+        if "consumo_arla" not in df_exibir.columns:
+            df_exibir["consumo_arla"] = 0.0
+        if "gasto_extra" not in df_exibir.columns:
+            df_exibir["gasto_extra"] = 0.0
+        if "pagto_estadia" not in df_exibir.columns:
+            df_exibir["pagto_estadia"] = 0.0
+        if "descricao_gasto_extra" not in df_exibir.columns:
+            df_exibir["descricao_gasto_extra"] = ""
+
+        df_exibir["diesel"] = pd.to_numeric(df_exibir["diesel"], errors="coerce").fillna(0.0)
+        df_exibir["consumo"] = pd.to_numeric(df_exibir["consumo"], errors="coerce").fillna(0.0)
+        df_exibir["arla"] = pd.to_numeric(df_exibir["arla"], errors="coerce").fillna(0.0)
+        df_exibir["consumo_arla"] = pd.to_numeric(df_exibir["consumo_arla"], errors="coerce").fillna(0.0)
+        df_exibir["toneladas"] = pd.to_numeric(df_exibir["toneladas"], errors="coerce").fillna(0.0)
+        df_exibir["valor_ton"] = pd.to_numeric(df_exibir["valor_ton"], errors="coerce").fillna(0.0)
+        df_exibir["km"] = pd.to_numeric(df_exibir["km"], errors="coerce").fillna(0.0)
+        df_exibir["valor_km"] = pd.to_numeric(df_exibir["valor_km"], errors="coerce").fillna(0.0)
+        df_exibir["pedagio"] = pd.to_numeric(df_exibir["pedagio"], errors="coerce").fillna(0.0)
+        df_exibir["qtd_viagens"] = pd.to_numeric(df_exibir["qtd_viagens"], errors="coerce").fillna(1.0)
+        df_exibir["qtd_viagens"] = df_exibir["qtd_viagens"].apply(lambda x: max(1, int(round(float(x)))))
+        df_exibir["gasto_extra"] = pd.to_numeric(df_exibir["gasto_extra"], errors="coerce").fillna(0.0)
+        df_exibir["pagto_estadia"] = pd.to_numeric(df_exibir["pagto_estadia"], errors="coerce").fillna(0.0)
+        df_exibir["descricao_gasto_extra"] = df_exibir["descricao_gasto_extra"].fillna("").astype(str)
+        df_exibir["tipo_cobranca"] = df_exibir["tipo_cobranca"].astype(str).str.upper().str.strip()
+
+        df_exibir["valor_ton_rota"] = df_exibir.apply(
+            lambda r: buscar_valor_ton_rota_exec(r["origem"], r["destino"]),
+            axis=1,
+        )
+
+        df_exibir["Total Frete"] = df_exibir.apply(
+            lambda r: (r["km"] * r["valor_km"]) if r["tipo_cobranca"] == "KM" else (r["toneladas"] * r["valor_ton"]),
+            axis=1,
+        )
+        df_exibir["Litros Diesel"] = (
+            (df_exibir["km"] * df_exibir["qtd_viagens"])
+            / df_exibir["consumo"].where(df_exibir["consumo"] > 0)
+        ).fillna(0.0)
+        df_exibir["Diesel/KM"] = (df_exibir["Litros Diesel"] * df_exibir["diesel"]).fillna(0.0)
+        df_exibir["Litros Arla"] = (
+            (df_exibir["km"] * df_exibir["qtd_viagens"])
+            / df_exibir["consumo_arla"].where(df_exibir["consumo_arla"] > 0)
+        ).fillna(0.0)
+        df_exibir["Gasto Arla"] = (df_exibir["Litros Arla"] * df_exibir["arla"]).fillna(0.0)
+        df_exibir["peso_kg"] = (pd.to_numeric(df_exibir["toneladas"], errors="coerce").fillna(0.0) * 1000.0)
+
+        # Mantém valor numérico para cálculos e exibe máscara BRL no grid.
+        df_exibir["Total Frete Valor"] = (
+            (
+                pd.to_numeric(df_exibir["Total Frete"], errors="coerce").fillna(0.0)
+                + pd.to_numeric(df_exibir["pagto_estadia"], errors="coerce").fillna(0.0)
+            )
+            * df_exibir["qtd_viagens"]
+        )
+        df_exibir["Frete Líquido"] = (
+            df_exibir["Total Frete Valor"]
+            - df_exibir["Diesel/KM"]
+            - df_exibir["Gasto Arla"]
+            - (df_exibir["pedagio"] * df_exibir["qtd_viagens"])
+            - (df_exibir["gasto_extra"] * df_exibir["qtd_viagens"])
+        ).fillna(0.0)
+        df_exibir["Total Frete"] = df_exibir["Total Frete Valor"].apply(brl)
+        
+        # Criar colunas de ação da grade
+        df_exibir["Editar"] = False
+        df_exibir["Excluir"] = False 
+
+        # 3. CÁLCULOS DOS TOTAIS
+        tot_km = float((df_exibir["km"] * df_exibir["qtd_viagens"]).sum())
+        tot_frete = float(df_exibir["Total Frete Valor"].sum())
+        tot_pedagio = float((df_exibir["pedagio"] * df_exibir["qtd_viagens"]).sum())
+        tot_extra = float((df_exibir["gasto_extra"] * df_exibir["qtd_viagens"]).sum())
+        tot_estadia = float((df_exibir["pagto_estadia"] * df_exibir["qtd_viagens"]).sum())
+        tot_litros_diesel = float(df_exibir["Litros Diesel"].sum())
+        tot_valor_diesel = float(df_exibir["Diesel/KM"].sum())
+        tot_litros_arla = float(df_exibir["Litros Arla"].sum())
+        tot_valor_arla = float(df_exibir["Gasto Arla"].sum())
+        tot_viagens = int(df_exibir["qtd_viagens"].sum())
+        tot_faturamento_liquido_periodo = float(df_exibir["Frete Líquido"].sum())
+
+        # EXIBIÇÃO DAS MÉTRICAS
+        st.markdown(
+            """
+            <style>
+            /* Evita corte dos cabeçalhos das métricas na aba Viagens Executadas */
+            @media (max-width: 1800px) {
+                div[data-testid="stMetricLabel"] p {
+                    font-size: 0.78rem !important;
+                }
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Total KM", format_br(tot_km, casas_decimais=0))
+        m2.metric("Total Frete", brl(tot_frete))
+        m3.metric("Total Pedágio", brl(tot_pedagio))
+        m4.metric("Total Gasto Extra", brl(tot_extra))
+        m5.metric("Total Pagto Estadia", brl(tot_estadia))
+        m6.metric("Total Litros Diesel", f"{tot_litros_diesel:.2f} L")
+
+        m7, m8, m9, m10, m11 = st.columns(5)
+        m7.metric("Total Gasto Diesel", brl(tot_valor_diesel))
+        m8.metric("Qtd. Viagens", tot_viagens)
+        m9.metric("Total Litros Arla", f"{tot_litros_arla:.2f} L")
+        m10.metric("Total Gasto Arla", brl(tot_valor_arla))
+        m11.metric("Faturamento Liquido", brl(tot_faturamento_liquido_periodo))
+
+        st.markdown("---")
+        tab_grid_exec, tab_lucro_exec = st.tabs(["📋 Grid de Viagens", "📈 Lucro e Viabilidade"])
+
+        with tab_grid_exec:
+            if "viagens_exec_editando" not in st.session_state:
+                st.session_state.viagens_exec_editando = False
+
+            # 4. DEFINIR COLUNAS PARA O EDITOR
+            colunas_tab = ["id", "data", "veiculo_placa", "nf", "cliente", "origem", "destino", "tipo_cobranca", "km", "peso_kg", "valor_ton", "valor_km", "diesel", "consumo", "arla", "consumo_arla", "Diesel/KM", "Gasto Arla", "Total Frete Valor", "Total Frete", "Frete Líquido", "pedagio", "gasto_extra", "pagto_estadia", "descricao_gasto_extra", "qtd_viagens", "Editar", "Excluir"]
+
+            def largura_por_conteudo(df, coluna):
+                if coluna not in df.columns or df.empty:
+                    return "small"
+                tam = int(df[coluna].fillna("").astype(str).str.len().max())
+                if tam <= 8:
+                    return "small"
+                if tam <= 18:
+                    return "medium"
+                return "large"
+
+            w_placa = "small"
+            w_nf = "small"
+            w_cliente = "small"
+            w_origem = "small"
+            w_destino = "small"
+            col_ed1, col_ed2 = st.columns(2)
+            if col_ed1.button("✏️ Editar", key="btn_viagens_exec_editar", use_container_width=True, disabled=st.session_state.viagens_exec_editando):
+                st.session_state.viagens_exec_editando = True
+                st.rerun()
+            if col_ed2.button("❌ Cancelar Edição", key="btn_viagens_exec_cancelar", use_container_width=True, disabled=not st.session_state.viagens_exec_editando):
+                st.session_state.viagens_exec_editando = False
+                st.rerun()
+
+            colunas_somente_leitura = ["Total Frete Valor", "Total Frete", "Frete Líquido", "Diesel/KM", "Gasto Arla"]
+            editor_disabled = colunas_somente_leitura if st.session_state.viagens_exec_editando else True
+
+            # Filtrar apenas as colunas que definimos acima
+            df_ed = st.data_editor(
+                df_exibir[colunas_tab], 
+                key="editor_historico_v2",
+                hide_index=True, 
+                height=470,
+                row_height=30,
+                use_container_width=True, 
+                disabled=editor_disabled,
+                column_config={
+                    "id": None, 
+                    "Total Frete Valor": None,
+                    "Editar": st.column_config.CheckboxColumn("✏️", width="small"),
+                    "Excluir": st.column_config.CheckboxColumn("🗑️", width="small"),
+                    "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", width="small"),
+                    "veiculo_placa": st.column_config.TextColumn("Placa", width=w_placa),
+                    "nf": st.column_config.TextColumn("NF", width=w_nf),
+                    "cliente": None,
+                    "origem": st.column_config.TextColumn("Origem", width=w_origem),
+                    "destino": st.column_config.TextColumn("Destino", width=w_destino),
+                    "tipo_cobranca": None,
+                    "km": st.column_config.NumberColumn("KM", format="%.0f", width="small"),
+                    "peso_kg": st.column_config.NumberColumn("KG", format="%.0f", width="small"),
+                    "valor_ton": st.column_config.NumberColumn("Val Ton", min_value=0.0, format="R$ %.2f", width="small"),
+                    "valor_km": None,
+                    "qtd_viagens": st.column_config.NumberColumn("Qtd", min_value=1, width="small"),
+                    "diesel": st.column_config.NumberColumn("VL/L/Diesel", min_value=0.0, format="R$ %.2f", width="small"),
+                    "consumo": st.column_config.NumberColumn("Gasto Diesel P/KM", min_value=0.0, format="%.2f", width="small"),
+                    "Diesel/KM": None,
+                    "arla": st.column_config.NumberColumn("VL/Litro Arla", min_value=0.0, format="R$ %.2f", width="small"),
+                    "consumo_arla": st.column_config.NumberColumn("Gasto Arla P/KM", min_value=0.0, format="%.2f", width="small"),
+                    "Gasto Arla": None,
+                    "Total Frete": st.column_config.TextColumn("Total Frete", width="small"),
+                    "Frete Líquido": st.column_config.NumberColumn("Frete Líquido", format="R$ %.2f", width="small"),
+                    "pedagio": None,
+                    "gasto_extra": None,
+                    "pagto_estadia": st.column_config.NumberColumn("Pagto Estadia", min_value=0.0, format="R$ %.2f", width="small"),
+                    "descricao_gasto_extra": None,
+                }
+            )
+
+            # 5. BOTÕES DE AÇÃO
+            c_h1, c_h2, c_h3 = st.columns(3)
+            if c_h1.button("💾 Gravar", key="save_hist_final", disabled=not st.session_state.viagens_exec_editando):
+                ids_excluir = set(df_ed[df_ed["Excluir"] == True]["id"].tolist())
+                ids_marcados_editar = set(df_ed[(df_ed["Editar"] == True) & (df_ed["Excluir"] != True)]["id"].tolist())
+                campos_comparacao = [
+                    "data",
+                    "veiculo_placa",
+                    "nf",
+                    "cliente",
+                    "origem",
+                    "destino",
+                    "tipo_cobranca",
+                    "km",
+                    "peso_kg",
+                    "valor_ton",
+                    "valor_km",
+                    "diesel",
+                    "consumo",
+                    "arla",
+                    "consumo_arla",
+                    "pedagio",
+                    "gasto_extra",
+                    "pagto_estadia",
+                    "descricao_gasto_extra",
+                    "qtd_viagens",
+                ]
+                campos_numericos = {
+                    "km",
+                    "peso_kg",
+                    "valor_ton",
+                    "valor_km",
+                    "diesel",
+                    "consumo",
+                    "arla",
+                    "consumo_arla",
+                    "pedagio",
+                    "gasto_extra",
+                    "pagto_estadia",
+                    "qtd_viagens",
+                }
+                df_old_cmp = df_exibir.set_index("id")
+                df_new_cmp = df_ed.set_index("id")
+                ids_comuns = set(df_old_cmp.index.tolist()) & set(df_new_cmp.index.tolist())
+                ids_alterados = set()
+
+                for id_linha in ids_comuns:
+                    if id_linha in ids_excluir:
+                        continue
+                    for campo in campos_comparacao:
+                        antigo = df_old_cmp.at[id_linha, campo] if campo in df_old_cmp.columns else None
+                        novo = df_new_cmp.at[id_linha, campo] if campo in df_new_cmp.columns else None
+
+                        if campo == "data":
+                            antigo_dt = pd.to_datetime(antigo, errors="coerce")
+                            novo_dt = pd.to_datetime(novo, errors="coerce")
+                            antigo_val = antigo_dt.strftime("%Y-%m-%d") if pd.notna(antigo_dt) else ""
+                            novo_val = novo_dt.strftime("%Y-%m-%d") if pd.notna(novo_dt) else ""
+                            if antigo_val != novo_val:
+                                ids_alterados.add(id_linha)
+                                break
+                        elif campo in campos_numericos:
+                            antigo_num = float(pd.to_numeric(pd.Series([antigo]), errors="coerce").fillna(0.0).iloc[0])
+                            novo_num = float(pd.to_numeric(pd.Series([novo]), errors="coerce").fillna(0.0).iloc[0])
+                            if abs(antigo_num - novo_num) > 1e-9:
+                                ids_alterados.add(id_linha)
+                                break
+                        else:
+                            antigo_txt = str(antigo or "").strip()
+                            novo_txt = str(novo or "").strip()
+                            if campo == "tipo_cobranca":
+                                antigo_txt = antigo_txt.upper()
+                                novo_txt = novo_txt.upper()
+                            if antigo_txt != novo_txt:
+                                ids_alterados.add(id_linha)
+                                break
+
+                ids_para_atualizar = (ids_marcados_editar | ids_alterados) - ids_excluir
+                if not ids_para_atualizar:
+                    st.warning("Nenhuma alteração detectada para gravar.")
+                    st.stop()
+
+                with conn() as c:
+                    for _, r in df_ed.iterrows():
+                        if int(r["id"]) in ids_para_atualizar:
+                            dt_sql = pd.to_datetime(r["data"], errors="coerce")
+                            data_sql = dt_sql.strftime("%Y-%m-%d") if pd.notna(dt_sql) else str(r["data"])[:10]
+                            tipo_cobranca_sql = str(r["tipo_cobranca"]).upper().strip()
+                            valor_ton_sql = float(pd.to_numeric(r["valor_ton"], errors="coerce") or 0.0)
+                            c.execute("""UPDATE viagens SET 
+                                data=?, cliente=?, tipo_cobranca=?, km=?, toneladas=?, valor_ton=?, valor_km=?, pedagio=?, gasto_extra=?, pagto_estadia=?, descricao_gasto_extra=?, diesel=?, consumo=?, arla=?, consumo_arla=?,
+                                origem=?, destino=?, nf=?, veiculo_placa=?, qtd_viagens=? 
+                                WHERE id=?""", 
+                                (data_sql, r["cliente"], tipo_cobranca_sql, r["km"], (float(r["peso_kg"]) / 1000.0), valor_ton_sql, r["valor_km"],
+                                 r["pedagio"], r["gasto_extra"], r["pagto_estadia"], str(r["descricao_gasto_extra"]).strip(), r["diesel"], r["consumo"], r["arla"], r["consumo_arla"], r["origem"], r["destino"], r["nf"], r["veiculo_placa"], 
+                                 int(r["qtd_viagens"]), r["id"]))
+                alerta_gravado()
+                st.session_state.viagens_exec_editando = False
+                st.rerun()
+
+            if c_h2.button("🔴 Excluir Selecionados", type="primary", disabled=not st.session_state.viagens_exec_editando):
+                ids = df_ed[df_ed["Excluir"] == True]["id"].tolist()
+                if not ids:
+                    st.warning("Marque pelo menos uma linha na coluna 🗑️ para excluir.")
+                    st.stop()
+                with conn() as c:
+                    for i in ids: c.execute("DELETE FROM viagens WHERE id=?", (i,))
+                st.session_state.viagens_exec_editando = False
+                st.rerun()
+
+            if c_h3.button("🖨️ Imprimir", use_container_width=True, key="btn_print_historico_data"):
+                total_frete_periodo = float(pd.to_numeric(df_ed["Total Frete Valor"], errors="coerce").fillna(0.0).sum())
+                total_frete_periodo += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
+                if "qtd_viagens" in df_ed.columns:
+                    qtd_imp = pd.to_numeric(df_ed["qtd_viagens"], errors="coerce").fillna(1.0)
+                    qtd_imp = qtd_imp.apply(lambda x: max(1, int(round(float(x)))))
+                else:
+                    qtd_imp = pd.Series(1, index=df_ed.index, dtype=int)
+                total_gasto_extra_periodo = float((pd.to_numeric(df_ed["gasto_extra"], errors="coerce").fillna(0.0) * qtd_imp).sum())
+                total_estadia_periodo = float((pd.to_numeric(df_ed["pagto_estadia"], errors="coerce").fillna(0.0) * qtd_imp).sum())
+                html_hist = f"""
+                <html>
+                <head>
+                    <style>
+                        body {{ font-family: sans-serif; margin: 24px; color: #333; }}
+                        header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+                        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
+                        th, td {{ border: 1px solid #999; padding: 8px; text-align: left; }}
+                        th {{ background-color: #f2f2f2; }}
+                        .resumo {{ margin-top: 14px; text-align: right; font-size: 15px; font-weight: bold; }}
+                        .btn-print {{ background: #007bff; color: white; padding: 12px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 14px; border-radius: 5px; }}
+                        @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
+                    </style>
+                </head>
+                <body>
+                    <button class="btn-print" onclick="window.print()">🖨️ IMPRIMIR HISTÓRICO</button>
+                    <header>
+                        <h2 style="margin:0;">Histórico de Fretes</h2>
+                        <p style="margin:6px 0;">Período: <b>{filtro_ini.strftime('%d/%m/%Y')}</b> até <b>{filtro_fim.strftime('%d/%m/%Y')}</b></p>
+                    </header>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Data</th>
+                                <th>NF</th>
+                                <th>Origem</th>
+                                <th>Destino</th>
+                                <th>Peso (KG)</th>
+                                <th>Valor Tonelada</th>
+                                <th>Placa</th>
+                                <th>Total Frete</th>
+                                <th>Gasto Extra</th>
+                                <th>Pagto Estadia</th>
+                                <th>Descrição Gasto Extra</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                """
+
+                for _, r in df_ed.iterrows():
+                    dt = pd.to_datetime(r["data"], errors="coerce")
+                    data_br = dt.strftime('%d/%m/%Y') if pd.notna(dt) else "-"
+                    nf = str(r["nf"]).strip() if pd.notna(r["nf"]) and str(r["nf"]).strip() else "-"
+                    origem = str(r["origem"]).strip() if pd.notna(r["origem"]) else "-"
+                    destino = str(r["destino"]).strip() if pd.notna(r["destino"]) else "-"
+                    peso_kg = float(pd.to_numeric(r["peso_kg"], errors="coerce")) if pd.notna(pd.to_numeric(r["peso_kg"], errors="coerce")) else 0.0
+                    valor_ton = float(pd.to_numeric(r["valor_ton"], errors="coerce")) if pd.notna(pd.to_numeric(r["valor_ton"], errors="coerce")) else 0.0
+                    placa = str(r["veiculo_placa"]).strip() if pd.notna(r["veiculo_placa"]) else "-"
+                    total_frete = float(pd.to_numeric(r["Total Frete Valor"], errors="coerce")) if pd.notna(pd.to_numeric(r["Total Frete Valor"], errors="coerce")) else 0.0
+                    gasto_extra = float(pd.to_numeric(r["gasto_extra"], errors="coerce")) if pd.notna(pd.to_numeric(r["gasto_extra"], errors="coerce")) else 0.0
+                    pagto_estadia = float(pd.to_numeric(r["pagto_estadia"], errors="coerce")) if pd.notna(pd.to_numeric(r["pagto_estadia"], errors="coerce")) else 0.0
+                    desc_gasto_extra = str(r["descricao_gasto_extra"]).strip() if pd.notna(r["descricao_gasto_extra"]) and str(r["descricao_gasto_extra"]).strip() else "-"
+                    html_hist += f"""
+                        <tr>
+                            <td>{data_br}</td>
+                            <td>{nf}</td>
+                            <td>{origem}</td>
+                            <td>{destino}</td>
+                            <td>{format_br(peso_kg, casas_decimais=0)}</td>
+                            <td>{brl(valor_ton)}</td>
+                            <td>{placa}</td>
+                            <td>{brl(total_frete)}</td>
+                            <td>{brl(gasto_extra)}</td>
+                            <td>{brl(pagto_estadia)}</td>
+                            <td>{desc_gasto_extra}</td>
+                        </tr>
+                    """
+
+                html_hist += f"""
+                        </tbody>
+                    </table>
+                    <div class="resumo">TOTAL FRETE NO PERÍODO: {brl(total_frete_periodo)}</div>
+                    <div class="resumo">TOTAL GASTO EXTRA NO PERÍODO: {brl(total_gasto_extra_periodo)}</div>
+                    <div class="resumo">TOTAL PAGTO ESTADIA NO PERÍODO: {brl(total_estadia_periodo)}</div>
+                    <script>
+                        setTimeout(function(){{ window.print(); }}, 600);
+                    </script>
+                </body>
+                </html>
+                """
+                components.html(html_hist, height=900, scrolling=True)
+
+        with tab_lucro_exec:
+            df_rank = df_exibir.copy()
+            for col in ["km", "qtd_viagens", "pedagio", "gasto_extra", "pagto_estadia", "consumo", "diesel", "arla"]:
+                if col not in df_rank.columns:
+                    df_rank[col] = 0.0 if col != "qtd_viagens" else 1
+            df_rank["km"] = pd.to_numeric(df_rank["km"], errors="coerce").fillna(0.0)
+            df_rank["qtd_viagens"] = pd.to_numeric(df_rank["qtd_viagens"], errors="coerce").fillna(1.0)
+            df_rank["qtd_viagens"] = df_rank["qtd_viagens"].apply(lambda x: max(1, int(round(float(x)))))
+            df_rank["pedagio"] = pd.to_numeric(df_rank["pedagio"], errors="coerce").fillna(0.0)
+            df_rank["gasto_extra"] = pd.to_numeric(df_rank["gasto_extra"], errors="coerce").fillna(0.0)
+            df_rank["pagto_estadia"] = pd.to_numeric(df_rank["pagto_estadia"], errors="coerce").fillna(0.0)
+            df_rank["consumo"] = pd.to_numeric(df_rank["consumo"], errors="coerce").fillna(0.0)
+            df_rank["diesel"] = pd.to_numeric(df_rank["diesel"], errors="coerce").fillna(0.0)
+            df_rank["arla"] = pd.to_numeric(df_rank["arla"], errors="coerce").fillna(0.0)
+
+            df_rank["km_total"] = (df_rank["km"] * df_rank["qtd_viagens"]).fillna(0.0)
+            df_rank["frete_total"] = pd.to_numeric(df_rank["Total Frete Valor"], errors="coerce").fillna(0.0)
+            df_rank["custo_diesel_total"] = pd.to_numeric(df_rank["Diesel/KM"], errors="coerce").fillna(0.0)
+            df_rank["custo_arla_total"] = pd.to_numeric(df_rank["Gasto Arla"], errors="coerce").fillna(0.0)
+            df_rank["custo_pedagio_total"] = (df_rank["pedagio"] * df_rank["qtd_viagens"]).fillna(0.0)
+            df_rank["custo_extra_total"] = (df_rank["gasto_extra"] * df_rank["qtd_viagens"]).fillna(0.0)
+            df_rank = aplicar_parametros_por_data(df_rank, col_data="data")
+            pct_comissao_series_rank = (pd.to_numeric(df_rank["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)
+            pct_imposto_series_rank = (pd.to_numeric(df_rank["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)
+            df_rank["custo_motorista_comissao_total"] = (df_rank["frete_total"] * pct_comissao_series_rank).fillna(0.0)
+            df_rank["custo_imposto_total"] = (df_rank["frete_total"] * pct_imposto_series_rank).fillna(0.0)
+
+            df_rank["custo_total_profissional"] = (
+                df_rank["custo_diesel_total"]
+                + df_rank["custo_arla_total"]
+                + df_rank["custo_pedagio_total"]
+                + df_rank["custo_extra_total"]
+                + df_rank["custo_motorista_comissao_total"]
+                + df_rank["custo_imposto_total"]
+            ).fillna(0.0)
+            df_rank["lucro_liquido_total"] = (df_rank["frete_total"] - df_rank["custo_total_profissional"]).fillna(0.0)
+            df_rank["lucro_liquido_por_km"] = (
+                df_rank["lucro_liquido_total"] / df_rank["km_total"].where(df_rank["km_total"] > 0)
+            ).fillna(0.0)
+            df_rank["custo_total_por_km"] = (
+                df_rank["custo_total_profissional"] / df_rank["km_total"].where(df_rank["km_total"] > 0)
+            ).fillna(0.0)
+            df_rank["margem_liquida_pct"] = (
+                (df_rank["lucro_liquido_total"] / df_rank["frete_total"].where(df_rank["frete_total"] > 0)) * 100.0
+            ).fillna(0.0)
+            df_rank["rota"] = (
+                df_rank["origem"].fillna("").astype(str).str.strip()
+                + " → "
+                + df_rank["destino"].fillna("").astype(str).str.strip()
+            )
+            df_rank["viagem_label"] = (
+                df_rank["data"].astype(str)
+                + " | "
+                + df_rank["cliente"].fillna("").astype(str).str.strip()
+                + " | "
+                + df_rank["rota"]
+            )
+
+            origem_norm = df_rank["origem"].fillna("").astype(str).str.strip().str.upper()
+            destino_norm = df_rank["destino"].fillna("").astype(str).str.strip().str.upper()
+            mask_od_diferente = origem_norm != destino_norm
+            qtd_ignoradas_od_igual = int((~mask_od_diferente).sum())
+            df_rank = df_rank.loc[mask_od_diferente].copy()
+            if qtd_ignoradas_od_igual > 0:
+                st.info(
+                    f"{qtd_ignoradas_od_igual} viagem(ns) com origem = destino foram desconsideradas no comparativo."
+                )
+
+            if (df_rank["consumo"] <= 0).any():
+                st.warning("Há viagens com consumo igual a 0.00; ajuste no grid para ranking mais fiel.")
+
+            total_receita = float(df_rank["frete_total"].sum())
+            total_custos = float(df_rank["custo_total_profissional"].sum())
+            total_lucro = float(df_rank["lucro_liquido_total"].sum())
+            frete_fixo_periodo_rank = frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
+            custo_comissao_frete_fixo_rank = float(
+                (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+                 * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+            )
+            custo_imposto_frete_fixo_rank = float(
+                (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+                 * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+            )
+            total_receita += frete_fixo_periodo_rank
+            total_custos += (custo_comissao_frete_fixo_rank + custo_imposto_frete_fixo_rank)
+            total_lucro += (frete_fixo_periodo_rank - custo_comissao_frete_fixo_rank - custo_imposto_frete_fixo_rank)
+            margem_total_pct = (total_lucro / total_receita * 100.0) if total_receita > 0 else 0.0
+
+            g1, g2, g3, g4 = st.columns(4)
+            g1.metric("Receita Total", brl(total_receita))
+            g2.metric("Custo Total", brl(total_custos))
+            g3.metric("Lucro Líquido", brl(total_lucro))
+            g4.metric("Margem Líquida", f"{margem_total_pct:.2f}%")
+            st.caption("Cálculo atual sem manutenção, pneu, depreciação e fixos rateados.")
+
+            df_rank["origem_key"] = df_rank["origem"].fillna("").astype(str).str.strip().str.upper()
+            df_rank["destino_key"] = df_rank["destino"].fillna("").astype(str).str.strip().str.upper()
+            df_rotas = (
+                df_rank.groupby(["origem_key", "destino_key"], as_index=False)
+                .agg(
+                    qtd_lancamentos=("id", "count"),
+                    qtd_viagens=("qtd_viagens", "sum"),
+                    km_total=("km_total", "sum"),
+                    frete_total=("frete_total", "sum"),
+                    custo_diesel_total=("custo_diesel_total", "sum"),
+                    custo_arla_total=("custo_arla_total", "sum"),
+                    custo_pedagio_total=("custo_pedagio_total", "sum"),
+                    custo_extra_total=("custo_extra_total", "sum"),
+                    custo_motorista_comissao_total=("custo_motorista_comissao_total", "sum"),
+                    custo_imposto_total=("custo_imposto_total", "sum"),
+                    custo_total_profissional=("custo_total_profissional", "sum"),
+                    lucro_liquido_total=("lucro_liquido_total", "sum"),
+                )
+            )
+            if not df_rotas.empty and frete_fixo_periodo_rank > 0:
+                total_receita_rotas_rank = float(df_rotas["frete_total"].sum())
+                if total_receita_rotas_rank > 0:
+                    proporcao_rotas_rank = df_rotas["frete_total"] / total_receita_rotas_rank
+                    receita_fixa_rateada_rank = frete_fixo_periodo_rank * proporcao_rotas_rank
+                    custo_comissao_fixa_rateada_rank = custo_comissao_frete_fixo_rank * proporcao_rotas_rank
+                    custo_imposto_fixa_rateada_rank = custo_imposto_frete_fixo_rank * proporcao_rotas_rank
+                    custo_total_fixo_rateado_rank = custo_comissao_fixa_rateada_rank + custo_imposto_fixa_rateada_rank
+                    df_rotas["frete_total"] = df_rotas["frete_total"] + receita_fixa_rateada_rank
+                    df_rotas["custo_motorista_comissao_total"] = df_rotas["custo_motorista_comissao_total"] + custo_comissao_fixa_rateada_rank
+                    df_rotas["custo_imposto_total"] = df_rotas["custo_imposto_total"] + custo_imposto_fixa_rateada_rank
+                    df_rotas["custo_total_profissional"] = df_rotas["custo_total_profissional"] + custo_total_fixo_rateado_rank
+                    df_rotas["lucro_liquido_total"] = df_rotas["lucro_liquido_total"] + (receita_fixa_rateada_rank - custo_total_fixo_rateado_rank)
+            df_rotas["origem"] = df_rotas["origem_key"]
+            df_rotas["destino"] = df_rotas["destino_key"]
+            df_rotas["rota"] = df_rotas["origem"] + " → " + df_rotas["destino"]
+            df_rotas["lucro_liquido_por_km"] = (
+                df_rotas["lucro_liquido_total"] / df_rotas["km_total"].where(df_rotas["km_total"] > 0)
+            ).fillna(0.0)
+            df_rotas["margem_liquida_pct"] = (
+                (df_rotas["lucro_liquido_total"] / df_rotas["frete_total"].where(df_rotas["frete_total"] > 0)) * 100.0
+            ).fillna(0.0)
+
+            ranking_lucro = df_rotas.sort_values(["lucro_liquido_total", "margem_liquida_pct"], ascending=False)
+            top3_lucrativas = ranking_lucro.head(3)
+            mais_lucrativa = ranking_lucro.head(1)
+            mais_viavel = df_rotas.sort_values("lucro_liquido_por_km", ascending=False).head(1)
+
+            if not top3_lucrativas.empty:
+                st.markdown("##### Top 3 Rotas Mais Lucrativas")
+                cores_cards = [
+                    ("#dcfce7", "#166534"),  # 1º lugar (verde)
+                    ("#fef9c3", "#854d0e"),  # 2º lugar (amarelo)
+                    ("#fee2e2", "#991b1b"),  # 3º lugar (vermelho)
+                ]
+                col_top1, col_top2, col_top3 = st.columns(3)
+                colunas_top = [col_top1, col_top2, col_top3]
+                for idx, (_, r_top) in enumerate(top3_lucrativas.iterrows()):
+                    bg, cor_texto = cores_cards[idx]
+                    colunas_top[idx].markdown(
+                        f"""
+                        <div style="background:{bg}; border-left: 6px solid {cor_texto}; border-radius:10px; padding:12px; min-height:128px;">
+                            <div style="font-size:12px; color:{cor_texto}; font-weight:700;">{idx + 1}º MAIS LUCRATIVA</div>
+                            <div style="font-size:20px; color:{cor_texto}; font-weight:800; margin-top:4px;">{brl(float(r_top["lucro_liquido_total"]))}</div>
+                            <div style="font-size:12px; color:{cor_texto};">{str(r_top["origem"])} → {str(r_top["destino"])}</div>
+                            <div style="font-size:12px; color:{cor_texto}; margin-top:8px;">Lançamentos: {int(r_top["qtd_lancamentos"])}</div>
+                            <div style="font-size:11px; color:{cor_texto}; margin-top:6px;">Viabilidade real: {brl(float(r_top["lucro_liquido_por_km"]))}/km</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+            a1, a2 = st.columns(2)
+            if not mais_lucrativa.empty:
+                r1 = mais_lucrativa.iloc[0]
+                a1.metric(
+                    "Rota Mais Lucrativa",
+                    brl(float(r1["lucro_liquido_total"])),
+                    f"{str(r1['origem'])}→{str(r1['destino'])}",
+                )
+            if not mais_viavel.empty:
+                r2 = mais_viavel.iloc[0]
+                a2.metric(
+                    "Rota Mais Viável (Lucro/KM)",
+                    brl(float(r2["lucro_liquido_por_km"])) + "/km",
+                    f"{str(r2['origem'])}→{str(r2['destino'])}",
+                )
+
+            st.caption("Lucro Líquido = Receita - (Diesel + Arla + Pedágio + Extra + Comissão + Imposto).")
+
+            col_rank = [
+                "rota",
+                "qtd_lancamentos",
+                "qtd_viagens",
+                "km_total",
+                "frete_total",
+                "custo_diesel_total",
+                "custo_arla_total",
+                "custo_pedagio_total",
+                "custo_extra_total",
+                "custo_motorista_comissao_total",
+                "custo_imposto_total",
+                "custo_total_profissional",
+                "lucro_liquido_total",
+                "lucro_liquido_por_km",
+                "margem_liquida_pct",
+            ]
+            st.dataframe(
+                df_rotas[col_rank].sort_values(["lucro_liquido_total", "margem_liquida_pct"], ascending=False),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "rota": "Rota",
+                    "qtd_lancamentos": st.column_config.NumberColumn("Lançamentos", format="%.0f"),
+                    "qtd_viagens": st.column_config.NumberColumn("Qtd", format="%.0f"),
+                    "km_total": st.column_config.NumberColumn("KM Total", format="%.0f"),
+                    "frete_total": st.column_config.NumberColumn("Frete Total", format="R$ %.2f"),
+                    "custo_diesel_total": st.column_config.NumberColumn("Custo Diesel", format="R$ %.2f"),
+                    "custo_arla_total": st.column_config.NumberColumn("Custo Arla", format="R$ %.2f"),
+                    "custo_pedagio_total": st.column_config.NumberColumn("Pedágio", format="R$ %.2f"),
+                    "custo_extra_total": st.column_config.NumberColumn("Gasto Extra", format="R$ %.2f"),
+                    "custo_motorista_comissao_total": st.column_config.NumberColumn("Comissão Motorista", format="R$ %.2f"),
+                    "custo_imposto_total": st.column_config.NumberColumn("Imposto", format="R$ %.2f"),
+                    "custo_total_profissional": st.column_config.NumberColumn("Custo Total", format="R$ %.2f"),
+                    "lucro_liquido_total": st.column_config.NumberColumn("Lucro Líquido", format="R$ %.2f"),
+                    "lucro_liquido_por_km": st.column_config.NumberColumn("Lucro Líquido/KM", format="R$ %.2f"),
+                    "margem_liquida_pct": st.column_config.NumberColumn("Margem Líquida (%)", format="%.2f%%"),
+                },
+            )
+
+with aba3:
+    if not df_db.empty:
+        df_ana = df_db.copy()
+        origem_norm_ana = df_ana["origem"].fillna("").astype(str).str.strip().str.upper()
+        destino_norm_ana = df_ana["destino"].fillna("").astype(str).str.strip().str.upper()
+        mask_od_diferente_ana = origem_norm_ana != destino_norm_ana
+        qtd_ignoradas_ana = int((~mask_od_diferente_ana).sum())
+        df_ana = df_ana.loc[mask_od_diferente_ana].copy()
+        if qtd_ignoradas_ana > 0:
+            st.info(
+                f"{qtd_ignoradas_ana} viagem(ns) com origem = destino foram desconsideradas na aba Análise."
+            )
+        df_ana["consumo"] = pd.to_numeric(df_ana["consumo"], errors="coerce")
+        df_ana["diesel"] = pd.to_numeric(df_ana["diesel"], errors="coerce").fillna(0.0)
+        df_ana["pedagio"] = pd.to_numeric(df_ana["pedagio"], errors="coerce").fillna(0.0)
+        if "gasto_extra" not in df_ana.columns:
+            df_ana["gasto_extra"] = 0.0
+        if "pagto_estadia" not in df_ana.columns:
+            df_ana["pagto_estadia"] = 0.0
+        df_ana["gasto_extra"] = pd.to_numeric(df_ana["gasto_extra"], errors="coerce").fillna(0.0)
+        df_ana["pagto_estadia"] = pd.to_numeric(df_ana["pagto_estadia"], errors="coerce").fillna(0.0)
+        if "qtd_viagens" not in df_ana.columns:
+            df_ana["qtd_viagens"] = 1
+        df_ana["qtd_viagens"] = pd.to_numeric(df_ana["qtd_viagens"], errors="coerce").fillna(1.0)
+        df_ana["qtd_viagens"] = df_ana["qtd_viagens"].apply(lambda x: max(1, int(round(float(x)))))
+        with conn() as c:
+            df_abs_ana = pd.read_sql(
+                """SELECT tipo_combustivel, qtde_litros, total_gasto
+                   FROM abastecimentos
+                   WHERE date(data) BETWEEN ? AND ?""",
+                c,
+                params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
+            )
+        if not df_abs_ana.empty:
+            df_abs_ana["tipo_combustivel"] = df_abs_ana["tipo_combustivel"].apply(normalizar_tipo_combustivel)
+            df_abs_ana["qtde_litros"] = pd.to_numeric(df_abs_ana["qtde_litros"], errors="coerce").fillna(0.0)
+            df_abs_ana["total_gasto"] = pd.to_numeric(df_abs_ana["total_gasto"], errors="coerce").fillna(0.0)
+            t_litros_diesel_ana = float(
+                df_abs_ana[df_abs_ana["tipo_combustivel"].str.contains("DIESEL", na=False)]["qtde_litros"].sum()
+            )
+            t_litros_arla_ana = float(
+                df_abs_ana[df_abs_ana["tipo_combustivel"].str.contains("ARLA", na=False)]["qtde_litros"].sum()
+            )
+            t_valor_arla_ana = float(
+                df_abs_ana[df_abs_ana["tipo_combustivel"].str.contains("ARLA", na=False)]["total_gasto"].sum()
+            )
+        else:
+            t_litros_diesel_ana = 0.0
+            t_litros_arla_ana = 0.0
+            t_valor_arla_ana = 0.0
+
+        t_rec = float(
+            (
+                (
+                    pd.to_numeric(df_ana["Total Frete"], errors="coerce").fillna(0.0)
+                    + pd.to_numeric(df_ana["pagto_estadia"], errors="coerce").fillna(0.0)
+                )
+                * df_ana["qtd_viagens"]
+            ).sum()
+        )
+        frete_fixo_periodo_ana = frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
+        t_rec += frete_fixo_periodo_ana
+
+        # Evita distorções no custo diesel quando o consumo está zerado ou inválido.
+        consumo_valido = df_ana["consumo"] > 0
+        df_ana["custo_diesel"] = 0.0
+        df_ana.loc[consumo_valido, "custo_diesel"] = (
+            ((df_ana.loc[consumo_valido, "km"] * df_ana.loc[consumo_valido, "qtd_viagens"]) / df_ana.loc[consumo_valido, "consumo"])
+            * df_ana.loc[consumo_valido, "diesel"]
+        )
+
+        t_die = float(df_ana["custo_diesel"].sum())
+        df_ana = aplicar_parametros_por_data(df_ana, col_data="data")
+        df_ana["km_total"] = (pd.to_numeric(df_ana["km"], errors="coerce").fillna(0.0) * df_ana["qtd_viagens"]).fillna(0.0)
+        df_ana["receita_viagem"] = (
+            (
+                pd.to_numeric(df_ana["Total Frete"], errors="coerce").fillna(0.0)
+                + pd.to_numeric(df_ana["pagto_estadia"], errors="coerce").fillna(0.0)
+            )
+            * df_ana["qtd_viagens"]
+        ).fillna(0.0)
+        t_km = float(df_ana["km_total"].sum())
+        t_pneu = float((df_ana["km_total"] * pd.to_numeric(df_ana["param_pneu"], errors="coerce").fillna(0.0)).sum())
+        t_manut = float((df_ana["km_total"] * pd.to_numeric(df_ana["param_manut"], errors="coerce").fillna(0.0)).sum())
+        t_depre = float((df_ana["km_total"] * pd.to_numeric(df_ana["param_depre"], errors="coerce").fillna(0.0)).sum())
+        t_ped = float((df_ana["pedagio"] * df_ana["qtd_viagens"]).sum())
+        t_extra = float((df_ana["gasto_extra"] * df_ana["qtd_viagens"]).sum())
+        t_estadia = float((df_ana["pagto_estadia"] * df_ana["qtd_viagens"]).sum())
+        t_comis_viagens = float(
+            (df_ana["receita_viagem"] * (pd.to_numeric(df_ana["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
+        )
+        t_imposto_viagens = float(
+            (df_ana["receita_viagem"] * (pd.to_numeric(df_ana["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
+        )
+        t_comis_frete_fixo = float(
+            (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+             * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+        )
+        t_imposto_frete_fixo = float(
+            (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+             * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+        )
+        t_comis = t_comis_viagens + t_comis_frete_fixo
+        t_imposto = t_imposto_viagens + t_imposto_frete_fixo
+
+        dias_periodo = max(1, (filtro_fim - filtro_ini).days + 1)
+        t_mot_fixo_rateado = valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim)
+        t_seguro = valor_mensal_rateado_periodo("seguro", filtro_ini, filtro_fim)
+        t_fin = valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim)
+        # IPVA informado como valor anual: rateio proporcional por dia.
+        t_ipva = valor_anual_rateado_periodo("pagto_ipva", filtro_ini, filtro_fim)
+        t_escritorio = valor_mensal_rateado_periodo("cmp_custo_escritorio", filtro_ini, filtro_fim)
+        t_mot_total = t_mot_fixo_rateado + t_comis
+
+        lucro = t_rec - (
+            t_die + t_valor_arla_ana + t_pneu + t_manut + t_depre + t_mot_total +
+            t_ped + t_escritorio + t_extra + t_seguro + t_fin + t_ipva + t_imposto
+        )
+
+        m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+        m1.metric("Total KM no Período", f"{format_br(t_km, casas_decimais=0)} KM")
+        m2.metric("Total Litro Diesel", f"{t_litros_diesel_ana:.2f} L")
+        m3.metric("Total Valor Diesel", brl(t_die))
+        m4.metric("Total Litro Arla", f"{t_litros_arla_ana:.2f} L")
+        m5.metric("Valor Total Arla (Despesa)", brl(t_valor_arla_ana))
+        m6.metric("Faturamento", brl(t_rec))
+        m7.metric("Custo Total no Período (inclui Arla)", brl(t_rec - lucro))
+        m8.metric("Lucro Líquido (com Arla)", brl(lucro))
+
+        df_custos = pd.DataFrame(
+            {
+                "Categoria": [
+                    "Diesel",
+                    "Arla",
+                    "Pneu",
+                    "Manutenção",
+                    "Depreciação",
+                    "Motorista (Rateado)",
+                    "Pedágio",
+                    "Escritório",
+                    "Gasto Extra",
+                    "Seguro (Rateado)",
+                    "Financiamento (Rateado)",
+                    "Pagto IPVA (Rateado)",
+                    "Imposto",
+                    "Lucro",
+                ],
+                "Valor": [t_die, t_valor_arla_ana, t_pneu, t_manut, t_depre, t_mot_total, t_ped, t_escritorio, t_extra, t_seguro, t_fin, t_ipva, t_imposto, max(0, lucro)],
+            }
+        )
+        df_custos["Legenda"] = df_custos.apply(
+            lambda r: f"{brl(r['Valor'])} - {r['Categoria']}",
+            axis=1,
+        )
+        base_colors = [
+            "#60a5fa", "#f59e0b", "#34d399", "#f472b6", "#a78bfa",
+            "#f87171", "#22d3ee", "#fbbf24", "#818cf8", "#fb7185", "#10b981"
+        ]
+
+        def escurecer_hex(cor_hex, fator=0.72):
+            cor_hex = str(cor_hex).lstrip("#")
+            if len(cor_hex) != 6:
+                return "#999999"
+            r = int(cor_hex[0:2], 16)
+            g = int(cor_hex[2:4], 16)
+            b = int(cor_hex[4:6], 16)
+            r = max(0, min(255, int(r * fator)))
+            g = max(0, min(255, int(g * fator)))
+            b = max(0, min(255, int(b * fator)))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        cores_topo = [base_colors[i % len(base_colors)] for i in range(len(df_custos))]
+        cores_sombra = [escurecer_hex(c, 0.64) for c in cores_topo]
+
+        fig = go.Figure()
+        profundidade = 10
+        for i in range(profundidade):
+            desloc_y = 0.01 + (i * 0.003)
+            fig.add_trace(
+                go.Pie(
+                    labels=df_custos["Legenda"],
+                    values=df_custos["Valor"],
+                    hole=0.55,
+                    sort=False,
+                    direction="clockwise",
+                    rotation=30,
+                    marker=dict(colors=cores_sombra, line=dict(color="#4b5563", width=0.2)),
+                    textinfo="none",
+                    hoverinfo="skip",
+                    showlegend=False,
+                    domain=dict(x=[0.02, 0.98], y=[desloc_y, 0.90 + desloc_y]),
+                )
+            )
+
+        fig.add_trace(
+            go.Pie(
+                labels=df_custos["Legenda"],
+                values=df_custos["Valor"],
+                hole=0.55,
+                sort=False,
+                direction="clockwise",
+                rotation=30,
+                marker=dict(colors=cores_topo, line=dict(color="#ffffff", width=1.2)),
+                textposition="outside",
+                textinfo="percent",
+                hovertemplate="%{label}<br>%{percent}<extra></extra>",
+                showlegend=True,
+                domain=dict(x=[0.02, 0.98], y=[0.05, 0.95]),
+            )
+        )
+
+        fig.update_layout(
+            title="Distribuição de Custos (Efeito 3D)",
+            margin=dict(l=10, r=330, t=60, b=10),
+            legend=dict(
+                orientation="v",
+                y=0.5,
+                yanchor="middle",
+                x=1.02,
+                xanchor="left",
+                font=dict(size=11),
+            ),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"Rateio dos custos fixos considerando {dias_periodo} dia(s) no filtro com vigência histórica dos parâmetros. IPVA rateado por dia (anual/365).")
+
+
+
+
+# ==================================================================================
+# ABA 4 - MANUTENÇÃO (ATUALIZADA: FLUXO DE ENTRADA, CONCLUSÃO E HISTÓRICO)
+# ==================================================================================
+with aba4:
+    st.subheader("🛠️ Gestão de Manutenção")
+    
+    if not apenas_placas or not oficinas_db:
+        st.warning("⚠️ Cadastre veículos e oficinas primeiro.")
+    else:
+        col_ent, col_con = st.columns(2)
+        
+        # --- 1. ENTRADA (ABERTURA) ---
+        with col_ent:
+            st.markdown("### 1️⃣ Abrir Ordem (Entrada)")
+            with st.form("f_manut_entrada_v10", clear_on_submit=True):
+                c_e1, c_e2 = st.columns(2)
+                d_e = c_e1.date_input("Data de Entrada", format="DD/MM/YYYY")
+                num_os = c_e2.text_input("Nº O.S.")
+                
+                v_m = st.selectbox("Veículo", apenas_placas)
+                k_m = st.number_input("KM Entrada", step=1.0)
+                o_m = st.selectbox("Oficina", list(dict_oficinas.keys()))
+                def_m = st.text_area("Relato do Defeito")
+                
+                if st.form_submit_button("💾 Gravar", key="btn_manut_entrada_gravar"):
+                    with conn() as c:
+                        c.execute("""INSERT INTO manutencoes (data_entrada, veiculo_placa, oficina_id, defeito, km_servico, num_os) 
+                                     VALUES (?,?,?,?,?,?)""", (d_e.isoformat(), v_m, dict_oficinas[o_m], def_m, k_m, num_os))
+                    alerta_gravado()
+                    st.rerun()
+
+        # --- 2. CONCLUSÃO (FINALIZAÇÃO) ---
+        with col_con:
+            st.markdown("### 2️⃣ Finalizar Serviço")
+            with conn() as c:
+                abertas = c.execute("SELECT m.id, m.veiculo_placa, o.nome, m.data_entrada FROM manutencoes m JOIN oficinas o ON m.oficina_id = o.id WHERE (m.servico IS NULL OR m.servico = '')").fetchall()
+            
+            if abertas:
+                opc_ab = {f"{a['veiculo_placa']} | {a['nome']} ({datetime.strptime(a['data_entrada'], '%Y-%m-%d').strftime('%d/%m/%Y')})": a['id'] for a in abertas}
+                sel_ab = st.selectbox("Selecionar Ordem Aberta", list(opc_ab.keys()))
+                
+                with st.form("f_manut_concl_v10"):
+                    c_s1, c_s2 = st.columns(2)
+                    d_f = c_s1.date_input("Data Saída", format="DD/MM/YYYY")
+                    num_nf = c_s2.text_input("Nº Nota Fiscal (N.F.)")
+                    
+                    serv_f = st.text_area("Serviço Realizado")
+                    
+                    c1, c2, c3 = st.columns(3)
+                    v_mo = c1.number_input("Mão de Obra (R$)", min_value=0.0, step=10.0)
+                    v_pe = c2.number_input("Peças (R$)", min_value=0.0, step=10.0)
+                    dt_gar = c3.date_input("Vencimento Garantia", format="DD/MM/YYYY")
+                    
+                    # Campo Visual do Total
+                    st.info(f"💰 **Total do Serviço: {brl(v_mo + v_pe)}**")
+                    
+                    obs_f = st.text_area("Observações Adicionais")
+                    
+                    if st.form_submit_button("💾 Gravar", key="btn_manut_conclusao_gravar"):
+                        with conn() as c:
+                            c.execute("""UPDATE manutencoes SET data_fim=?, servico=?, valor_mo=?, valor_pecas=?, num_nf=?, 
+                                         data_vencimento_garantia=?, observacao_adicional=? 
+                                         WHERE id=?""", (d_f.isoformat(), serv_f, v_mo, v_pe, num_nf, dt_gar.isoformat(), obs_f, opc_ab[sel_ab]))
+                        alerta_gravado()
+                        st.rerun()
+            else:
+                st.info("Não há ordens pendentes de conclusão.")
+
+    # --- 3. HISTÓRICO COM EDIÇÃO TOTAL ---
+    st.markdown("---")
+    st.subheader("📋 Histórico e Auditoria")
+    
+    with conn() as c:
+        df_m = pd.read_sql("""SELECT m.*, o.nome as oficina_nome FROM manutencoes m 
+                              JOIN oficinas o ON m.oficina_id = o.id 
+                              WHERE m.data_entrada BETWEEN ? AND ? 
+                              ORDER BY m.data_entrada DESC""", 
+                           c, params=(filtro_ini.isoformat(), filtro_fim.isoformat()))
+
+    if not df_m.empty:
+        for idx, r in df_m.iterrows():
+            dt_ent_br = datetime.strptime(r['data_entrada'], '%Y-%m-%d').strftime('%d/%m/%Y')
+            status = "✅" if r['servico'] else "⏳"
+            # Soma do total para o título/resumo
+            valor_total_serv = (r['valor_mo'] or 0) + (r['valor_pecas'] or 0)
+            
+            titulo = f"{status} | {dt_ent_br} | {r['veiculo_placa']} | Total: {brl(valor_total_serv)}"
+            
+            with st.expander(titulo):
+                ed_key = f"edit_full_{r['id']}"
+                if ed_key not in st.session_state: st.session_state[ed_key] = False
+
+                if not st.session_state[ed_key]:
+                    # --- MODO VISUALIZAÇÃO ---
+                    col_v1, col_v2, col_v3 = st.columns(3)
+                    col_v1.write(f"**Oficina:** {r['oficina_nome']}")
+                    col_v1.write(f"**KM Entrada:** {r['km_servico']:,}".replace(",", "."))
+                    
+                    col_v2.write(f"**Nº NF:** {r['num_nf'] or '-'}")
+                    if r['data_fim']:
+                        dt_saida_br = datetime.strptime(r['data_fim'], '%Y-%m-%d').strftime('%d/%m/%Y')
+                        col_v2.write(f"**Data Saída:** {dt_saida_br}")
+                    
+                    if r['data_vencimento_garantia']:
+                        dt_gar_br = datetime.strptime(r['data_vencimento_garantia'], '%Y-%m-%d').strftime('%d/%m/%Y')
+                        col_v3.write(f"**🛡️ Garantia até:** {dt_gar_br}")
+
+                    st.divider()
+                    ca, cb = st.columns(2)
+                    ca.info(f"📋 **Defeito Relatado:**\n\n{r['defeito']}")
+                    cb.success(f"🔧 **Serviço Realizado:**\n\n{r['servico'] or 'Pendente'}")
+                    
+                    if r['observacao_adicional']:
+                        st.warning(f"📝 **Observação:** {r['observacao_adicional']}")
+                    
+                    # Exibição Financeira Detalhada
+                    st.markdown(f"""
+                    **Detalhamento Financeiro:**
+                    * Mão de Obra: {brl(r['valor_mo'] or 0)}
+                    * Peças: {brl(r['valor_pecas'] or 0)}
+                    * **TOTAL DO SERVIÇO: {brl(valor_total_serv)}**
+                    """)
+                    
+                    c_b1, c_b2 = st.columns(2)
+                    if c_b1.button("✏️ EDITAR TUDO", key=f"btn_ed_f_{r['id']}", use_container_width=True):
+                        st.session_state[ed_key] = True
+                        st.rerun()
+                    if c_b2.button("🗑️ EXCLUIR", key=f"btn_ex_f_{r['id']}", type="primary", use_container_width=True):
+                        with conn() as c: c.execute("DELETE FROM manutencoes WHERE id=?", (r['id'],))
+                        st.rerun()
+                else:
+                    # --- MODO EDIÇÃO COMPLETA ---
+                    with st.form(f"form_edit_total_{r['id']}"):
+                        st.markdown("**1️⃣ Dados de Entrada**")
+                        e_c1, e_c2, e_c3 = st.columns(3)
+                        val_dt_e = datetime.strptime(r['data_entrada'], '%Y-%m-%d').date() if r['data_entrada'] else datetime.now().date()
+                        ed_dt_e = e_c1.date_input("Data Entrada", value=val_dt_e, format="DD/MM/YYYY")
+                        ed_os = e_c2.text_input("Nº O.S.", value=r['num_os'] or "")
+                        ed_km = e_c3.number_input("KM Entrada", value=float(r['km_servico'] or 0))
+                        ed_def = st.text_area("Defeito Relatado", value=r['defeito'])
+                        
+                        st.divider()
+                        st.markdown("**2️⃣ Dados de Finalização**")
+                        e_c4, e_c5, e_c6 = st.columns(3)
+                        val_dt_f = datetime.strptime(r['data_fim'], '%Y-%m-%d').date() if r['data_fim'] else datetime.now().date()
+                        ed_dt_f = e_c4.date_input("Data Saída", value=val_dt_f, format="DD/MM/YYYY")
+                        ed_nf = e_c5.text_input("Nº N.F.", value=r['num_nf'] or "")
+                        val_dt_g = datetime.strptime(r['data_vencimento_garantia'], '%Y-%m-%d').date() if r['data_vencimento_garantia'] else datetime.now().date()
+                        ed_dt_g = e_c6.date_input("Vencimento Garantia", value=val_dt_g, format="DD/MM/YYYY")
+                        
+                        ed_serv = st.text_area("Serviço Realizado", value=r['servico'] or "")
+                        ed_obs = st.text_area("Observações Adicionais", value=r['observacao_adicional'] or "")
+                        
+                        e_c7, e_c8 = st.columns(2)
+                        ed_mo = e_c7.number_input("Valor Mão de Obra", value=float(r['valor_mo'] or 0))
+                        ed_pe = e_c8.number_input("Valor Peças", value=float(r['valor_pecas'] or 0))
+                        
+                        # Total dinâmico na edição
+                        st.warning(f"💰 **Novo Total Calculado: {brl(ed_mo + ed_pe)}**")
+
+                        b_col1, b_col2 = st.columns(2)
+                        if b_col1.form_submit_button("💾 Gravar", use_container_width=True, key=f"btn_manut_editar_gravar_{r['id']}"):
+                            with conn() as c:
+                                c.execute("""UPDATE manutencoes SET 
+                                             data_entrada=?, num_os=?, km_servico=?, defeito=?,
+                                             data_fim=?, num_nf=?, servico=?, valor_mo=?, valor_pecas=?,
+                                             data_vencimento_garantia=?, observacao_adicional=?
+                                             WHERE id=?""", 
+                                         (ed_dt_e.isoformat(), ed_os, ed_km, ed_def,
+                                          ed_dt_f.isoformat(), ed_nf, ed_serv, ed_mo, ed_pe, 
+                                          ed_dt_g.isoformat(), ed_obs, r['id']))
+                            st.session_state[ed_key] = False
+                            st.rerun()
+                        if b_col2.form_submit_button("❌ CANCELAR", use_container_width=True):
+                            st.session_state[ed_key] = False
+                            st.rerun()
+
+with aba5:
+    st.subheader("🏢 Gestão de Oficinas")
+    if "oficina_editando" not in st.session_state:
+        st.session_state.oficina_editando = False
+    
+    # --- FORMULÁRIO DE CADASTRO ---
+    with st.form("f_of", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        n_o = c1.text_input("Nome da Oficina")
+        cnpj_o = c2.text_input("CNPJ")
+        e_o = c1.text_input("Endereço")
+        b_o = c2.text_input("Bairro")
+        ci_o = c1.text_input("Cidade")
+        r_o = c2.text_input("Responsável / Contato")
+        
+        if st.form_submit_button("💾 Gravar", key="btn_oficina_cadastro_gravar"):
+            if n_o:
+                with conn() as c:
+                    c.execute("""INSERT INTO oficinas (nome, cnpj, endereco, bairro, cidade, responsavel) 
+                                 VALUES (?,?,?,?,?,?)""", (n_o, cnpj_o, e_o, b_o, ci_o, r_o))
+                alerta_gravado()
+                st.rerun()
+            else:
+                st.error("O nome da oficina é obrigatório.")
+
+    st.markdown("---")
+    st.markdown("### 📋 Editar ou Excluir Oficinas")
+
+    # --- TABELA DE EDIÇÃO E EXCLUSÃO ---
+    with conn() as c:
+        df_oficinas = pd.read_sql("SELECT * FROM oficinas ORDER BY nome ASC", c)
+
+    if not df_oficinas.empty:
+        st.button("✏️ Editar", key="btn_oficina_editar", use_container_width=True)
+        df_oficinas["Excluir"] = False
+        df_ed_of = st.data_editor(
+            df_oficinas,
+            key="editor_oficinas_art",
+            column_config={
+                "id": None,
+                "Excluir": st.column_config.CheckboxColumn("🗑️"),
+                "nome": st.column_config.TextColumn("Nome", width="medium"),
+                "cnpj": "CNPJ",
+                "endereco": "Endereço",
+                "bairro": "Bairro",
+                "cidade": "Cidade",
+                "responsavel": "Responsável"
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        col_btn1, col_btn2 = st.columns(2)
+        if col_btn1.button("💾 Gravar", key="btn_save_oficina"):
+            with conn() as c:
+                for _, r in df_ed_of.iterrows():
+                    if not r["Excluir"]:
+                        c.execute("""UPDATE oficinas SET 
+                                     nome=?, cnpj=?, endereco=?, bairro=?, cidade=?, responsavel=? 
+                                     WHERE id=?""", 
+                                  (r["nome"], r["cnpj"], r["endereco"], r["bairro"], r["cidade"], r["responsavel"], r["id"]))
+            alerta_gravado()
+            st.rerun()
+        if col_btn2.button("🔴 Excluir Oficinas Selecionadas", type="primary", key="btn_del_oficina"):
+            ids_para_excluir = df_ed_of[df_ed_of["Excluir"] == True]["id"].tolist()
+            if ids_para_excluir:
+                with conn() as c:
+                    for id_of in ids_para_excluir:
+                        c.execute("DELETE FROM oficinas WHERE id=?", (id_of,))
+                st.warning("Oficinas removidas.")
+                st.rerun()
+            else:
+                st.info("Marque a lixeira (🗑️) das oficinas que deseja remover.")
+    else:
+        st.info("Nenhuma oficina cadastrada no sistema.")
+
+
+with aba6:
+    st.subheader("🏙️ Cidades")
+    if "cidade_editando" not in st.session_state:
+        st.session_state.cidade_editando = False
+    if "msg_cidades" in st.session_state:
+        st.success(st.session_state.pop("msg_cidades"))
+
+    with st.form("cid_f", clear_on_submit=True):
+        nc = st.text_input("Nome da Cidade").strip().upper()
+        if st.form_submit_button("💾 Gravar", key="btn_cidade_cadastro_gravar"):
+            if not nc:
+                st.warning("Informe o nome da cidade.")
+            else:
+                with conn() as c:
+                    cur_cidade = c.execute("INSERT OR IGNORE INTO cidades (nome) VALUES (?)", (nc,))
+                if cur_cidade.rowcount == 0:
+                    st.warning("Essa cidade já está cadastrada.")
+                else:
+                    st.session_state.msg_cidades = "✅ Gravado com sucesso!"
+                    st.rerun()
+
+    with conn() as c:
+        df_cidades = pd.read_sql("SELECT id, nome FROM cidades ORDER BY nome", c)
+
+    if not df_cidades.empty:
+        st.button("✏️ Editar", key="btn_cidade_editar", use_container_width=True)
+        df_cidades["Editar"] = False
+        with st.form("form_editar_cidades"):
+            df_cidades_ed = st.data_editor(
+                df_cidades,
+                key="editor_cidades_art",
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "id": None,
+                    "nome": st.column_config.TextColumn("Nome da Cidade"),
+                    "Editar": st.column_config.CheckboxColumn("✏️ Editar", default=False),
+                },
+            )
+            salvar_edicao_cidades = st.form_submit_button("💾 Gravar", use_container_width=True, key="btn_cidade_edicao_gravar")
+
+        if salvar_edicao_cidades:
+            selecionadas = df_cidades_ed[df_cidades_ed["Editar"] == True]
+            if selecionadas.empty:
+                st.warning("Marque pelo menos uma cidade na coluna Editar.")
+            else:
+                alteradas = 0
+                erros = []
+                with conn() as c:
+                    nomes_atuais = {
+                        int(r["id"]): str(r["nome"]).strip().upper()
+                        for r in c.execute("SELECT id, nome FROM cidades").fetchall()
+                    }
+                    for _, row in selecionadas.iterrows():
+                        cidade_id = int(row["id"])
+                        nome_antigo = nomes_atuais.get(cidade_id, "")
+                        nome_novo = str(row["nome"] or "").strip().upper()
+                        if not nome_novo:
+                            erros.append(f"ID {cidade_id}: nome vazio.")
+                            continue
+                        if nome_novo == nome_antigo:
+                            continue
+                        nome_duplicado = c.execute(
+                            "SELECT 1 FROM cidades WHERE nome=? AND id<>?",
+                            (nome_novo, cidade_id),
+                        ).fetchone()
+                        if nome_duplicado:
+                            erros.append(f"{nome_novo}: já existe outra cidade com esse nome.")
+                            continue
+                        c.execute("UPDATE cidades SET nome=? WHERE id=?", (nome_novo, cidade_id))
+                        c.execute("UPDATE rotas SET origem=? WHERE origem=?", (nome_novo, nome_antigo))
+                        c.execute("UPDATE rotas SET destino=? WHERE destino=?", (nome_novo, nome_antigo))
+                        c.execute("UPDATE viagens SET origem=? WHERE origem=?", (nome_novo, nome_antigo))
+                        c.execute("UPDATE viagens SET destino=? WHERE destino=?", (nome_novo, nome_antigo))
+                        alteradas += 1
+                if alteradas:
+                    st.session_state.msg_cidades = "✅ Gravado com sucesso!"
+                    st.rerun()
+                if erros:
+                    st.warning(" | ".join(erros))
+    else:
+        st.info("Nenhuma cidade cadastrada.")
+
+with aba7:
+    st.subheader("🛣️ Gestão de Rotas (KM e Valores)")
+    if "rota_editando" not in st.session_state:
+        st.session_state.rota_editando = False
+    
+    # 1. FORMULÁRIO PARA NOVO CADASTRO
+    with st.expander("➕ Cadastrar Nova Rota", expanded=False):
+        with st.form("rota_f", clear_on_submit=True):
+            c1, c2, c3, c4, c5 = st.columns(5)
+            o = c1.selectbox("Origem", lista_cidades, key="orig_rota")
+            d = c2.selectbox("Destino", lista_cidades, key="dest_rota")
+            k = c3.number_input("Distância (KM)", min_value=0.0, step=0.1)
+            v = c4.number_input("Valor por Tonelada (R$)", min_value=0.0, step=0.01)
+            vk = c5.number_input("Valor por KM (R$)", min_value=0.0, step=0.01)
+            ce1, ce2 = st.columns(2)
+            nome_empresa_origem = ce1.text_input("Nome Empresa Origem", key="rota_nome_empresa_origem").strip()
+            nome_empresa_destino = ce2.text_input("Nome Empresa Destino", key="rota_nome_empresa_destino").strip()
+            
+            if st.form_submit_button("💾 Gravar", key="btn_rota_cadastro_gravar"):
+                if o == d:
+                    st.error("Origem e Destino não podem ser iguais.")
+                elif float(v) == 0.0 and float(vk) == 0.0:
+                    st.warning("VALOR NULO")
+                elif o and d:
+                    with conn() as c:
+                        c.execute(
+                            """INSERT OR REPLACE INTO rotas
+                               (origem, destino, nome_empresa_origem, nome_empresa_destino, km, valor_ton, valor_km)
+                               VALUES (?,?,?,?,?,?,?)""",
+                            (o, d, nome_empresa_origem, nome_empresa_destino, k, v, vk),
+                        )
+                    alerta_gravado()
+
+    st.markdown("---")
+    st.markdown("### 📋 Lista de Rotas Cadastradas")
+
+    # 2. BUSCA DOS DADOS
+    with conn() as c:
+        df_rotas = pd.read_sql("SELECT * FROM rotas ORDER BY origem, destino", c)
+
+    if not df_rotas.empty:
+        if "valor_km" not in df_rotas.columns:
+            df_rotas["valor_km"] = 0.0
+        if "nome_empresa_origem" not in df_rotas.columns:
+            df_rotas["nome_empresa_origem"] = ""
+        if "nome_empresa_destino" not in df_rotas.columns:
+            df_rotas["nome_empresa_destino"] = ""
+
+        st.markdown("### 📈 Comparativo de Lucratividade das Rotas")
+        df_cmp_rotas = df_rotas.copy()
+        df_cmp_rotas["km"] = pd.to_numeric(df_cmp_rotas["km"], errors="coerce").fillna(0.0)
+        df_cmp_rotas["valor_ton"] = pd.to_numeric(df_cmp_rotas["valor_ton"], errors="coerce").fillna(0.0)
+        df_cmp_rotas["valor_km"] = pd.to_numeric(df_cmp_rotas["valor_km"], errors="coerce").fillna(0.0)
+        df_cmp_rotas["rota"] = (
+            df_cmp_rotas["origem"].fillna("").astype(str).str.strip()
+            + " → "
+            + df_cmp_rotas["destino"].fillna("").astype(str).str.strip()
+        )
+        df_cmp_rotas["indice_ton_por_km"] = (
+            df_cmp_rotas["valor_ton"] / df_cmp_rotas["km"].where(df_cmp_rotas["km"] > 0)
+        ).fillna(0.0)
+        df_cmp_rotas["indice_lucratividade_ref"] = df_cmp_rotas["valor_km"]
+        sem_valor_km = df_cmp_rotas["indice_lucratividade_ref"] <= 0
+        df_cmp_rotas.loc[sem_valor_km, "indice_lucratividade_ref"] = df_cmp_rotas.loc[sem_valor_km, "indice_ton_por_km"]
+
+        top_km = df_cmp_rotas.sort_values("valor_km", ascending=False).head(1)
+        top_ton = df_cmp_rotas.sort_values("valor_ton", ascending=False).head(1)
+        top_ref = df_cmp_rotas.sort_values("indice_lucratividade_ref", ascending=False).head(1)
+
+        c_cmp1, c_cmp2, c_cmp3 = st.columns(3)
+        if not top_km.empty:
+            r_km = top_km.iloc[0]
+            c_cmp1.metric("Mais Lucrativa por Valor/KM", brl(float(r_km["valor_km"])) + "/km", str(r_km["rota"]))
+        if not top_ton.empty:
+            r_ton = top_ton.iloc[0]
+            c_cmp2.metric("Mais Lucrativa por Valor/Ton", brl(float(r_ton["valor_ton"])) + "/ton", str(r_ton["rota"]))
+        if not top_ref.empty:
+            r_ref = top_ref.iloc[0]
+            c_cmp3.metric(
+                "Melhor Índice de Referência",
+                brl(float(r_ref["indice_lucratividade_ref"])) + "/km",
+                str(r_ref["rota"]),
+            )
+
+        st.caption(
+            "Comparativo usando apenas KM Rotas: Valor/KM, Valor/Ton e índice técnico Valor/Ton por KM (quando não houver Valor/KM)."
+        )
+        st.dataframe(
+            df_cmp_rotas[
+                [
+                    "rota",
+                    "km",
+                    "valor_ton",
+                    "valor_km",
+                    "indice_ton_por_km",
+                    "indice_lucratividade_ref",
+                ]
+            ].sort_values("indice_lucratividade_ref", ascending=False),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "rota": "Rota",
+                "km": st.column_config.NumberColumn("KM", format="%.1f"),
+                "valor_ton": st.column_config.NumberColumn("Valor/Ton", format="R$ %.2f"),
+                "valor_km": st.column_config.NumberColumn("Valor/KM", format="R$ %.2f"),
+                "indice_ton_por_km": st.column_config.NumberColumn("Índice Ton/KM", format="R$ %.4f"),
+                "indice_lucratividade_ref": st.column_config.NumberColumn("Índice Lucratividade", format="R$ %.4f"),
+            },
+        )
+        st.markdown("---")
+
+        st.button("✏️ Editar", key="btn_rota_editar", use_container_width=True)
+        df_rotas["Excluir"] = False
+        df_ed_rotas = st.data_editor(
+            df_rotas,
+            key="editor_rotas_art_v2",
+            column_config={
+                "id": None, 
+                "Excluir": st.column_config.CheckboxColumn("🗑️"),
+                "origem": st.column_config.TextColumn("Origem", disabled=True),
+                "destino": st.column_config.TextColumn("Destino", disabled=True),
+                "nome_empresa_origem": st.column_config.TextColumn("Nome Empresa Origem"),
+                "nome_empresa_destino": st.column_config.TextColumn("Nome Empresa Destino"),
+                "km": st.column_config.NumberColumn("KM", format="%.1f"),
+                "valor_ton": st.column_config.NumberColumn("Valor/Ton", format="R$ %.2f"),
+                "valor_km": st.column_config.NumberColumn("Valor/KM", format="R$ %.2f")
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        col_r1, col_r2 = st.columns(2)
+        if col_r1.button("💾 Gravar", key="btn_save_rotas", use_container_width=True):
+            rotas_valor_nulo = df_ed_rotas[
+                (pd.to_numeric(df_ed_rotas["valor_ton"], errors="coerce").fillna(0.0) == 0.0) &
+                (pd.to_numeric(df_ed_rotas["valor_km"], errors="coerce").fillna(0.0) == 0.0) &
+                (df_ed_rotas["Excluir"] != True)
+            ]
+            if not rotas_valor_nulo.empty:
+                st.warning("Existem rotas com valor zerado. Os nomes de empresa e demais alterações serão gravados mesmo assim.")
+            with conn() as c:
+                for _, r in df_ed_rotas.iterrows():
+                    if not r["Excluir"]:
+                        nome_emp_origem = "" if pd.isna(r.get("nome_empresa_origem")) else str(r.get("nome_empresa_origem")).strip()
+                        nome_emp_destino = "" if pd.isna(r.get("nome_empresa_destino")) else str(r.get("nome_empresa_destino")).strip()
+                        c.execute(
+                            """UPDATE rotas
+                               SET nome_empresa_origem=?, nome_empresa_destino=?, km=?, valor_ton=?, valor_km=?
+                               WHERE id=?""",
+                            (
+                                nome_emp_origem,
+                                nome_emp_destino,
+                                r["km"],
+                                r["valor_ton"],
+                                r["valor_km"],
+                                r["id"],
+                            ),
+                        )
+            alerta_gravado()
+        if col_r2.button("🔴 Excluir Selecionados", type="primary", key="btn_del_rotas", use_container_width=True):
+            itens_para_excluir = df_ed_rotas[df_ed_rotas["Excluir"] == True]
+            if not itens_para_excluir.empty:
+                com_erro = []
+                sucesso_count = 0
+                with conn() as c:
+                    for _, rota in itens_para_excluir.iterrows():
+                        check = c.execute(
+                            """SELECT COUNT(*) as total FROM viagens 
+                               WHERE (origem = ? AND destino = ?) 
+                               OR (origem = ? AND destino = ?)""",
+                            (rota['origem'], rota['destino'], rota['destino'], rota['origem'])
+                        ).fetchone()
+                        if check['total'] > 0:
+                            com_erro.append(f"{rota['origem']} x {rota['destino']}")
+                        else:
+                            c.execute("DELETE FROM rotas WHERE id=?", (rota['id'],))
+                            sucesso_count += 1
+                if com_erro:
+                    st.error(f"⚠️ **Não foi possível excluir as seguintes rotas:** {', '.join(com_erro)}. \n\nMotivo: Existem fretes cadastrados usando estas rotas no histórico.")
+                if sucesso_count > 0:
+                    st.success(f"✅ {sucesso_count} rota(s) excluída(s com sucesso!")
+                    st.rerun()
+            else:
+                st.info("Selecione a lixeira (🗑️) para excluir.")
+    else:
+        st.info("Nenhuma rota cadastrada.")
+with aba8:
+    st.subheader("📑 Relatório para Impressão")
+    st.markdown(
+        """
+        <style>
+        /* Padroniza tamanho dos números dos cards do relatório */
+        div[data-testid="stMetricValue"] {
+            font-size: 1.55rem !important;
+            line-height: 1.1 !important;
+            white-space: nowrap !important;
+        }
+        div[data-testid="stMetricLabel"] {
+            font-size: 0.90rem !important;
+            white-space: nowrap !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    fixo_db = valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim)
+    
+    if not df_db.empty:
+        # Cálculos de apoio
+        if "qtd_viagens" in df_db.columns:
+            qtd_rel = pd.to_numeric(df_db["qtd_viagens"], errors="coerce").fillna(1.0)
+            qtd_rel = qtd_rel.apply(lambda x: max(1, int(round(float(x)))))
+        else:
+            qtd_rel = pd.Series(1, index=df_db.index, dtype=int)
+        pagto_estadia_rel = pd.to_numeric(df_db.get("pagto_estadia", 0.0), errors="coerce").fillna(0.0)
+        total_frete_rel = (
+            (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_rel) * qtd_rel
+        )
+        df_rel_param = df_db.copy()
+        df_rel_param["total_frete_rel"] = total_frete_rel
+        df_rel_param = aplicar_parametros_por_data(df_rel_param, col_data="data")
+        total_f = float(total_frete_rel.sum())
+        frete_fixo_periodo_rel = frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
+        total_f += frete_fixo_periodo_rel
+        v_comis_viagens = float(
+            (df_rel_param["total_frete_rel"] * (pd.to_numeric(df_rel_param["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
+        )
+        v_comis_frete_fixo = float(
+            (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+             * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+        )
+        v_comis = v_comis_viagens + v_comis_frete_fixo
+        pct_db = (v_comis / total_f * 100.0) if total_f > 0 else 0.0
+        pct_db_txt = format_pct(pct_db)
+        total_pg = v_comis + fixo_db
+        qtde_fretes = int(qtd_rel.sum())
+
+        # Visualização no Streamlit
+        m0, m1, m2, m3 = st.columns(4)
+        m0.metric("Qtd. Fretes", qtde_fretes)
+        m1.metric("Total Fretes", brl(total_f))
+        m2.metric(f"Comissão ({pct_db_txt})", brl(v_comis))
+        m3.metric("Total a Pagar", brl(total_pg))
+        st.caption(f"Salário fixo do motorista: {brl(fixo_db)}")
+        
+        if st.button("🔍 PREPARAR IMPRESSÃO", use_container_width=True, key="btn_print_rel_final"):
+            # Início do HTML
+            html = f"""
+            <html>
+            <head>
+                <style>
+                    body {{ font-family: sans-serif; margin: 30px; color: #333; }}
+                    header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+                    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
+                    th, td {{ border: 1px solid #999; padding: 8px; text-align: left; }}
+                    th {{ background-color: #f2f2f2; }}
+                    .container-resumo {{ margin-top: 30px; display: flex; justify-content: flex-end; }}
+                    .tot {{ width: 350px; border: 1px solid #ccc; padding: 15px; background: #fafafa; }}
+                    .ln {{ display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }}
+                    .fin {{ font-weight: bold; font-size: 18px; border-top: 2px solid #2e7d32; color: #2e7d32; padding-top: 10px; margin-top: 10px; }}
+                    .assinatura-box {{ margin-top: 80px; text-align: center; width: 400px; }}
+                    .linha-assinatura {{ border-top: 1px solid #000; margin-bottom: 5px; }}
+                    .btn-print {{ background: #007bff; color: white; padding: 15px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 5px; }}
+                    @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
+                </style>
+            </head>
+            <body>
+                <button class="btn-print" onclick="window.print()">🖨️ CLIQUE AQUI PARA IMPRIMIR ESTE RELATÓRIO</button>
+                
+                <header>
+                    <h1 style="margin:0;">ART TRANSPORTES</h1>
+                    <p style="margin:5px 0;">RELATÓRIO DE PRESTAÇÃO DE CONTAS</p>
+                    <p>Período: <b>{filtro_ini.strftime('%d/%m/%Y')}</b> até <b>{filtro_fim.strftime('%d/%m/%Y')}</b></p>
+                    <p style="margin:5px 0;">
+                        Salário Fixo do Motorista: <b>{brl(fixo_db)}</b>
+                        | Comissão: <b>{pct_db_txt}</b>
+                        | Total a Pagar: <b>{brl(total_pg)}</b>
+                    </p>
+                </header>
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Data</th>
+                            <th>NF</th>
+                            <th>Cliente</th>
+                            <th>Rota (Origem x Destino)</th>
+                            <th>Peso (Ton)</th>
+                            <th>Valor Ton</th>
+                            <th>Total Frete</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            """
+            
+            # Loop das linhas da tabela
+            for i_rel, r in df_db.iterrows():
+                qtd_linha = int(qtd_rel.loc[i_rel]) if i_rel in qtd_rel.index else 1
+                pagto_estadia_linha = pd.to_numeric(pd.Series([r.get("pagto_estadia", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+                frete_base_linha = pd.to_numeric(pd.Series([r.get("Total Frete", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+                total_frete_linha = float((frete_base_linha + pagto_estadia_linha) * qtd_linha)
+                html += f"""
+                <tr>
+                    <td>{r['data'].strftime('%d/%m/%Y')}</td>
+                    <td>{r['nf'] or '-'}</td>
+                    <td>{r['cliente']}</td>
+                    <td>{r['origem']} x {r['destino']}</td>
+                    <td>{r['toneladas']}</td>
+                    <td>{brl(r['valor_ton'])}</td>
+                    <td>{brl(total_frete_linha)}</td>
+                </tr>
+                """
+            
+            # Fechamento da tabela e inclusão ÚNICA do resumo e assinatura
+            html += f"""
+                    </tbody>
+                </table>
+
+                <div class="container-resumo">
+                    <div class="tot">
+                        <div class="ln"><span>Qtd. de Fretes:</span> <span>{qtde_fretes}</span></div>
+                        <div class="ln"><span>Total Bruto:</span> <span>{brl(total_f)}</span></div>
+                        <div class="ln"><span>Frete Fixo Rateado:</span> <span>{brl(frete_fixo_periodo_rel)}</span></div>
+                        <div class="ln"><span>Comissão ({pct_db_txt}):</span> <span>{brl(v_comis)}</span></div>
+                        <div class="ln"><span>Salário Fixo:</span> <span>{brl(fixo_db)}</span></div>
+                        <div class="ln fin"><span>TOTAL A PAGAR:</span> <span>{brl(total_pg)}</span></div>
+                    </div>
+                </div>
+
+                <div class="assinatura-box">
+                    <div class="linha-assinatura"></div>
+                    <p><b>Assinatura do Responsável / Motorista</b></p>
+                    <p style="font-size: 10px; color: #666;">Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+                </div>
+
+                <script>
+                    // Pequeno atraso para garantir que o layout carregue antes de abrir o print
+                    setTimeout(function(){{ window.print(); }}, 700);
+                </script>
+            </body>
+            </html>
+            """
+            components.html(html, height=1000, scrolling=True)
+    else:
+        st.warning("Não existem fretes lançados neste período para gerar o relatório.")
+
+
+# ==================================================================================
+# ABA 9 - ABASTECIMENTO (MÉDIA KM/L CORRIGIDA: DESCONSIDERA LITROS DO KM INICIAL)
+# ==================================================================================
+with aba9:
+    st.subheader("⛽ Lançar Abastecimento")
+    with conn() as c:
+        tipos_combustivel_db = [
+            normalizar_tipo_combustivel(r["tipo_combustivel"])
+            for r in c.execute(
+                "SELECT DISTINCT tipo_combustivel FROM abastecimentos WHERE COALESCE(TRIM(tipo_combustivel), '') <> ''"
+            ).fetchall()
+        ]
+    tipos_combustivel_sugeridos = sorted(set(["DIESEL", "ARLA"] + [t for t in tipos_combustivel_db if t]))
+
+    with st.form("form_inclusao_abastecimento", clear_on_submit=True):
+        col_a, col_b, col_c = st.columns(3)
+        data_abs = col_a.date_input("Data", value=date.today(), format="DD/MM/YYYY")
+        local_abs = col_b.text_input("Local do Abastecimento")
+        doc_nf_abs = col_c.text_input("Documento / NF")
+
+        col_d, col_e, col_f, col_g = st.columns(4)
+        km_inicial_abs = col_d.number_input("KM Inicial", min_value=0.0, value=0.0, step=1.0)
+        tipo_cadastrado_abs = col_e.selectbox(
+            "Tipo Cadastrado (opcional)",
+            options=[""] + tipos_combustivel_sugeridos,
+            index=0,
+            placeholder="Selecione um tipo já cadastrado",
+        )
+        tipo_comb_abs = col_e.text_input(
+            "Tipo de Combustível",
+            value=tipo_cadastrado_abs,
+            help="Você pode escolher um tipo já cadastrado acima ou digitar um novo aqui.",
+        ).strip()
+        qtde_litros_abs = col_f.number_input("Qtde Litros", min_value=0.0, value=0.0, step=1.0)
+        valor_unit_abs = col_g.number_input("Valor Unitário (R$)", min_value=0.0, value=0.0, step=0.01)
+
+        total_gasto_abs = qtde_litros_abs * valor_unit_abs
+        st.caption(f"Total calculado: {brl(total_gasto_abs)}")
+
+        if st.form_submit_button("💾 Gravar", use_container_width=True, type="primary", key="btn_abastecimento_incluir_gravar"):
+            if not local_abs.strip():
+                st.warning("Informe o local do abastecimento para incluir o registro.")
+            elif not normalizar_tipo_combustivel(tipo_comb_abs):
+                st.warning("Informe o tipo de combustível para incluir o registro.")
+            elif qtde_litros_abs <= 0 or valor_unit_abs <= 0:
+                st.warning("Informe quantidade de litros e valor unitário maiores que zero.")
+            else:
+                with conn() as c:
+                    c.execute(
+                        """INSERT INTO abastecimentos
+                           (data, local, doc_nf, km_inicial, tipo_combustivel, qtde_litros, valor_unit, total_gasto)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            data_abs.isoformat(),
+                            local_abs.strip(),
+                            doc_nf_abs.strip(),
+                            km_inicial_abs,
+                            normalizar_tipo_combustivel(tipo_comb_abs),
+                            qtde_litros_abs,
+                            valor_unit_abs,
+                            total_gasto_abs,
+                        ),
+                    )
+                alerta_gravado()
+
+    st.markdown("---")
+    
+    with conn() as c:
+        df_abs = pd.read_sql(
+            """SELECT *
+               FROM abastecimentos
+               WHERE date(data) BETWEEN ? AND ?
+               ORDER BY date(data) ASC, id ASC""",
+            c,
+            params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
+        )
+
+    if not df_abs.empty:
+        df_abs['data_dt'] = pd.to_datetime(df_abs['data'], errors='coerce').dt.date
+        df_abs["km_inicial"] = pd.to_numeric(df_abs["km_inicial"], errors="coerce")
+        df_abs["qtde_litros"] = pd.to_numeric(df_abs["qtde_litros"], errors="coerce").fillna(0.0)
+        df_abs["valor_unit"] = pd.to_numeric(df_abs["valor_unit"], errors="coerce").fillna(0.0)
+        df_abs["total_gasto"] = pd.to_numeric(df_abs["total_gasto"], errors="coerce").fillna(0.0)
+        df_abs["tipo_combustivel"] = df_abs["tipo_combustivel"].apply(normalizar_tipo_combustivel)
+        tipos_filtro_abs = sorted([t for t in df_abs["tipo_combustivel"].dropna().unique().tolist() if t])
+        filtro_tipos_abs = st.multiselect(
+            "Filtrar por tipo de combustível",
+            options=tipos_filtro_abs,
+            default=tipos_filtro_abs,
+            help="Selecione um ou mais tipos para visualizar no resumo e no histórico.",
+        )
+        if filtro_tipos_abs:
+            df_abs = df_abs[df_abs["tipo_combustivel"].isin(filtro_tipos_abs)].copy()
+        else:
+            df_abs = df_abs.iloc[0:0].copy()
+        if df_abs.empty:
+            st.info("Sem abastecimentos para o(s) tipo(s) de combustível selecionado(s).")
+
+        if df_abs["km_inicial"].notna().sum() >= 2: # Precisamos de pelo menos 2 registros válidos para tentar calcular média
+            st.markdown(f"### 📊 Resumo de Consumo Real ({filtro_ini.strftime('%d/%m/%Y')} - {filtro_fim.strftime('%d/%m/%Y')})")
+            
+            # 1. Distância do período = último KM do período - primeiro KM do período.
+            # 2. Média = (2 últimos KMs diferentes) / litros do KM final de referência.
+            df_km_valido = df_abs.dropna(subset=["km_inicial"]).copy()
+            df_km_valido = df_km_valido.sort_values(by=["data_dt", "id"], ascending=[True, True])
+            if len(df_km_valido) >= 2:
+                # Distância real do período (primeiro KM até o último KM dentro do filtro).
+                km_inicial_periodo = float(df_km_valido.iloc[0]["km_inicial"])
+                km_final_periodo = float(df_km_valido.iloc[-1]["km_inicial"])
+                distancia_total = km_final_periodo - km_inicial_periodo
+
+                # Referência para média de consumo: 2 últimos KMs diferentes em ordem cronológica.
+                km_final_media = None
+                km_anterior = None
+                for km_lido in reversed(df_km_valido["km_inicial"].tolist()):
+                    km_atual = float(km_lido)
+                    if km_final_media is None:
+                        km_final_media = km_atual
+                    elif km_atual != km_final_media:
+                        km_anterior = km_atual
+                        break
+                tem_base_media = (km_final_media is not None) and (km_anterior is not None)
+                distancia_media_ref = (km_final_media - km_anterior) if tem_base_media else 0.0
+
+                df_ultimo_km_media = df_km_valido[df_km_valido["km_inicial"] == km_final_media].copy() if tem_base_media else pd.DataFrame(columns=df_km_valido.columns)
+                df_diesel = df_ultimo_km_media[df_ultimo_km_media['tipo_combustivel'].str.contains("DIESEL", na=False)]
+                df_arla = df_ultimo_km_media[df_ultimo_km_media['tipo_combustivel'].str.contains("ARLA", na=False)]
+
+                # Litros usados para calcular a média (regra do último KM de referência).
+                litros_diesel_ref = df_diesel['qtde_litros'].sum()
+                litros_arla_ref = df_arla['qtde_litros'].sum()
+
+                # Totais reais do período filtrado.
+                litros_diesel_periodo = df_abs[df_abs['tipo_combustivel'].str.contains("DIESEL", na=False)]['qtde_litros'].sum()
+                litros_arla_periodo = df_abs[df_abs['tipo_combustivel'].str.contains("ARLA", na=False)]['qtde_litros'].sum()
+                gasto_diesel_periodo = df_abs[df_abs['tipo_combustivel'].str.contains("DIESEL", na=False)]['total_gasto'].sum()
+                gasto_arla_periodo = df_abs[df_abs['tipo_combustivel'].str.contains("ARLA", na=False)]['total_gasto'].sum()
+                investimento_periodo = df_abs['total_gasto'].sum()
+
+                # 3. CÁLCULO DAS MÉDIAS (KM RODADO ENTRE LEITURAS / LITROS DO ABASTECIMENTO FINAL)
+                media_diesel = distancia_media_ref / litros_diesel_ref if litros_diesel_ref > 0 else 0
+                media_arla = distancia_media_ref / litros_arla_ref if litros_arla_ref > 0 else 0
+                media_diesel_txt = f"{media_diesel:.2f} KM/L" if tem_base_media else "-"
+                media_arla_txt = f"{media_arla:.2f} KM/L" if tem_base_media else "-"
+
+                # --- EXIBIÇÃO DAS MÉTRICAS ---
+                c1, c2, c3 = st.columns(3)
+                c1.metric("🏁 Distância Percorrida", f"{distancia_total:,.0f} KM".replace(",", "."))
+                c2.metric("⛽ Diesel no Período", f"{litros_diesel_periodo:.2f} L")
+                c3.metric("🧪 Arla no Período", f"{litros_arla_periodo:.2f} L")
+
+                v1, v2, v3 = st.columns(3)
+                v1.metric("📉 Média Diesel", media_diesel_txt)
+                v2.metric("📉 Média Arla", media_arla_txt)
+                v3.metric("💰 Investimento no Período", brl(investimento_periodo))
+                g1, g2 = st.columns(2)
+                g1.metric("💵 Gasto com Diesel", brl(gasto_diesel_periodo))
+                g2.metric("💵 Gasto com Arla", brl(gasto_arla_periodo))
+
+                if tem_base_media:
+                    st.info(
+                        f"💡 Distância do período: ({km_final_periodo:,.0f} - {km_inicial_periodo:,.0f}). "
+                        f"Média de consumo: ({km_final_media:,.0f} - {km_anterior:,.0f}) dividido pelos litros do KM final {km_final_media:,.0f}. "
+                        "Os totais de litros e investimento consideram todo o período filtrado."
+                        .replace(",", ".")
+                    )
+                else:
+                    st.info(
+                        f"💡 Distância do período: ({km_final_periodo:,.0f} - {km_inicial_periodo:,.0f}). "
+                        "Média de consumo indisponível: é necessário ter 2 KMs diferentes no período filtrado."
+                        .replace(",", ".")
+                    )
+                st.markdown("---")
+            else:
+                st.info("ℹ️ Para calcular a média, é necessário ter pelo menos 2 leituras de KM diferentes no período.")
+            
+        elif len(df_abs) == 1 or df_abs["km_inicial"].notna().sum() == 1:
+            st.info("ℹ️ Para calcular a média de consumo, é necessário pelo menos dois registros no período (KM Inicial e KM Final).")
+        
+        # --- TABELA DE HISTÓRICO (MOSTRA TUDO, INCLUSIVE O INICIAL) ---
+        if not df_abs.empty:
+            df_abs["Data_BR"] = pd.to_datetime(df_abs["data_dt"]).dt.strftime('%d/%m/%Y')
+            df_abs["Excluir"] = False
+            df_base_abs = df_abs[["id", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit"]].copy()
+            df_base_abs = df_base_abs.set_index("id")
+            df_editor_abs = df_abs[["id", "Data_BR", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto", "Excluir"]].copy().reset_index(drop=True)
+
+            # Reaplica mudanças já feitas no data_editor (estado da sessão) para recalcular o total em tempo real.
+            estado_editor = st.session_state.get("editor_abs_v16", {})
+            linhas_editadas = estado_editor.get("edited_rows", {}) if isinstance(estado_editor, dict) else {}
+            for idx_linha, alteracoes in linhas_editadas.items():
+                try:
+                    i = int(idx_linha)
+                except (TypeError, ValueError):
+                    continue
+                if i < 0 or i >= len(df_editor_abs):
+                    continue
+                for campo, valor in alteracoes.items():
+                    if campo in df_editor_abs.columns:
+                        df_editor_abs.at[i, campo] = valor
+
+            df_editor_abs["km_inicial"] = pd.to_numeric(df_editor_abs["km_inicial"], errors="coerce").fillna(0.0)
+            df_editor_abs["qtde_litros"] = pd.to_numeric(df_editor_abs["qtde_litros"], errors="coerce").fillna(0.0)
+            df_editor_abs["valor_unit"] = pd.to_numeric(df_editor_abs["valor_unit"], errors="coerce").fillna(0.0)
+            df_editor_abs["tipo_combustivel"] = df_editor_abs["tipo_combustivel"].apply(normalizar_tipo_combustivel)
+            df_editor_abs["total_gasto"] = (df_editor_abs["qtde_litros"] * df_editor_abs["valor_unit"]).round(2)
+            df_editor_abs["Excluir"] = df_editor_abs["Excluir"].fillna(False).astype(bool)
+            tipos_comb_editor = sorted(
+                set(["DIESEL", "ARLA"] + [t for t in df_editor_abs["tipo_combustivel"].dropna().astype(str).tolist() if t.strip()])
+            )
+            colunas_bloqueadas_abs = ["Data_BR", "total_gasto"]
+            st.caption("Edite diretamente os campos na tabela e clique em `💾 Gravar`. Para excluir, marque a coluna `🗑️` e clique em `🔴 Excluir Selecionados`.")
+
+            with st.form("form_editor_abs_v16"):
+                df_ed = st.data_editor(
+                    df_editor_abs,
+                    column_config={
+                        "id": None,
+                        "Data_BR": "Data",
+                        "local": "Local",
+                        "doc_nf": "N.NF",
+                        "km_inicial": "Km Incial",
+                        "tipo_combustivel": st.column_config.SelectboxColumn("Tipo Combustível", options=tipos_comb_editor),
+                        "qtde_litros": "Qtde Litros",
+                        "valor_unit": st.column_config.NumberColumn("Valor Unitario", format="R$ %.2f"),
+                        "total_gasto": st.column_config.NumberColumn("Total Gasto", format="R$ %.2f"),
+                        "Excluir": st.column_config.CheckboxColumn("🗑️"),
+                    },
+                    disabled=colunas_bloqueadas_abs,
+                    hide_index=True, use_container_width=True, key="editor_abs_v16"
+                )
+
+                col_btn_gravar, col_btn_del = st.columns(2)
+                btn_gravar = col_btn_gravar.form_submit_button("💾 Gravar", use_container_width=True, type="primary", key="btn_abastecimento_editor_gravar")
+                btn_excluir_sel = col_btn_del.form_submit_button("🔴 Excluir Selecionados", use_container_width=True)
+
+            if btn_gravar:
+                alteracoes = 0
+                erros_validacao = []
+                registros_alterados = []
+                with conn() as c:
+                    for _, row in df_ed.iterrows():
+                        id_abs = int(row["id"])
+                        if id_abs not in df_base_abs.index:
+                            continue
+
+                        try:
+                            km_edit = float(row["km_inicial"])
+                            litros_edit = float(row["qtde_litros"])
+                            valor_edit = float(row["valor_unit"])
+                        except (TypeError, ValueError):
+                            erros_validacao.append(f"ID {id_abs}: valores numéricos inválidos.")
+                            continue
+
+                        if km_edit < 0 or litros_edit < 0 or valor_edit < 0:
+                            erros_validacao.append(f"ID {id_abs}: não é permitido valor negativo.")
+                            continue
+
+                        tipo_edit = normalizar_tipo_combustivel(row["tipo_combustivel"])
+                        if not tipo_edit:
+                            erros_validacao.append(f"ID {id_abs}: informe o tipo de combustível.")
+                            continue
+
+                        antigo = df_base_abs.loc[id_abs]
+                        if (
+                            str(row["local"]).strip() != str(antigo["local"]).strip()
+                            or str(row["doc_nf"]).strip() != str(antigo["doc_nf"]).strip()
+                            or km_edit != float(antigo["km_inicial"])
+                            or tipo_edit != str(antigo["tipo_combustivel"]).strip().upper()
+                            or litros_edit != float(antigo["qtde_litros"])
+                            or valor_edit != float(antigo["valor_unit"])
+                        ):
+                            novo_total = litros_edit * valor_edit
+                            c.execute(
+                                """UPDATE abastecimentos
+                                   SET local=?, doc_nf=?, km_inicial=?, tipo_combustivel=?, qtde_litros=?, valor_unit=?, total_gasto=?
+                                   WHERE id=?""",
+                                (
+                                    str(row["local"]).strip(),
+                                    str(row["doc_nf"]).strip(),
+                                    km_edit,
+                                    tipo_edit,
+                                    litros_edit,
+                                    valor_edit,
+                                    novo_total,
+                                    id_abs,
+                                ),
+                            )
+                            alteracoes += 1
+                            registros_alterados.append(
+                                f"ID {id_abs} | {str(row['local']).strip()} | {tipo_edit} | KM {km_edit:,.0f}".replace(",", ".")
+                            )
+
+                if erros_validacao:
+                    st.warning("Alguns registros não foram salvos: " + " | ".join(erros_validacao[:3]))
+
+                if alteracoes > 0:
+                    alerta_gravado()
+                    st.info("Registros alterados:\n" + "\n".join(registros_alterados[:10]))
+                else:
+                    st.info("Nenhuma alteração detectada para salvar.")
+
+            if btn_excluir_sel:
+                ids_del_set = set()
+
+                # 1) IDs vindos do DataFrame retornado pelo editor
+                try:
+                    ids_del_df = df_ed.loc[df_ed["Excluir"] == True, "id"].tolist()
+                    ids_del_set.update(int(i) for i in ids_del_df)
+                except Exception:
+                    pass
+
+                # 2) IDs vindos do estado interno do data_editor (mais confiável em alguns ciclos)
+                estado_editor_del = st.session_state.get("editor_abs_v16", {})
+                linhas_editadas_del = estado_editor_del.get("edited_rows", {}) if isinstance(estado_editor_del, dict) else {}
+                for idx_linha, alteracoes in linhas_editadas_del.items():
+                    if isinstance(alteracoes, dict) and alteracoes.get("Excluir") is True:
+                        try:
+                            i = int(idx_linha)
+                            if 0 <= i < len(df_editor_abs):
+                                ids_del_set.add(int(df_editor_abs.iloc[i]["id"]))
+                        except (TypeError, ValueError):
+                            continue
+
+                ids_del = sorted(ids_del_set)
+                if ids_del:
+                    with conn() as c:
+                        c.executemany("DELETE FROM abastecimentos WHERE id=?", [(i,) for i in ids_del])
+                    st.rerun()
+                else:
+                    st.warning("Marque pelo menos um registro na coluna Excluir.")
+    else:
+        st.info("Sem abastecimentos no período filtrado.")
+
+with aba10:
+    st.subheader("⚙️ Configurações e Simulador de Custos")
+    if "param_editando" not in st.session_state:
+        st.session_state.param_editando = False
+
+    # 1. FUNÇÃO DE CONTROLE (ON_CHANGE)
+    # Garante que ao desligar o botão, a memória de teste seja limpa imediatamente
+    def alternar_simulacao():
+        if not st.session_state.toggle_sim:
+            st.session_state.p_simulado = {} 
+            st.session_state.simulacao_ativa = False
+        else:
+            st.session_state.simulacao_ativa = True
+            # Ao ativar simulação, clona os parâmetros reais para memória.
+            # Assim, toda edição ocorre em sessão sem tocar no banco.
+            if not st.session_state.p_simulado:
+                with conn() as c:
+                    p_base = dict(c.execute("SELECT * FROM parametros WHERE id=1").fetchone())
+                st.session_state.p_simulado = p_base
+
+    # Botão de Ativação
+    st.toggle(
+        "🚀 ATIVAR MODO SIMULAÇÃO", 
+        value=st.session_state.simulacao_ativa,
+        key="toggle_sim",
+        on_change=alternar_simulacao,
+        help="Ative para testar novos valores sem alterar o banco de dados original."
+    )
+
+    # 2. BUSCA OS DADOS REAIS DIRETO DO BANCO (PORTO SEGURO)
+    with conn() as c:
+        p_real_banco = dict(c.execute("SELECT * FROM parametros WHERE id=1").fetchone())
+
+    # 3. DEFINE A FONTE DE DADOS PARA EXIBIÇÃO
+    if st.session_state.simulacao_ativa and st.session_state.p_simulado:
+        dados_para_exibir = st.session_state.p_simulado
+        st.warning("⚠️ **MODO SIMULAÇÃO ATIVO:** Os valores abaixo são temporários.")
+    else:
+        dados_para_exibir = p_real_banco
+        st.info("✅ **MODO REAL:** Os valores abaixo estão salvos no banco de dados.")
+
+    # 4. CAMPOS COM CHAVE DINÂMICA (tipo_modo)
+    # Fora de st.form para atualizar cálculos em tempo real
+    tipo_modo = "sim" if st.session_state.simulacao_ativa else "real"
+
+    # --- SEÇÃO DE DATAS E META ---
+    c_ctrl_p1, c_ctrl_p2 = st.columns([1, 1])
+    if c_ctrl_p1.button("✏️ Editar", use_container_width=True, key="btn_param_editar", disabled=st.session_state.param_editando):
+        st.session_state.param_editando = True
+        st.rerun()
+    c_ctrl_p2.button("💾 Gravar", use_container_width=True, type="primary", key="btn_param_gravar_top", disabled=True)
+
+    st.markdown("##### 📅 Período Global de Filtro")
+    c_data1, c_data2, c_meta, c_frete = st.columns([1, 1, 1.5, 1.5])
+    
+    # Converte datas do banco para o seletor do Streamlit
+    d_ini_val = datetime.strptime(dados_para_exibir.get('data_filtro_ini', '2026-01-01'), '%Y-%m-%d').date()
+    d_fim_val = datetime.strptime(dados_para_exibir.get('data_filtro_fim', '2026-12-31'), '%Y-%m-%d').date()
+    
+    dt_ini_param = c_data1.date_input("Data Início", value=d_ini_val, format="DD/MM/YYYY", key=f"dtini_{tipo_modo}", disabled=not st.session_state.param_editando)
+    dt_fim_param = c_data2.date_input("Data Fim", value=d_fim_val, format="DD/MM/YYYY", key=f"dtfim_{tipo_modo}", disabled=not st.session_state.param_editando)
+    meta_v = c_meta.number_input("Meta de Faturamento Mensal (R$)", value=float(dados_para_exibir.get('meta_faturamento', 50000.0)), key=f"meta_{tipo_modo}", disabled=not st.session_state.param_editando)
+    frete_mensal_fixo_v = c_frete.number_input(
+        "Valor Frete Mensal Fixo (R$)",
+        min_value=0.0,
+        step=100.0,
+        value=float(dados_para_exibir.get('valor_frete_mensal_fixo', 0.0)),
+        key=f"frete_mensal_fixo_{tipo_modo}",
+        disabled=not st.session_state.param_editando
+    )
+
+    st.markdown("---")
+    st.markdown("##### 💰 Custos e Índices Operacionais")
+    
+    c1, c2, c3, c4, c5 = st.columns(5)
+    con_v = c1.number_input("Consumo (km/l)", value=float(dados_para_exibir.get('consumo', 2.5)), step=0.1, key=f"con_{tipo_modo}", disabled=not st.session_state.param_editando)
+    man_v = c2.number_input("Manutenção (R$/km)", value=float(dados_para_exibir.get('manut', 0.25)), step=0.01, key=f"man_{tipo_modo}", disabled=not st.session_state.param_editando)
+    qtde_pneu_v = c3.number_input("Qtde Pneu", min_value=0.0, step=1.0, format="%.0f", value=float(dados_para_exibir.get('qtde_pneu', 1.0)), key=f"qtde_pneu_{tipo_modo}", disabled=not st.session_state.param_editando)
+    vl_gasto_pneu_km_v = c4.number_input(
+        "Vl Gasto por KM",
+        min_value=0.0,
+        step=0.0001,
+        format="%.4f",
+        value=float(dados_para_exibir.get('vl_gasto_pneu_km', dados_para_exibir.get('pneu', 0.12))),
+        key=f"vl_pneu_km_{tipo_modo}",
+        disabled=not st.session_state.param_editando
+    )
+    pne_v = qtde_pneu_v * vl_gasto_pneu_km_v
+    c5.number_input("Pneu (R$/km)", value=float(pne_v), step=0.01, disabled=True)
+    dep_v = st.number_input("Depreciação (R$/km)", value=float(dados_para_exibir.get('depre', 0.30)), step=0.01, key=f"dep_{tipo_modo}", disabled=not st.session_state.param_editando)
+    
+    c6, c7, c8, c9, c10, c11, c12 = st.columns(7)
+    fix_v = c6.number_input("Salário Fixo (R$)", value=float(dados_para_exibir.get('motora_fixo', 2500.0)), step=50.0, key=f"fix_{tipo_modo}", disabled=not st.session_state.param_editando)
+    pct_v = c7.number_input("Comissão (%)", value=float(dados_para_exibir.get('motora_pct', 10.0)), step=0.5, key=f"pct_{tipo_modo}", disabled=not st.session_state.param_editando)
+    seg_v = c8.number_input("Seguro Mensal (R$)", value=float(dados_para_exibir.get('seguro', 2750.0)), step=10.0, key=f"seg_{tipo_modo}", disabled=not st.session_state.param_editando)
+    fin_v = c9.number_input("Financiamento (R$)", value=float(dados_para_exibir.get('financiamento', 0.0)), step=100.0, key=f"fin_{tipo_modo}", disabled=not st.session_state.param_editando)
+    esc_v = c10.number_input("Escritório (R$)", value=float(dados_para_exibir.get('cmp_custo_escritorio', 0.0)), step=50.0, key=f"esc_{tipo_modo}", disabled=not st.session_state.param_editando)
+    ipva_v = c11.number_input("Pagto IPVA Anual (R$)", value=float(dados_para_exibir.get('pagto_ipva', 0.0)), step=50.0, key=f"ipva_{tipo_modo}", disabled=not st.session_state.param_editando)
+    imp_v = c12.number_input("% de Impostos", min_value=0.0, step=0.1, value=float(dados_para_exibir.get('imposto_pct', 0.0)), key=f"imposto_{tipo_modo}", disabled=not st.session_state.param_editando)
+
+    if not df_db.empty:
+        qtd_imposto = pd.to_numeric(df_db.get("qtd_viagens", 1), errors="coerce").fillna(1.0)
+        qtd_imposto = qtd_imposto.apply(lambda x: max(1, int(round(float(x)))))
+        pagto_estadia_imposto = pd.to_numeric(df_db.get("pagto_estadia", 0.0), errors="coerce").fillna(0.0)
+        total_frete_base_imposto = float(
+            (
+                (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_imposto)
+                * qtd_imposto
+            ).sum()
+        )
+    else:
+        total_frete_base_imposto = 0.0
+    total_frete_base_imposto += frete_mensal_fixo_v * fator_rateio_mensal_por_periodo(filtro_ini, filtro_fim)
+    total_imposto_calc = total_frete_base_imposto * (imp_v / 100.0)
+    st.number_input("Total Imposto (R$)", value=float(total_imposto_calc), step=0.01, disabled=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    btn_label = "💾 Gravar"
+    
+    if st.button(btn_label, use_container_width=True, type="primary", key=f"btn_param_save_{tipo_modo}", disabled=not st.session_state.param_editando):
+        # Cria o dicionário de dados atualizados
+        novos_dados = {
+            'consumo': con_v, 'manut': man_v, 'pneu': pne_v, 'depre': dep_v,
+            'qtde_pneu': qtde_pneu_v, 'vl_gasto_pneu_km': vl_gasto_pneu_km_v,
+            'motora_fixo': fix_v, 'motora_pct': pct_v, 'seguro': seg_v, 'financiamento': fin_v,
+            'cmp_custo_escritorio': esc_v, 'pagto_ipva': ipva_v, 'imposto_pct': imp_v,
+            'meta_faturamento': meta_v,
+            'valor_frete_mensal_fixo': frete_mensal_fixo_v,
+            'data_filtro_ini': dt_ini_param.strftime('%Y-%m-%d'),
+            'data_filtro_fim': dt_fim_param.strftime('%Y-%m-%d')
+        }
+
+        if st.session_state.simulacao_ativa:
+            # Grava apenas na memória da sessão
+            st.session_state.p_simulado = {**st.session_state.p_simulado, **novos_dados}
+            alerta_gravado()
+        else:
+            # Grava permanentemente no SQLite
+            with conn() as c:
+                c.execute("""UPDATE parametros SET 
+                             consumo=?, manut=?, pneu=?, depre=?, 
+                             qtde_pneu=?, vl_gasto_pneu_km=?,
+                             motora_fixo=?, motora_pct=?, seguro=?, financiamento=?,
+                             cmp_custo_escritorio=?, pagto_ipva=?, imposto_pct=?, meta_faturamento=?, valor_frete_mensal_fixo=?, data_filtro_ini=?, data_filtro_fim=?
+                             WHERE id=1""", 
+                          (con_v, man_v, pne_v, dep_v, qtde_pneu_v, vl_gasto_pneu_km_v, fix_v, pct_v, seg_v, fin_v, esc_v, ipva_v, imp_v,
+                           meta_v, frete_mensal_fixo_v, dt_ini_param.strftime('%Y-%m-%d'), dt_fim_param.strftime('%Y-%m-%d')))
+                data_vigencia_param = dt_ini_param.isoformat()
+                c.execute(
+                    """INSERT INTO parametros_historico (
+                           vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                           seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                           qtde_pneu, vl_gasto_pneu_km
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(vigencia_data) DO UPDATE SET
+                           consumo=excluded.consumo,
+                           manut=excluded.manut,
+                           pneu=excluded.pneu,
+                           depre=excluded.depre,
+                           motora_fixo=excluded.motora_fixo,
+                           motora_pct=excluded.motora_pct,
+                           seguro=excluded.seguro,
+                           financiamento=excluded.financiamento,
+                           pagto_ipva=excluded.pagto_ipva,
+                           cmp_custo_escritorio=excluded.cmp_custo_escritorio,
+                           imposto_pct=excluded.imposto_pct,
+                           valor_frete_mensal_fixo=excluded.valor_frete_mensal_fixo,
+                           qtde_pneu=excluded.qtde_pneu,
+                           vl_gasto_pneu_km=excluded.vl_gasto_pneu_km""",
+                    (
+                        data_vigencia_param,
+                        con_v, man_v, pne_v, dep_v, fix_v, pct_v,
+                        seg_v, fin_v, ipva_v, esc_v, imp_v, frete_mensal_fixo_v,
+                        qtde_pneu_v, vl_gasto_pneu_km_v,
+                    ),
+                )
+            st.session_state.p_simulado = {} # Limpa para garantir sincronia
+            alerta_gravado()
+        
+        st.session_state.param_editando = False
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("##### 🕒 Histórico de Vigência dos Parâmetros")
+    st.caption("As alterações feitas aqui impactam apenas os cálculos a partir da data de vigência selecionada.")
+
+    with conn() as c:
+        df_hist_param = pd.read_sql(
+            """SELECT id, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                      seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                      qtde_pneu, vl_gasto_pneu_km
+               FROM parametros_historico
+               ORDER BY date(vigencia_data) DESC, id DESC""",
+            c,
+        )
+
+    if df_hist_param.empty:
+        st.info("Ainda não há histórico de parâmetros.")
+    else:
+        if "hist_param_excluir_tudo" not in st.session_state:
+            st.session_state.hist_param_excluir_tudo = False
+
+        ac1, ac2 = st.columns([1, 2])
+        if ac1.button("🗑️ Excluir Histórico", use_container_width=True, key="btn_hist_excluir_tudo"):
+            st.session_state.hist_param_excluir_tudo = True
+
+        if st.session_state.hist_param_excluir_tudo:
+            ac2.warning("Confirma a exclusão de todo o histórico de vigência?")
+            c1, c2 = st.columns(2)
+            if c1.button("✅ Confirmar exclusão total", use_container_width=True, type="primary", key="btn_hist_excluir_tudo_conf"):
+                with conn() as c:
+                    c.execute("DELETE FROM parametros_historico")
+                st.session_state.hist_param_excluir_tudo = False
+                st.success("Histórico de vigência excluído com sucesso.")
+                st.rerun()
+            if c2.button("❌ Cancelar", use_container_width=True, key="btn_hist_excluir_tudo_cancel"):
+                st.session_state.hist_param_excluir_tudo = False
+                st.rerun()
+
+        df_hist_exibir = df_hist_param.copy()
+        df_hist_exibir["vigencia_data"] = pd.to_datetime(df_hist_exibir["vigencia_data"], errors="coerce").dt.date
+        st.dataframe(
+            df_hist_exibir,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", format="%d"),
+                "vigencia_data": st.column_config.DateColumn("Vigência", format="DD/MM/YYYY"),
+                "consumo": st.column_config.NumberColumn("Consumo", format="%.2f"),
+                "manut": st.column_config.NumberColumn("Manut.", format="R$ %.4f"),
+                "pneu": st.column_config.NumberColumn("Pneu", format="R$ %.4f"),
+                "depre": st.column_config.NumberColumn("Depre.", format="R$ %.4f"),
+                "motora_fixo": st.column_config.NumberColumn("Motorista Fixo", format="R$ %.2f"),
+                "motora_pct": st.column_config.NumberColumn("Comissão (%)", format="%.2f"),
+                "seguro": st.column_config.NumberColumn("Seguro", format="R$ %.2f"),
+                "financiamento": st.column_config.NumberColumn("Financiamento", format="R$ %.2f"),
+                "pagto_ipva": st.column_config.NumberColumn("IPVA Anual", format="R$ %.2f"),
+                "cmp_custo_escritorio": st.column_config.NumberColumn("Escritório", format="R$ %.2f"),
+                "imposto_pct": st.column_config.NumberColumn("Imposto (%)", format="%.2f"),
+                "valor_frete_mensal_fixo": st.column_config.NumberColumn("Frete Fixo Mensal", format="R$ %.2f"),
+                "qtde_pneu": st.column_config.NumberColumn("Qtde Pneu", format="%.0f"),
+                "vl_gasto_pneu_km": st.column_config.NumberColumn("Valor Pneu Km", format="R$ %.4f"),
+            },
+        )
+
+        st.markdown("##### ✏️ Editar Registro de Vigência")
+        if "hist_param_excluir_id" not in st.session_state:
+            st.session_state.hist_param_excluir_id = None
+        mapa_hist = {
+            f"ID {int(r['id'])} | Vigência {str(r['vigencia_data'])}": int(r["id"])
+            for _, r in df_hist_param.iterrows()
+        }
+        hist_sel_label = st.selectbox(
+            "Selecione um registro do histórico",
+            options=list(mapa_hist.keys()),
+            index=None,
+            placeholder="Escolha um registro para editar",
+            key="hist_param_sel",
+        )
+
+        if hist_sel_label:
+            id_hist_sel = mapa_hist[hist_sel_label]
+            row_hist = df_hist_param[df_hist_param["id"] == id_hist_sel].iloc[0]
+            vig_atual = pd.to_datetime(row_hist["vigencia_data"], errors="coerce").date()
+
+            h1, h2, h3 = st.columns(3)
+            nova_vigencia = h1.date_input(
+                "Data Vigência",
+                value=vig_atual,
+                min_value=date(1900, 1, 1),
+                max_value=date(2100, 12, 31),
+                format="DD/MM/YYYY",
+                key=f"hist_vig_{id_hist_sel}",
+            )
+            novo_consumo = h2.number_input("Consumo (km/l)", value=float(row_hist["consumo"]), step=0.1, key=f"hist_con_{id_hist_sel}")
+            nova_manut = h3.number_input("Manutenção (R$/km)", value=float(row_hist["manut"]), step=0.01, key=f"hist_man_{id_hist_sel}")
+
+            h4, h5, h6 = st.columns(3)
+            novo_pneu = h4.number_input("Pneu (R$/km)", value=float(row_hist["pneu"]), step=0.01, key=f"hist_pneu_{id_hist_sel}")
+            nova_depre = h5.number_input("Depreciação (R$/km)", value=float(row_hist["depre"]), step=0.01, key=f"hist_dep_{id_hist_sel}")
+            novo_mot_fixo = h6.number_input("Motorista Fixo (R$)", value=float(row_hist["motora_fixo"]), step=50.0, key=f"hist_fix_{id_hist_sel}")
+
+            h7, h8, h9 = st.columns(3)
+            novo_mot_pct = h7.number_input("Comissão (%)", value=float(row_hist["motora_pct"]), step=0.1, key=f"hist_pct_{id_hist_sel}")
+            novo_seguro = h8.number_input("Seguro (R$)", value=float(row_hist["seguro"]), step=10.0, key=f"hist_seg_{id_hist_sel}")
+            novo_fin = h9.number_input("Financiamento (R$)", value=float(row_hist["financiamento"]), step=50.0, key=f"hist_fin_{id_hist_sel}")
+
+            h10, h11, h12, h13 = st.columns(4)
+            novo_ipva = h10.number_input("IPVA Anual (R$)", value=float(row_hist["pagto_ipva"]), step=50.0, key=f"hist_ipva_{id_hist_sel}")
+            novo_escr = h11.number_input("Escritório (R$)", value=float(row_hist["cmp_custo_escritorio"]), step=50.0, key=f"hist_esc_{id_hist_sel}")
+            novo_imp = h12.number_input("Imposto (%)", value=float(row_hist["imposto_pct"]), step=0.1, key=f"hist_imp_{id_hist_sel}")
+            novo_frete_fixo = h13.number_input("Frete Fixo Mensal (R$)", value=float(row_hist["valor_frete_mensal_fixo"]), step=100.0, key=f"hist_ff_{id_hist_sel}")
+            h14, h15 = st.columns(2)
+            nova_qtde_pneu = h14.number_input("Qtde Pneu", value=float(row_hist["qtde_pneu"] or 0.0), min_value=0.0, step=1.0, format="%.0f", key=f"hist_qpneu_{id_hist_sel}")
+            novo_vl_pneu_km = h15.number_input("Valor Pneu Km (R$)", value=float(row_hist["vl_gasto_pneu_km"] or 0.0), min_value=0.0, step=0.0001, format="%.4f", key=f"hist_vlpkm_{id_hist_sel}")
+
+            st.markdown("##### 📄 Duplicar Vigência")
+            d1, d2 = st.columns([2, 1])
+            data_duplicar = d1.date_input(
+                "Nova data para cópia do registro",
+                value=(vig_atual + timedelta(days=1)),
+                min_value=date(1900, 1, 1),
+                max_value=date(2100, 12, 31),
+                format="DD/MM/YYYY",
+                key=f"hist_dup_data_{id_hist_sel}",
+            )
+            if d2.button("📄 Duplicar", use_container_width=True, key=f"btn_hist_dup_{id_hist_sel}"):
+                data_dup_txt = data_duplicar.isoformat()
+                with conn() as c:
+                    existe_dup = c.execute(
+                        "SELECT id FROM parametros_historico WHERE vigencia_data=?",
+                        (data_dup_txt,),
+                    ).fetchone()
+                    if existe_dup:
+                        st.warning("Já existe um registro nessa data. Escolha outra data para duplicar.")
+                    else:
+                        c.execute(
+                            """INSERT INTO parametros_historico (
+                                   vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                                   seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                                   qtde_pneu, vl_gasto_pneu_km
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                data_dup_txt,
+                                float(row_hist["consumo"] or 0.0),
+                                float(row_hist["manut"] or 0.0),
+                                float(row_hist["pneu"] or 0.0),
+                                float(row_hist["depre"] or 0.0),
+                                float(row_hist["motora_fixo"] or 0.0),
+                                float(row_hist["motora_pct"] or 0.0),
+                                float(row_hist["seguro"] or 0.0),
+                                float(row_hist["financiamento"] or 0.0),
+                                float(row_hist["pagto_ipva"] or 0.0),
+                                float(row_hist["cmp_custo_escritorio"] or 0.0),
+                                float(row_hist["imposto_pct"] or 0.0),
+                                float(row_hist["valor_frete_mensal_fixo"] or 0.0),
+                                float(row_hist["qtde_pneu"] or 0.0),
+                                float(row_hist["vl_gasto_pneu_km"] or 0.0),
+                            ),
+                        )
+                alerta_gravado()
+                st.rerun()
+
+            a_salvar, a_excluir = st.columns(2)
+            if a_salvar.button("💾 Salvar Alteração de Vigência", use_container_width=True, key=f"btn_hist_save_{id_hist_sel}"):
+                nova_vig_txt = nova_vigencia.isoformat()
+                with conn() as c:
+                    existe_data = c.execute(
+                        "SELECT id FROM parametros_historico WHERE vigencia_data=? AND id<>?",
+                        (nova_vig_txt, int(id_hist_sel)),
+                    ).fetchone()
+                    if existe_data:
+                        st.warning("Já existe outro registro nessa data de vigência.")
+                    else:
+                        c.execute(
+                            """UPDATE parametros_historico
+                               SET vigencia_data=?, consumo=?, manut=?, pneu=?, depre=?, motora_fixo=?, motora_pct=?,
+                                   seguro=?, financiamento=?, pagto_ipva=?, cmp_custo_escritorio=?, imposto_pct=?, valor_frete_mensal_fixo=?,
+                                   qtde_pneu=?, vl_gasto_pneu_km=?
+                               WHERE id=?""",
+                            (
+                                nova_vig_txt, novo_consumo, nova_manut, novo_pneu, nova_depre, novo_mot_fixo, novo_mot_pct,
+                                novo_seguro, novo_fin, novo_ipva, novo_escr, novo_imp, novo_frete_fixo,
+                                nova_qtde_pneu, novo_vl_pneu_km, int(id_hist_sel),
+                            ),
+                        )
+                alerta_gravado()
+                st.rerun()
+
+            if a_excluir.button("🗑️ Excluir Registro", use_container_width=True, key=f"btn_hist_del_{id_hist_sel}"):
+                st.session_state.hist_param_excluir_id = int(id_hist_sel)
+
+            if st.session_state.hist_param_excluir_id == int(id_hist_sel):
+                st.warning(f"Confirma a exclusão do registro de vigência ID {int(id_hist_sel)}?")
+                d_conf, d_cancel = st.columns(2)
+                if d_conf.button("✅ Confirmar exclusão", use_container_width=True, type="primary", key=f"btn_hist_del_conf_{id_hist_sel}"):
+                    with conn() as c:
+                        cur_del = c.execute("DELETE FROM parametros_historico WHERE id=?", (int(id_hist_sel),))
+                    st.session_state.hist_param_excluir_id = None
+                    if int(cur_del.rowcount or 0) > 0:
+                        alerta_gravado()
+                    else:
+                        st.warning("Registro não encontrado para exclusão.")
+                    st.rerun()
+                if d_cancel.button("❌ Cancelar exclusão", use_container_width=True, key=f"btn_hist_del_cancel_{id_hist_sel}"):
+                    st.session_state.hist_param_excluir_id = None
+                    st.rerun()
+
+with aba11:
+    if "meta_editando" not in st.session_state:
+        st.session_state.meta_editando = False
+    if "meta_aba11_valor" not in st.session_state:
+        st.session_state.meta_aba11_valor = float(p.get("meta_faturamento", 50000.0))
+
+    meta_atual = float(p.get("meta_faturamento", 50000.0))
+    if not st.session_state.meta_editando:
+        st.session_state.meta_aba11_valor = meta_atual
+
+    c_meta, c_editar, c_gravar = st.columns([2, 1, 1])
+    with c_meta:
+        meta = st.number_input(
+            "Meta Mensal",
+            min_value=0.0,
+            step=100.0,
+            key="meta_aba11_valor",
+            disabled=not st.session_state.meta_editando,
+        )
+    with c_editar:
+        if st.button("✏️ Editar Meta", use_container_width=True, disabled=st.session_state.meta_editando):
+            st.session_state.meta_editando = True
+            st.rerun()
+    with c_gravar:
+        if st.button("💾 Gravar", use_container_width=True, type="primary", disabled=not st.session_state.meta_editando, key="btn_meta_gravar"):
+            nova_meta = float(st.session_state.meta_aba11_valor)
+            if st.session_state.simulacao_ativa:
+                if not st.session_state.p_simulado:
+                    with conn() as c:
+                        p_base = dict(c.execute("SELECT * FROM parametros WHERE id=1").fetchone())
+                    st.session_state.p_simulado = p_base
+                st.session_state.p_simulado["meta_faturamento"] = nova_meta
+                alerta_gravado()
+            else:
+                with conn() as c:
+                    c.execute("UPDATE parametros SET meta_faturamento=? WHERE id=1", (nova_meta,))
+                alerta_gravado()
+            st.session_state.meta_editando = False
+            st.rerun()
+
+    if not df_db.empty:
+        if "qtd_viagens" in df_db.columns:
+            qtd_meta = pd.to_numeric(df_db["qtd_viagens"], errors="coerce").fillna(1.0)
+            qtd_meta = qtd_meta.apply(lambda x: max(1, int(round(float(x)))))
+        else:
+            qtd_meta = pd.Series(1, index=df_db.index, dtype=int)
+        pagto_estadia_meta = pd.to_numeric(df_db.get("pagto_estadia", 0.0), errors="coerce").fillna(0.0)
+        fat_at = float(
+            (
+                (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_meta)
+                * qtd_meta
+            ).sum()
+        )
+    else:
+        fat_at = 0.0
+    fat_at += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number+delta",
+            value=fat_at,
+            delta={"reference": float(meta)},
+            gauge={"bar": {"color": "#B8E0D2"}},
+        )
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+with aba12:
+    st.subheader("🚚 Veículos")
+    if "veiculo_editando" not in st.session_state:
+        st.session_state.veiculo_editando = False
+    with st.form("f_v"):
+        c1, c2 = st.columns(2); d_v, m_v, a_v = c1.text_input("Desc"), c1.text_input("Modelo"), c1.text_input("Ano"); co_v, pl_v, re_v = c2.text_input("Cor"), c2.text_input("Placa").upper(), c2.text_input("Renavan")
+        if st.form_submit_button("💾 Gravar", key="btn_veiculo_gravar"):
+            with conn() as c: c.execute("INSERT OR REPLACE INTO veiculos (descricao, modelo, ano, cor, placa, renavan) VALUES (?,?,?,?,?,?)", (d_v, m_v, a_v, co_v, pl_v, re_v))
+            alerta_gravado()
+            st.rerun()
+    with conn() as c:
+        df_veic = pd.read_sql("SELECT * FROM veiculos ORDER BY descricao ASC", c)
+    st.dataframe(df_veic, use_container_width=True, hide_index=True)
+    c_ve1, c_ve2 = st.columns(2)
+    if c_ve1.button("✏️ Editar", key="btn_veiculo_editar", use_container_width=True, disabled=st.session_state.veiculo_editando):
+        st.session_state.veiculo_editando = True
+        st.rerun()
+    if c_ve2.button("❌ Cancelar Edição", key="btn_veiculo_cancelar_editar", use_container_width=True, disabled=not st.session_state.veiculo_editando):
+        st.session_state.veiculo_editando = False
+        st.rerun()
+    if st.session_state.veiculo_editando and not df_veic.empty:
+        df_veic_ed = st.data_editor(
+            df_veic,
+            key="editor_veiculos_cad",
+            hide_index=True,
+            use_container_width=True,
+            column_config={"id": None},
+        )
+        if st.button("💾 Gravar", key="btn_veiculo_gravar_edicao", type="primary", use_container_width=True):
+            with conn() as c:
+                for _, r in df_veic_ed.iterrows():
+                    c.execute(
+                        """UPDATE veiculos
+                           SET descricao=?, modelo=?, ano=?, cor=?, placa=?, renavan=?
+                           WHERE id=?""",
+                        (r["descricao"], r["modelo"], r["ano"], r["cor"], r["placa"], r["renavan"], int(r["id"])),
+                    )
+            alerta_gravado()
+            st.session_state.veiculo_editando = False
+            st.rerun()
+
+# =========================
+# ABA 13 - CONTROLE DE TROCAS (LÓGICA ALTERADA)
+# =========================
+with aba13:
+    st.subheader("🛢️ Controle de Trocas e Revisões")
+    
+    # Lista de serviços expandida
+    lista_servicos_troca = [
+        "Troca de Óleo Motor", "Troca de Óleo Câmbio", "Troca de Óleo Diferencial", 
+        "Filtro de Ar", "Filtro de Combustível", "Revisão Geral", 
+        "Troca Pneu Dianteiro", "Troca Pneu Tração", "Troca Pneu Truck", "Outros"
+    ]
+    
+    col_cad, col_hist = st.columns([1, 2])
+    
+    with col_cad:
+        st.markdown("### 📝 Registrar Troca/Revisão")
+        with st.form("f_troca_v11", clear_on_submit=True):
+            veic_t = st.selectbox("Veículo", apenas_placas, key="veic_troca_new")
+            serv_t = st.selectbox("Tipo de Serviço", lista_servicos_troca)
+            
+            c_t1, c_t2 = st.columns(2)
+            dt_t = c_t1.date_input("Data do Serviço", format="DD/MM/YYYY")
+            km_t = c_t2.number_input("KM Atual", step=1.0)
+            
+            c_t3, c_t4 = st.columns(2)
+            km_prox = c_t3.number_input("Próxima KM", step=1.0)
+            dt_venc_t = c_t4.date_input("Vencimento (Data)", value=dt_t + timedelta(days=180), format="DD/MM/YYYY")
+            
+            det_t = st.text_area("Detalhes/Peças Utilizadas (Ex: Marca do pneu, DOT, etc)")
+            
+            if st.form_submit_button("💾 Gravar", key="btn_troca_cadastro_gravar"):
+                with conn() as c:
+                    c.execute("""INSERT INTO controle_trocas (tipo_servico, data_servico, veiculo_placa, km_atual, km_proxima, detalhes, data_vencimento) 
+                                 VALUES (?,?,?,?,?,?,?)""", 
+                              (serv_t, dt_t.isoformat(), veic_t, km_t, km_prox, det_t, dt_venc_t.isoformat()))
+                alerta_gravado()
+                st.rerun()
+
+    with col_hist:
+        st.markdown("### 📋 Histórico de Trocas")
+        with conn() as c:
+            df_t = pd.read_sql("SELECT * FROM controle_trocas ORDER BY data_servico DESC", c)
+        
+        if not df_t.empty:
+            hoje_troca = date.today()
+            for idx, r in df_t.iterrows():
+                ed_key_t = f"edit_troca_{r['id']}"
+                if ed_key_t not in st.session_state: st.session_state[ed_key_t] = False
+
+                dt_s_br = datetime.strptime(r['data_servico'], '%Y-%m-%d').strftime('%d/%m/%Y') if r['data_servico'] else "-"
+                # Ícone visual para pneus
+                prefixo = "🛞" if "Pneu" in r['tipo_servico'] else "🔧"
+                exp_title = f"{prefixo} {dt_s_br} - {r['veiculo_placa']} - {r['tipo_servico']}"
+                
+                with st.expander(exp_title):
+                    if not st.session_state[ed_key_t]:
+                        # --- VISUALIZAÇÃO ---
+                        c1, c2, c3 = st.columns(3)
+                        c1.write(f"**KM Realizada:**\n{r['km_atual']:,}".replace(",", "."))
+                        c2.write(f"**Próxima KM:**\n{r['km_proxima']:,}".replace(",", "."))
+                        
+                        dt_v_br = datetime.strptime(r['data_vencimento'], '%Y-%m-%d').strftime('%d/%m/%Y') if r['data_vencimento'] else "-"
+                        c3.write(f"**Venc. Data:**\n{dt_v_br}")
+
+                        dt_v_calc = datetime.strptime(r['data_vencimento'], '%Y-%m-%d').date() if r['data_vencimento'] else None
+                        if dt_v_calc is not None:
+                            dias_para_vencer_troca = (dt_v_calc - hoje_troca).days
+                            if dias_para_vencer_troca > 0:
+                                st.caption(f"Faltam {dias_para_vencer_troca} dia(s) para vencer.")
+                            elif dias_para_vencer_troca == 0:
+                                st.warning("Vence hoje.")
+                            elif abs(dias_para_vencer_troca) > 30:
+                                st.error(f"Já venceu os 30 dias (há {abs(dias_para_vencer_troca)} dia(s)).")
+                            else:
+                                st.warning(f"Vencido há {abs(dias_para_vencer_troca)} dia(s).")
+                        
+                        st.info(f"**Detalhes:** {r['detalhes'] or 'Sem observações'}")
+                        
+                        b1, b2 = st.columns(2)
+                        if b1.button("✏️ EDITAR", key=f"btn_ed_t_{r['id']}", use_container_width=True):
+                            st.session_state[ed_key_t] = True
+                            st.rerun()
+                        if b2.button("🗑️ EXCLUIR", key=f"btn_del_t_{r['id']}", type="primary", use_container_width=True):
+                            with conn() as c: c.execute("DELETE FROM controle_trocas WHERE id=?", (r['id'],))
+                            st.rerun()
+                    else:
+                        # --- EDIÇÃO ---
+                        with st.form(f"form_ed_t_{r['id']}"):
+                            # Tenta encontrar o índice do serviço atual para o selectbox
+                            try:
+                                idx_serv = lista_servicos_troca.index(r['tipo_servico'])
+                            except ValueError:
+                                idx_serv = 0
+
+                            new_serv = st.selectbox("Tipo de Serviço", lista_servicos_troca, index=idx_serv)
+                            
+                            ce1, ce2 = st.columns(2)
+                            d_s_v = datetime.strptime(r['data_servico'], '%Y-%m-%d').date() if r['data_servico'] else datetime.now().date()
+                            new_dt_s = ce1.date_input("Data do Serviço", value=d_s_v, format="DD/MM/YYYY")
+                            new_km_a = ce2.number_input("KM Atual", value=float(r['km_atual'] or 0))
+                            
+                            ce3, ce4 = st.columns(2)
+                            new_km_p = ce3.number_input("Próxima KM", value=float(r['km_proxima'] or 0))
+                            d_v_v = datetime.strptime(r['data_vencimento'], '%Y-%m-%d').date() if r['data_vencimento'] else datetime.now().date()
+                            new_dt_v = ce4.date_input("Vencimento (Data)", value=d_v_v, format="DD/MM/YYYY")
+                            
+                            new_det = st.text_area("Detalhes", value=r['detalhes'] or "")
+                            
+                            be1, be2 = st.columns(2)
+                            if be1.form_submit_button("💾 Gravar", use_container_width=True, key=f"btn_troca_edicao_gravar_{r['id']}"):
+                                with conn() as c:
+                                    c.execute("""UPDATE controle_trocas SET 
+                                                 tipo_servico=?, data_servico=?, km_atual=?, km_proxima=?, detalhes=?, data_vencimento=? 
+                                                 WHERE id=?""", 
+                                              (new_serv, new_dt_s.isoformat(), new_km_a, new_km_p, new_det, new_dt_v.isoformat(), r['id']))
+                                st.session_state[ed_key_t] = False
+                                alerta_gravado()
+                                st.rerun()
+                            if be2.form_submit_button("❌ CANCELAR", use_container_width=True):
+                                st.session_state[ed_key_t] = False
+                                st.rerun()
+        else:
+            st.info("Nenhum registro de troca encontrado.")
+
+# =========================
+# ABA 14 - FRETE LIQUIDO SEM CUSTO FIXO
+# =========================
+with aba14:
+    st.subheader("💵 Frete Líquido Sem Custo Fixo")
+    st.caption(f"Período: {filtro_ini.strftime('%d/%m/%Y')} até {filtro_fim.strftime('%d/%m/%Y')}")
+
+    with conn() as c:
+        df_viagens_liq = pd.read_sql(
+            """SELECT data, km, toneladas, valor_ton, valor_km, tipo_cobranca, qtd_viagens, pedagio, gasto_extra, pagto_estadia, diesel, consumo
+               FROM viagens
+               WHERE date(data) BETWEEN ? AND ?""",
+            c,
+            params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
+        )
+        df_abs_ref = pd.read_sql(
+            """SELECT id, data, km_inicial, tipo_combustivel, qtde_litros, valor_unit
+               FROM abastecimentos
+               WHERE data <= ?
+               ORDER BY data ASC, id ASC""",
+            c,
+            params=(filtro_fim.isoformat(),),
+        )
+
+    if not df_viagens_liq.empty:
+        df_viagens_liq["km"] = pd.to_numeric(df_viagens_liq["km"], errors="coerce").fillna(0.0)
+        df_viagens_liq["toneladas"] = pd.to_numeric(df_viagens_liq["toneladas"], errors="coerce").fillna(0.0)
+        df_viagens_liq["valor_ton"] = pd.to_numeric(df_viagens_liq["valor_ton"], errors="coerce").fillna(0.0)
+        if "valor_km" not in df_viagens_liq.columns:
+            df_viagens_liq["valor_km"] = 0.0
+        if "tipo_cobranca" not in df_viagens_liq.columns:
+            df_viagens_liq["tipo_cobranca"] = "TONELADA"
+        df_viagens_liq["valor_km"] = pd.to_numeric(df_viagens_liq["valor_km"], errors="coerce").fillna(0.0)
+        df_viagens_liq["tipo_cobranca"] = df_viagens_liq["tipo_cobranca"].astype(str).str.upper().str.strip()
+        if "qtd_viagens" not in df_viagens_liq.columns:
+            df_viagens_liq["qtd_viagens"] = 1
+        if "gasto_extra" not in df_viagens_liq.columns:
+            df_viagens_liq["gasto_extra"] = 0.0
+        if "pedagio" not in df_viagens_liq.columns:
+            df_viagens_liq["pedagio"] = 0.0
+        if "pagto_estadia" not in df_viagens_liq.columns:
+            df_viagens_liq["pagto_estadia"] = 0.0
+        if "diesel" not in df_viagens_liq.columns:
+            df_viagens_liq["diesel"] = 0.0
+        if "consumo" not in df_viagens_liq.columns:
+            df_viagens_liq["consumo"] = 0.0
+        df_viagens_liq["qtd_viagens"] = pd.to_numeric(df_viagens_liq["qtd_viagens"], errors="coerce").fillna(1.0)
+        # Garante quantidade inteira e mínima de 1 para refletir o número real de viagens.
+        df_viagens_liq["qtd_viagens"] = df_viagens_liq["qtd_viagens"].apply(lambda x: max(1, int(round(float(x)))))
+        df_viagens_liq["pedagio"] = pd.to_numeric(df_viagens_liq["pedagio"], errors="coerce").fillna(0.0)
+        df_viagens_liq["gasto_extra"] = pd.to_numeric(df_viagens_liq["gasto_extra"], errors="coerce").fillna(0.0)
+        df_viagens_liq["pagto_estadia"] = pd.to_numeric(df_viagens_liq["pagto_estadia"], errors="coerce").fillna(0.0)
+        df_viagens_liq["diesel"] = pd.to_numeric(df_viagens_liq["diesel"], errors="coerce").fillna(0.0)
+        df_viagens_liq["consumo"] = pd.to_numeric(df_viagens_liq["consumo"], errors="coerce").fillna(0.0)
+        df_viagens_liq["frete_unitario"] = df_viagens_liq.apply(
+            lambda r: (r["km"] * r["valor_km"]) if r["tipo_cobranca"] == "KM" else (r["toneladas"] * r["valor_ton"]),
+            axis=1,
+        )
+        df_viagens_liq["total_frete"] = df_viagens_liq["frete_unitario"] * df_viagens_liq["qtd_viagens"]
+        df_viagens_liq["km_total"] = df_viagens_liq["km"] * df_viagens_liq["qtd_viagens"]
+        df_viagens_liq["pedagio_total"] = df_viagens_liq["pedagio"] * df_viagens_liq["qtd_viagens"]
+        df_viagens_liq["gasto_extra_total"] = df_viagens_liq["gasto_extra"] * df_viagens_liq["qtd_viagens"]
+        df_viagens_liq["pagto_estadia_total"] = df_viagens_liq["pagto_estadia"] * df_viagens_liq["qtd_viagens"]
+        consumo_valido_liq = df_viagens_liq["consumo"] > 0
+        df_viagens_liq["litros_diesel_total"] = 0.0
+        df_viagens_liq.loc[consumo_valido_liq, "litros_diesel_total"] = (
+            df_viagens_liq.loc[consumo_valido_liq, "km_total"] / df_viagens_liq.loc[consumo_valido_liq, "consumo"]
+        )
+        df_viagens_liq["valor_diesel_total"] = df_viagens_liq["litros_diesel_total"] * df_viagens_liq["diesel"]
+    else:
+        df_viagens_liq = pd.DataFrame(columns=["km", "qtd_viagens", "total_frete", "pedagio", "gasto_extra", "pagto_estadia", "km_total", "pedagio_total", "gasto_extra_total", "pagto_estadia_total", "litros_diesel_total", "valor_diesel_total"])
+
+    if not df_abs_ref.empty:
+        df_abs_ref["km_inicial"] = pd.to_numeric(df_abs_ref["km_inicial"], errors="coerce")
+        df_abs_ref["qtde_litros"] = pd.to_numeric(df_abs_ref["qtde_litros"], errors="coerce").fillna(0.0)
+        df_abs_ref["valor_unit"] = pd.to_numeric(df_abs_ref["valor_unit"], errors="coerce").fillna(0.0)
+        df_abs_ref["tipo_combustivel"] = df_abs_ref["tipo_combustivel"].apply(normalizar_tipo_combustivel)
+    else:
+        df_abs_ref = pd.DataFrame(columns=["km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit"])
+
+    qtde_viagem = int(df_viagens_liq["qtd_viagens"].sum()) if not df_viagens_liq.empty else 0
+    valor_total_viagem = float(df_viagens_liq["total_frete"].sum()) if not df_viagens_liq.empty else 0.0
+    valor_total_pedagio = float(df_viagens_liq["pedagio_total"].sum()) if not df_viagens_liq.empty else 0.0
+    valor_total_gasto_extra = float(df_viagens_liq["gasto_extra_total"].sum()) if not df_viagens_liq.empty else 0.0
+    valor_total_pagto_estadia = float(df_viagens_liq["pagto_estadia_total"].sum()) if not df_viagens_liq.empty else 0.0
+    valor_total_viagem += valor_total_pagto_estadia
+    valor_total_viagem += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
+    valor_pago_por_viagem = (valor_total_viagem / qtde_viagem) if qtde_viagem > 0 else 0.0
+    km_total = float(df_viagens_liq["km_total"].sum()) if not df_viagens_liq.empty else 0.0
+    km_por_viagem = (km_total / qtde_viagem) if qtde_viagem > 0 else 0.0
+    qtd_datas_periodo = df_viagens_liq["data"].nunique() if not df_viagens_liq.empty else 0
+
+    # Referência de consumo por KM baseada no mesmo raciocínio da aba Abastecimento:
+    # diferença entre os 2 últimos KMs diferentes / litros do KM final.
+    kms_ref = sorted(df_abs_ref["km_inicial"].dropna().unique().tolist()) if not df_abs_ref.empty else []
+    km_ref_anterior = kms_ref[-2] if len(kms_ref) >= 2 else None
+    km_ref_final = kms_ref[-1] if len(kms_ref) >= 2 else None
+    distancia_ref = (km_ref_final - km_ref_anterior) if km_ref_anterior is not None and km_ref_final is not None else 0.0
+    consumo_diesel_ref = 0.0
+    litros_diesel_ref = 0.0
+    if not df_abs_ref.empty and distancia_ref > 0 and km_ref_final is not None:
+        df_abs_ref_km_final = df_abs_ref[df_abs_ref["km_inicial"] == km_ref_final].copy()
+        litros_diesel_ref = float(
+            df_abs_ref_km_final[
+                df_abs_ref_km_final["tipo_combustivel"].str.contains("DIESEL", na=False)
+            ]["qtde_litros"].sum()
+        )
+        consumo_diesel_ref = (distancia_ref / litros_diesel_ref) if litros_diesel_ref > 0 else 0.0
+
+    def calcula_por_ultimo_abastecimento(df_ref, termo_tipo):
+        if df_ref.empty or distancia_ref <= 0:
+            return 0.0, 0.0, 0.0, 0.0
+        df_tipo = df_ref[df_ref["tipo_combustivel"].str.contains(termo_tipo, na=False)].copy()
+        if df_tipo.empty:
+            return 0.0, 0.0, 0.0, 0.0
+        ult = df_tipo.iloc[-1]
+        litros_ultimo = float(ult["qtde_litros"] or 0.0)
+        valor_unit_ultimo = float(ult["valor_unit"] or 0.0)
+        if litros_ultimo <= 0:
+            return 0.0, 0.0, 0.0, valor_unit_ultimo
+        consumo_km_l = distancia_ref / litros_ultimo
+        litros_estimados = (km_total / consumo_km_l) if consumo_km_l > 0 else 0.0
+        valor_estimado = litros_estimados * valor_unit_ultimo
+        return consumo_km_l, litros_estimados, valor_estimado, valor_unit_ultimo
+
+    _, _, _, preco_diesel_ref = calcula_por_ultimo_abastecimento(df_abs_ref, "DIESEL")
+    consumo_arla_ref, litros_arla_total, valor_arla_total, preco_arla_ref = calcula_por_ultimo_abastecimento(df_abs_ref, "ARLA")
+    litros_diesel_total = float(df_viagens_liq["litros_diesel_total"].sum()) if not df_viagens_liq.empty else 0.0
+    valor_diesel_total = float(df_viagens_liq["valor_diesel_total"].sum()) if not df_viagens_liq.empty else 0.0
+
+    if not df_viagens_liq.empty:
+        df_viagens_liq = aplicar_parametros_por_data(df_viagens_liq, col_data="data")
+        valor_motorista_viagens = float(
+            (df_viagens_liq["total_frete"] * (pd.to_numeric(df_viagens_liq["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
+        )
+        valor_imposto_viagens = float(
+            (df_viagens_liq["total_frete"] * (pd.to_numeric(df_viagens_liq["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
+        )
+    else:
+        valor_motorista_viagens = 0.0
+        valor_imposto_viagens = 0.0
+    valor_motorista_frete_fixo = float(
+        (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+         * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+    )
+    valor_imposto_frete_fixo = float(
+        (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+         * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+    )
+    valor_motorista_10 = valor_motorista_viagens + valor_motorista_frete_fixo
+    valor_imposto = valor_imposto_viagens + valor_imposto_frete_fixo
+    valor_liquido = (
+        valor_total_viagem
+        - valor_diesel_total
+        - valor_arla_total
+        - valor_total_pedagio
+        - valor_total_gasto_extra
+        - valor_motorista_10
+        - valor_imposto
+    )
+    valor_liquido_pct = (valor_liquido / valor_total_viagem * 100.0) if valor_total_viagem > 0 else 0.0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Quantidade de Viagem", f"{qtde_viagem}")
+    c2.metric("Valor da Viagem (Total)", brl(valor_total_viagem))
+    c4.metric("Total KM das Viagens", f"{km_total:,.2f} KM".replace(",", "."))
+    if qtd_datas_periodo <= 1:
+        c3.metric("Valor Pago por Viagem", brl(valor_pago_por_viagem))
+        c5.metric("KM por Viagem", f"{km_por_viagem:,.2f} KM".replace(",", "."))
+    else:
+        c3.metric("Valor Pago por Viagem", "-")
+        c5.metric("KM por Viagem", "-")
+        st.caption("Valor Pago por Viagem e KM por Viagem são exibidos apenas quando o filtro tiver uma única data.")
+
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("Qtde Total Litro Diesel", f"{litros_diesel_total:.2f} L")
+    d2.metric("Valor Total Gasto com Diesel", brl(valor_diesel_total))
+    d3.metric("Qtde Total Litro Arla", f"{litros_arla_total:.2f} L")
+    d4.metric("Valor Total Gasto com Arla", brl(valor_arla_total))
+    d5.metric("Média Diesel", f"{consumo_diesel_ref:.2f} KM/L" if consumo_diesel_ref > 0 else "-")
+
+    mliq1, mliq2, mliq3, mliq4, mliq5, mliq6, mliq7 = st.columns(7)
+    mliq1.metric("Valor 10% do Motorista", brl(valor_motorista_10))
+    mliq2.metric("Total Pedágio", brl(valor_total_pedagio))
+    mliq3.metric("Total Gasto Extra", brl(valor_total_gasto_extra))
+    mliq4.metric("Total Pagto Estadia", brl(valor_total_pagto_estadia))
+    mliq5.metric("Total Imposto", brl(valor_imposto))
+    mliq6.metric("Valor Líquido", brl(valor_liquido))
+    mliq7.metric("Valor Líquido em %", f"{valor_liquido_pct:.2f}%")
+    if distancia_ref > 0:
+        st.info(
+            (
+                f"Referência do último abastecimento: distância base {distancia_ref:,.0f} KM "
+                f"({km_ref_final:,.0f} - {km_ref_anterior:,.0f}). "
+                f"Diesel ref: {consumo_diesel_ref:.2f} KM/L (R$ {preco_diesel_ref:.2f}/L). "
+                f"Arla ref: {consumo_arla_ref:.2f} KM/L (R$ {preco_arla_ref:.2f}/L)."
+            ).replace(",", ".")
+        )
+    else:
+        st.warning("Sem base suficiente de abastecimento para calcular consumo por KM (necessário 2 KMs de abastecimento diferentes).")
+
+# =========================
+# ABA 15 - FORNECEDORES
+# =========================
+with aba15:
+    st.subheader("🏭 Cadastro de Fornecedores")
+    if "fornecedor_editando" not in st.session_state:
+        st.session_state.fornecedor_editando = False
+    with st.form("form_fornecedor", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        cod_forn = c1.text_input("Código Fornecedor").strip().upper()
+        nome_forn = c2.text_input("Nome do Fornecedor").strip()
+        cnpj_forn = c3.text_input("CNPJ").strip()
+
+        c4, c5, c6 = st.columns(3)
+        ie_forn = c4.text_input("Insc. Est.").strip()
+        end_forn = c5.text_input("Endereço").strip()
+        cidade_forn = c6.text_input("Cidade").strip()
+
+        c7, c8, c9 = st.columns(3)
+        bairro_forn = c7.text_input("Bairro").strip()
+        cep_forn = c8.text_input("CEP").strip()
+        tel_forn = c9.text_input("Telefone").strip()
+
+        if st.form_submit_button("💾 Gravar", type="primary", key="btn_fornecedor_gravar"):
+            if not cod_forn or not nome_forn:
+                st.warning("Informe Código Fornecedor e Nome do Fornecedor.")
+            else:
+                try:
+                    with conn() as c:
+                        c.execute(
+                            """INSERT INTO fornecedores
+                               (codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (cod_forn, nome_forn, cnpj_forn, ie_forn, end_forn, cidade_forn, bairro_forn, cep_forn, tel_forn),
+                        )
+                    alerta_gravado()
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Código Fornecedor já cadastrado.")
+
+    with conn() as c:
+        df_forn = pd.read_sql("SELECT codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone FROM fornecedores ORDER BY nome ASC", c)
+    st.dataframe(df_forn, use_container_width=True, hide_index=True)
+    c_fed1, c_fed2 = st.columns(2)
+    if c_fed1.button("✏️ Editar", key="btn_fornecedor_editar", use_container_width=True, disabled=st.session_state.fornecedor_editando):
+        st.session_state.fornecedor_editando = True
+        st.rerun()
+    if c_fed2.button("❌ Cancelar Edição", key="btn_fornecedor_cancelar_editar", use_container_width=True, disabled=not st.session_state.fornecedor_editando):
+        st.session_state.fornecedor_editando = False
+        st.rerun()
+    if st.session_state.fornecedor_editando and not df_forn.empty:
+        with conn() as c:
+            df_forn_ed = pd.read_sql("SELECT id, codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone FROM fornecedores ORDER BY nome ASC", c)
+        df_forn_ed2 = st.data_editor(df_forn_ed, key="editor_fornecedores_cad", hide_index=True, use_container_width=True, column_config={"id": None})
+        if st.button("💾 Gravar", key="btn_fornecedor_gravar_edicao", type="primary", use_container_width=True):
+            with conn() as c:
+                for _, r in df_forn_ed2.iterrows():
+                    c.execute(
+                        """UPDATE fornecedores
+                           SET codigo=?, nome=?, cnpj=?, insc_est=?, endereco=?, cidade=?, bairro=?, cep=?, telefone=?
+                           WHERE id=?""",
+                        (r["codigo"], r["nome"], r["cnpj"], r["insc_est"], r["endereco"], r["cidade"], r["bairro"], r["cep"], r["telefone"], int(r["id"])),
+                    )
+            alerta_gravado()
+            st.session_state.fornecedor_editando = False
+            st.rerun()
+
+# =========================
+# ABA 16 - OBRIGAÇÃO
+# =========================
+with aba16:
+    st.subheader("📌 Cadastro de Obrigação")
+    if "obrigacao_editando" not in st.session_state:
+        st.session_state.obrigacao_editando = False
+    with st.form("form_obrigacao", clear_on_submit=True):
+        desc_ob = st.text_input("Descrição Obrigação").strip()
+        if st.form_submit_button("💾 Gravar", type="primary", key="btn_obrigacao_gravar"):
+            if not desc_ob:
+                st.warning("Informe a descrição da obrigação.")
+            else:
+                try:
+                    with conn() as c:
+                        c.execute("INSERT INTO obrigacoes (descricao_obrigacao) VALUES (?)", (desc_ob,))
+                    alerta_gravado()
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.warning("Essa obrigação já está cadastrada.")
+
+    with conn() as c:
+        df_ob = pd.read_sql("SELECT id, descricao_obrigacao FROM obrigacoes ORDER BY descricao_obrigacao ASC", c)
+    st.dataframe(df_ob, use_container_width=True, hide_index=True)
+    c_ob1, c_ob2 = st.columns(2)
+    if c_ob1.button("✏️ Editar", key="btn_obrigacao_editar", use_container_width=True, disabled=st.session_state.obrigacao_editando):
+        st.session_state.obrigacao_editando = True
+        st.rerun()
+    if c_ob2.button("❌ Cancelar Edição", key="btn_obrigacao_cancelar_editar", use_container_width=True, disabled=not st.session_state.obrigacao_editando):
+        st.session_state.obrigacao_editando = False
+        st.rerun()
+    if st.session_state.obrigacao_editando and not df_ob.empty:
+        df_ob_ed = st.data_editor(df_ob, key="editor_obrigacoes_cad", hide_index=True, use_container_width=True, column_config={"id": None})
+        if st.button("💾 Gravar", key="btn_obrigacao_gravar_edicao", type="primary", use_container_width=True):
+            with conn() as c:
+                for _, r in df_ob_ed.iterrows():
+                    c.execute("UPDATE obrigacoes SET descricao_obrigacao=? WHERE id=?", (r["descricao_obrigacao"], int(r["id"])))
+            alerta_gravado()
+            st.session_state.obrigacao_editando = False
+            st.rerun()
+
+# =========================
+# ABA 19 - COMPARATIVO CONSUMO DIESEL
+# =========================
+with aba19:
+    st.subheader("⛽ Comparativo Consumo de Diesel")
+    if "cmp_editando" not in st.session_state:
+        st.session_state.cmp_editando = False
+
+    st.caption(
+        f"Período aplicado (mesmo filtro do Histórico): {filtro_ini.strftime('%d/%m/%Y')} até {filtro_fim.strftime('%d/%m/%Y')}"
+    )
+
+    if not df_db.empty:
+        df_km_ref = df_db.copy()
+        if "qtd_viagens" not in df_km_ref.columns:
+            df_km_ref["qtd_viagens"] = 1
+        df_km_ref["km"] = pd.to_numeric(df_km_ref["km"], errors="coerce").fillna(0.0)
+        df_km_ref["qtd_viagens"] = pd.to_numeric(df_km_ref["qtd_viagens"], errors="coerce").fillna(1.0)
+        df_km_ref["qtd_viagens"] = df_km_ref["qtd_viagens"].apply(lambda x: max(1, int(round(float(x)))))
+        total_km_mensal = float((df_km_ref["km"] * df_km_ref["qtd_viagens"]).sum())
+    else:
+        total_km_mensal = 0.0
+
+    valor_litro_padrao = float(p.get("cmp_valor_litro_diesel", p.get("diesel", v_diesel_sug or 0.0)))
+    consumo_001_padrao = float(p.get("cmp_consumo_001", p.get("consumo", v_cons_sug or 2.5)))
+    consumo_002_padrao = float(p.get("cmp_consumo_002", consumo_001_padrao))
+    consumo_003_padrao = float(p.get("cmp_consumo_003", consumo_001_padrao))
+    custo_escritorio_padrao = float(p.get("cmp_custo_escritorio", 0.0))
+
+    if not st.session_state.cmp_editando:
+        st.session_state["cmp_valor_litro_diesel"] = valor_litro_padrao
+        st.session_state["cmp_consumo_001"] = consumo_001_padrao
+        st.session_state["cmp_consumo_002"] = consumo_002_padrao
+        st.session_state["cmp_consumo_003"] = consumo_003_padrao
+        st.session_state["cmp_custo_escritorio"] = custo_escritorio_padrao
+
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    c1.metric("Total KM Mensal (Histórico)", format_br(total_km_mensal, casas_decimais=0))
+    with c2:
+        if st.button("✏️ Editar", use_container_width=True, disabled=st.session_state.cmp_editando):
+            st.session_state.cmp_editando = True
+            st.rerun()
+    with c3:
+        if st.button("💾 Gravar", use_container_width=True, type="primary", disabled=not st.session_state.cmp_editando, key="btn_cmp_gravar"):
+            novo_valor_litro = float(st.session_state.get("cmp_valor_litro_diesel", valor_litro_padrao))
+            novo_consumo_001 = float(st.session_state.get("cmp_consumo_001", consumo_001_padrao))
+            novo_consumo_002 = float(st.session_state.get("cmp_consumo_002", consumo_002_padrao))
+            novo_consumo_003 = float(st.session_state.get("cmp_consumo_003", consumo_003_padrao))
+            novo_custo_escritorio = float(st.session_state.get("cmp_custo_escritorio", custo_escritorio_padrao))
+
+            if st.session_state.simulacao_ativa:
+                if not st.session_state.p_simulado:
+                    with conn() as c:
+                        p_base = dict(c.execute("SELECT * FROM parametros WHERE id=1").fetchone())
+                    st.session_state.p_simulado = p_base
+                st.session_state.p_simulado["cmp_valor_litro_diesel"] = novo_valor_litro
+                st.session_state.p_simulado["cmp_consumo_001"] = novo_consumo_001
+                st.session_state.p_simulado["cmp_consumo_002"] = novo_consumo_002
+                st.session_state.p_simulado["cmp_consumo_003"] = novo_consumo_003
+                st.session_state.p_simulado["cmp_custo_escritorio"] = novo_custo_escritorio
+                alerta_gravado()
+            else:
+                with conn() as c:
+                    c.execute(
+                        """UPDATE parametros
+                           SET cmp_valor_litro_diesel=?, cmp_consumo_001=?, cmp_consumo_002=?, cmp_consumo_003=?, cmp_custo_escritorio=?
+                           WHERE id=1""",
+                        (novo_valor_litro, novo_consumo_001, novo_consumo_002, novo_consumo_003, novo_custo_escritorio),
+                    )
+                    p_hist_base = c.execute(
+                        """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro, financiamento,
+                                  pagto_ipva, imposto_pct, valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
+                           FROM parametros WHERE id=1"""
+                    ).fetchone()
+                    data_vigencia_cmp = str(p.get("data_filtro_ini", date.today().isoformat()) or date.today().isoformat())
+                    c.execute(
+                        """INSERT INTO parametros_historico (
+                               vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                               seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                               qtde_pneu, vl_gasto_pneu_km
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(vigencia_data) DO UPDATE SET
+                               cmp_custo_escritorio=excluded.cmp_custo_escritorio""",
+                        (
+                            data_vigencia_cmp,
+                            float(p_hist_base["consumo"] or 0.0),
+                            float(p_hist_base["manut"] or 0.0),
+                            float(p_hist_base["pneu"] or 0.0),
+                            float(p_hist_base["depre"] or 0.0),
+                            float(p_hist_base["motora_fixo"] or 0.0),
+                            float(p_hist_base["motora_pct"] or 0.0),
+                            float(p_hist_base["seguro"] or 0.0),
+                            float(p_hist_base["financiamento"] or 0.0),
+                            float(p_hist_base["pagto_ipva"] or 0.0),
+                            float(novo_custo_escritorio or 0.0),
+                            float(p_hist_base["imposto_pct"] or 0.0),
+                            float(p_hist_base["valor_frete_mensal_fixo"] or 0.0),
+                            float(p_hist_base["qtde_pneu"] or 0.0),
+                            float(p_hist_base["vl_gasto_pneu_km"] or 0.0),
+                        ),
+                    )
+                alerta_gravado()
+
+            st.session_state.cmp_editando = False
+            st.rerun()
+    with c4:
+        st.write("")
+
+    valor_litro_diesel = st.number_input(
+        "Valor Litro Diesel (R$)",
+        min_value=0.0,
+        step=0.01,
+        key="cmp_valor_litro_diesel",
+        disabled=not st.session_state.cmp_editando,
+    )
+    custo_escritorio = st.number_input(
+        "Custo Escritório (R$)",
+        min_value=0.0,
+        step=10.0,
+        key="cmp_custo_escritorio",
+        disabled=not st.session_state.cmp_editando,
+    )
+
+    st.markdown("#### Consumo por KM/L")
+    p1, p2, p3 = st.columns(3)
+    consumo_001 = p1.number_input(
+        "Consumo por KM 001",
+        min_value=0.0,
+        step=0.01,
+        key="cmp_consumo_001",
+        disabled=not st.session_state.cmp_editando,
+    )
+    consumo_002 = p2.number_input(
+        "Consumo por KM 002",
+        min_value=0.0,
+        step=0.01,
+        key="cmp_consumo_002",
+        disabled=not st.session_state.cmp_editando,
+    )
+    consumo_003 = p3.number_input(
+        "Consumo por KM 003",
+        min_value=0.0,
+        step=0.01,
+        key="cmp_consumo_003",
+        disabled=not st.session_state.cmp_editando,
+    )
+
+    comparativos = [
+        ("Consumo 001", float(consumo_001)),
+        ("Consumo 002", float(consumo_002)),
+        ("Consumo 003", float(consumo_003)),
+    ]
+
+    linhas_cmp = []
+    for nome, consumo_km_l in comparativos:
+        litros = (total_km_mensal / consumo_km_l) if consumo_km_l > 0 else None
+        custo = (litros * float(valor_litro_diesel)) if litros is not None else None
+        linhas_cmp.append(
+            {
+                "Cenário": nome,
+                "Consumo (KM/L)": consumo_km_l,
+                "Litros Estimados": litros,
+                "Custo Diesel": custo,
+                "Custo Escritório": float(custo_escritorio),
+                "Custo Total": (custo + float(custo_escritorio)) if custo is not None else None,
+            }
+        )
+
+    df_cmp = pd.DataFrame(linhas_cmp)
+    if not df_cmp.empty:
+        df_cmp["Custo Diesel"] = pd.to_numeric(df_cmp["Custo Diesel"], errors="coerce")
+        df_cmp["Custo Escritório"] = pd.to_numeric(df_cmp["Custo Escritório"], errors="coerce").fillna(0.0)
+        df_cmp["Custo Total"] = pd.to_numeric(df_cmp["Custo Total"], errors="coerce")
+        df_cmp["Litros Estimados"] = pd.to_numeric(df_cmp["Litros Estimados"], errors="coerce")
+        df_cmp_valid = df_cmp[df_cmp["Custo Total"].notna()].copy()
+
+        if df_cmp_valid.empty:
+            st.warning("Informe consumos maiores que zero para calcular o comparativo.")
+        else:
+            maior_custo = float(df_cmp_valid["Custo Total"].max())
+            menor_custo = float(df_cmp_valid["Custo Total"].min())
+            df_cmp["Economia vs Pior Cenário"] = maior_custo - df_cmp["Custo Total"]
+
+            custo_ref_001 = float(df_cmp_valid.loc[df_cmp_valid["Cenário"] == "Consumo 001", "Custo Total"].iloc[0]) if not df_cmp_valid.loc[df_cmp_valid["Cenário"] == "Consumo 001"].empty else None
+            custo_ref_002 = float(df_cmp_valid.loc[df_cmp_valid["Cenário"] == "Consumo 002", "Custo Total"].iloc[0]) if not df_cmp_valid.loc[df_cmp_valid["Cenário"] == "Consumo 002"].empty else None
+            custo_ref_003 = float(df_cmp_valid.loc[df_cmp_valid["Cenário"] == "Consumo 003", "Custo Total"].iloc[0]) if not df_cmp_valid.loc[df_cmp_valid["Cenário"] == "Consumo 003"].empty else None
+            df_cmp["Economia vs Consumo 001"] = (custo_ref_001 - df_cmp["Custo Total"]) if custo_ref_001 is not None else None
+
+            st.dataframe(
+                df_cmp.style.format(
+                    {
+                        "Consumo (KM/L)": "{:.2f}",
+                        "Litros Estimados": "{:.2f}",
+                        "Custo Diesel": "R$ {:,.2f}",
+                        "Custo Escritório": "R$ {:,.2f}",
+                        "Custo Total": "R$ {:,.2f}",
+                        "Economia vs Pior Cenário": "R$ {:,.2f}",
+                        "Economia vs Consumo 001": "R$ {:,.2f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            melhor_idx = df_cmp_valid["Custo Total"].idxmin()
+            melhor = df_cmp_valid.loc[melhor_idx]
+            e1, e2 = st.columns(2)
+            e1.metric("Melhor Consumo", f"{melhor['Cenário']} ({melhor['Consumo (KM/L)']:.2f} KM/L)")
+            e2.metric("Custo Mensal Melhor Cenário", brl(menor_custo))
+
+            r1, r2 = st.columns(2)
+            economia_002_vs_001 = (custo_ref_001 - custo_ref_002) if (custo_ref_001 is not None and custo_ref_002 is not None) else None
+            economia_003_vs_001 = (custo_ref_001 - custo_ref_003) if (custo_ref_001 is not None and custo_ref_003 is not None) else None
+            r1.metric("Economia Mensal Consumo 002 (vs 001)", brl(economia_002_vs_001) if economia_002_vs_001 is not None else "-")
+            r2.metric("Economia Mensal Consumo 003 (vs 001)", brl(economia_003_vs_001) if economia_003_vs_001 is not None else "-")
+
+            st.caption("A economia é estimada com base no KM total do período filtrado, no valor do litro e no custo de escritório informado.")
+
+# =========================
+# ABA 17 - CONTAS A PAGAR
+# =========================
+with aba17:
+    st.subheader("🧾 Contas a Pagar")
+    if st.session_state.get("cp_flash_msg"):
+        st.success(st.session_state["cp_flash_msg"])
+        st.session_state["cp_flash_msg"] = None
+
+    def _cp_parse_valor(txt):
+        if txt is None:
+            return 0.0
+        s = str(txt).strip().replace("R$", "").replace(" ", "")
+        if not s:
+            return 0.0
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        elif "," in s:
+            s = s.replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _cp_extrair_parcelas(vencimentos_texto):
+        parcelas = []
+        if not vencimentos_texto:
+            return parcelas
+        for idx, item in enumerate(str(vencimentos_texto).split(";")):
+            trecho = item.strip()
+            if not trecho:
+                continue
+            numero = None
+            restante = trecho
+            if ":" in trecho:
+                pref, possivel_restante = trecho.split(":", 1)
+                if pref.strip().isdigit():
+                    numero = int(pref.strip())
+                    restante = possivel_restante
+            data_txt = restante
+            valor_txt = ""
+            if "|" in restante:
+                data_txt, valor_txt = restante.split("|", 1)
+            data_parcela = pd.to_datetime(str(data_txt).strip(), dayfirst=True, errors="coerce")
+            if pd.isna(data_parcela):
+                continue
+            if numero is None:
+                numero = idx + 1
+            parcelas.append(
+                {
+                    "parcela": numero,
+                    "data": data_parcela.date(),
+                    "valor": _cp_parse_valor(valor_txt),
+                }
+            )
+        return parcelas
+
+    def _cp_parse_parcelas_pagas(parcelas_pagas_texto):
+        pagas = set()
+        if not parcelas_pagas_texto:
+            return pagas
+        for token in str(parcelas_pagas_texto).replace(",", ";").split(";"):
+            t = token.strip()
+            if t.isdigit():
+                pagas.add(int(t))
+        return pagas
+
+    def _cp_serializar_parcelas_pagas(parcelas_pagas):
+        try:
+            nums = sorted({int(x) for x in parcelas_pagas if int(x) > 0})
+        except Exception:
+            nums = []
+        return ";".join(str(n) for n in nums)
+
+    def _cp_proximo_vencimento_mensal(hoje_ref, dia_venc, data_base=None):
+        data_base_dt = pd.to_datetime(data_base, errors="coerce")
+        if pd.notna(data_base_dt):
+            data_base_date = data_base_dt.date()
+            if data_base_date >= hoje_ref:
+                return data_base_date
+            dia_ref = int(data_base_date.day)
+        else:
+            dia_ref = int(dia_venc or 1)
+
+        dia = max(1, min(31, dia_ref))
+        ano = hoje_ref.year
+        mes = hoje_ref.month
+        dias_mes = int(pd.Period(f"{ano}-{mes:02d}").days_in_month)
+        venc_atual = date(ano, mes, min(dia, dias_mes))
+        if venc_atual < hoje_ref:
+            if mes == 12:
+                ano += 1
+                mes = 1
+            else:
+                mes += 1
+            dias_mes = int(pd.Period(f"{ano}-{mes:02d}").days_in_month)
+            venc_atual = date(ano, mes, min(dia, dias_mes))
+        return venc_atual
+
+    def _cp_distribuir_valor(total, qtd):
+        qtd_ok = max(1, int(qtd or 1))
+        total_ok = float(total or 0.0)
+        base = round(total_ok / qtd_ok, 2)
+        valores = [base for _ in range(qtd_ok)]
+        ajuste = round(total_ok - sum(valores), 2)
+        valores[-1] = round(valores[-1] + ajuste, 2)
+        return valores
+
+    def _cp_montar_alertas(df_base):
+        alertas = []
+        hoje_ref = date.today()
+        for _, r in df_base.iterrows():
+            tipo = str(r.get("tipo_lancamento") or "NAO_MENSAL")
+            dias_alerta = int(r.get("dias_alerta") or 7)
+            dias_alerta = max(0, dias_alerta)
+            fornecedor = str(r.get("fornecedor") or "-")
+            obrigacao = str(r.get("descricao_obrigacao") or "-")
+            nf_ref = str(r.get("n_nf") or "-")
+
+            if tipo == "MENSAL_FIXO":
+                prox = _cp_proximo_vencimento_mensal(
+                    hoje_ref,
+                    r.get("dia_vencimento_mensal"),
+                    r.get("data_vencimento_base"),
+                )
+                dias = (prox - hoje_ref).days
+                if 0 <= dias <= dias_alerta:
+                    alertas.append(
+                        {
+                            "ID": int(r["id"]),
+                            "Tipo": "Mensal Fixa",
+                            "Fornecedor": fornecedor,
+                            "Obrigação": obrigacao,
+                            "NF": nf_ref,
+                            "Parcela": "-",
+                            "Vencimento": prox,
+                            "Dias": dias,
+                            "Valor (R$)": float(r.get("valor_parcela") or r.get("valor_total_nf") or 0.0),
+                            "Situação": "Vence hoje" if dias == 0 else f"Vence em {dias} dia(s)",
+                        }
+                    )
+                continue
+
+            parcelas = _cp_extrair_parcelas(r.get("vencimentos_parcelas"))
+            parcelas_pagas = _cp_parse_parcelas_pagas(r.get("parcelas_pagas"))
+            for p_item in parcelas:
+                parcela_num = int(p_item["parcela"]) if p_item["parcela"] is not None else None
+                if parcela_num is not None and parcela_num in parcelas_pagas:
+                    continue
+                dias = (p_item["data"] - hoje_ref).days
+                if 0 <= dias <= dias_alerta:
+                    alertas.append(
+                        {
+                            "ID": int(r["id"]),
+                            "Tipo": "Não mensal",
+                            "Fornecedor": fornecedor,
+                            "Obrigação": obrigacao,
+                            "NF": nf_ref,
+                            "Parcela": parcela_num if parcela_num is not None else "-",
+                            "Vencimento": p_item["data"],
+                            "Dias": dias,
+                            "Valor (R$)": float(p_item["valor"] or r.get("valor_parcela") or 0.0),
+                            "Situação": "Vence hoje" if dias == 0 else f"Vence em {dias} dia(s)",
+                        }
+                    )
+        if not alertas:
+            return pd.DataFrame()
+        df_alertas = pd.DataFrame(alertas).sort_values(by=["Dias", "Vencimento", "ID"], ascending=[True, True, True]).reset_index(drop=True)
+        return df_alertas
+
+    def _cp_proximo_vencimento_grade(row):
+        tipo = str(row.get("tipo_lancamento") or "NAO_MENSAL")
+        if tipo == "MENSAL_FIXO":
+            return _cp_proximo_vencimento_mensal(
+                date.today(),
+                row.get("dia_vencimento_mensal"),
+                row.get("data_vencimento_base"),
+            )
+        parcelas = _cp_extrair_parcelas(row.get("vencimentos_parcelas"))
+        if not parcelas:
+            return None
+        parcelas_pagas = _cp_parse_parcelas_pagas(row.get("parcelas_pagas"))
+        hoje_ref = date.today()
+        datas = sorted(
+            [
+                p["data"]
+                for p in parcelas
+                if p.get("data") is not None and int(p.get("parcela") or 0) not in parcelas_pagas
+            ]
+        )
+        if not datas:
+            return None
+        futuras = [d for d in datas if d >= hoje_ref]
+        return futuras[0] if futuras else datas[-1]
+
+    with conn() as c:
+        fornecedores_cp = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
+        obrigacoes_cp = c.execute("SELECT id, descricao_obrigacao FROM obrigacoes ORDER BY descricao_obrigacao ASC").fetchall()
+
+    if not fornecedores_cp:
+        st.warning("Cadastre pelo menos um fornecedor na aba Fornecedores.")
+    elif not obrigacoes_cp:
+        st.warning("Cadastre pelo menos uma obrigação na aba Obrigação.")
+    else:
+        mapa_forn = {f"{f['codigo']} - {f['nome']}": f["id"] for f in fornecedores_cp}
+        mapa_obr = {o["descricao_obrigacao"]: o["id"] for o in obrigacoes_cp}
+        st.markdown("##### Dados Principais")
+        p1, p2, p3 = st.columns(3)
+        sel_forn = p1.selectbox("Código Fornecedor", list(mapa_forn.keys()), key="cp_sel_forn")
+        n_nf_cp = p2.text_input("N.NF", key="cp_nf").strip()
+        dt_ent_cp = p3.date_input("Data Entrada", format="DD/MM/YYYY", key="cp_dt_entrada")
+
+        p4, p5, p6 = st.columns(3)
+        valor_total_nf_cp = p4.number_input("Valor Total da NF", min_value=0.0, step=0.01, key="cp_valor_total_nf")
+        sel_obr = p5.selectbox("Obrigação", list(mapa_obr.keys()), key="cp_sel_obrigacao")
+        tipo_label_cp = p6.selectbox(
+            "Tipo de Lançamento",
+            options=["Não mensal (único/parcelado)", "Mensal fixa (todo mês)"],
+            key="cp_tipo_lancamento_sel",
+        )
+        tipo_lancamento_cp = "MENSAL_FIXO" if "Mensal fixa" in tipo_label_cp else "NAO_MENSAL"
+        dados_nf_cp = st.text_input("Dados da NF", key="cp_dados_nf").strip()
+
+        c_cfg1, c_cfg2, c_cfg3 = st.columns(3)
+        dias_alerta_cp = int(c_cfg1.number_input("Avisar com antecedência (dias)", min_value=0, max_value=90, step=1, value=7, key="cp_dias_alerta"))
+        dia_vencimento_mensal_cp = None
+        data_vencimento_base_cp = None
+        qtd_parc_cp = 1
+        if tipo_lancamento_cp == "MENSAL_FIXO":
+            data_vencimento_base_cp = c_cfg2.date_input(
+                "Data de Vencimento",
+                value=dt_ent_cp + timedelta(days=30),
+                format="DD/MM/YYYY",
+                key="cp_data_vencimento_base",
+            )
+            dia_vencimento_mensal_cp = int(data_vencimento_base_cp.day)
+            c_cfg3.info("Informe a data de vencimento. O sistema usa essa data como referência.")
+        else:
+            qtd_parc_cp = int(c_cfg2.number_input("Quantidade Parcelas", min_value=1, step=1, value=1, key="cp_qtd_parcelas"))
+            c_cfg3.info("Para não mensal, informe as parcelas abaixo.")
+
+        st.markdown("##### Parcelas (Vencimento e Valor)")
+        valor_parcela_base = (float(valor_total_nf_cp) / qtd_parc_cp) if qtd_parc_cp > 0 else 0.0
+        df_parcelas_edit = pd.DataFrame(columns=["Parcela", "Vencimento", "Valor", "Paga"])
+
+        if tipo_lancamento_cp == "NAO_MENSAL":
+            if "cp_parcelas_df" not in st.session_state:
+                st.session_state.cp_parcelas_df = pd.DataFrame(columns=["Parcela", "Vencimento", "Valor", "Paga"])
+
+            df_parc_state = st.session_state.cp_parcelas_df.copy()
+            if "Paga" not in df_parc_state.columns:
+                df_parc_state["Paga"] = False
+                st.session_state.cp_parcelas_df = df_parc_state
+            precisa_regerar = (
+                df_parc_state.empty
+                or len(df_parc_state) != qtd_parc_cp
+                or "cp_qtd_parcelas_prev" not in st.session_state
+                or st.session_state.get("cp_qtd_parcelas_prev") != qtd_parc_cp
+            )
+
+            if precisa_regerar:
+                linhas = []
+                for i in range(qtd_parc_cp):
+                    linhas.append(
+                        {
+                            "Parcela": i + 1,
+                            "Vencimento": dt_ent_cp + timedelta(days=30 * (i + 1)),
+                            "Valor": round(valor_parcela_base, 2),
+                            "Paga": False,
+                        }
+                    )
+                st.session_state.cp_parcelas_df = pd.DataFrame(linhas)
+                st.session_state.cp_qtd_parcelas_prev = qtd_parc_cp
+
+            cpar_a, cpar_b = st.columns([1, 1])
+            if cpar_a.button("🔄 Redistribuir Valor Igual", key="cp_btn_redistribuir"):
+                df_tmp = st.session_state.cp_parcelas_df.copy()
+                if not df_tmp.empty:
+                    df_tmp["Valor"] = round(valor_parcela_base, 2)
+                    st.session_state.cp_parcelas_df = df_tmp
+                    st.rerun()
+            cpar_b.caption(f"Valor base por parcela: {brl(valor_parcela_base)}")
+
+            df_parcelas_edit = st.data_editor(
+                st.session_state.cp_parcelas_df,
+                key="cp_editor_parcelas",
+                hide_index=True,
+                use_container_width=True,
+                num_rows="fixed",
+                disabled=["Parcela"],
+                column_config={
+                    "Parcela": st.column_config.NumberColumn("Parcela", format="%d"),
+                    "Vencimento": st.column_config.DateColumn("Data Parcela", format="DD/MM/YYYY"),
+                    "Valor": st.column_config.NumberColumn("Valor Parcela (R$)", format="R$ %.2f", min_value=0.0, step=0.01),
+                    "Paga": st.column_config.CheckboxColumn("Paga", default=False),
+                },
+            )
+            st.session_state.cp_parcelas_df = df_parcelas_edit
+            soma_parcelas = float(pd.to_numeric(df_parcelas_edit["Valor"], errors="coerce").fillna(0.0).sum()) if not df_parcelas_edit.empty else 0.0
+            diferenca = float(valor_total_nf_cp) - soma_parcelas
+        else:
+            st.info("Lançamento mensal fixo: o valor será considerado recorrente todo mês.")
+            soma_parcelas = float(valor_total_nf_cp)
+            diferenca = 0.0
+
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Total NF", brl(valor_total_nf_cp))
+        r2.metric("Soma das Parcelas", brl(soma_parcelas))
+        r3.metric("Diferença", brl(diferenca))
+
+        if st.button("💾 Gravar", type="primary", key="btn_salvar_cp"):
+            if tipo_lancamento_cp == "NAO_MENSAL" and not n_nf_cp:
+                st.warning("Informe o número da NF.")
+            elif tipo_lancamento_cp == "NAO_MENSAL" and df_parcelas_edit.empty:
+                st.warning("Informe as parcelas antes de salvar.")
+            elif tipo_lancamento_cp == "MENSAL_FIXO" and float(valor_total_nf_cp) <= 0:
+                st.warning("Informe o valor mensal para o lançamento fixo.")
+            else:
+                detalhes_parcelas = ""
+                parcelas_pagas_salvar = ""
+                valor_medio_parcela = float(valor_total_nf_cp)
+                qtd_parcelas_salvar = int(qtd_parc_cp)
+                dia_venc_salvar = int(dia_vencimento_mensal_cp) if tipo_lancamento_cp == "MENSAL_FIXO" else None
+                data_venc_base_salvar = data_vencimento_base_cp.isoformat() if (tipo_lancamento_cp == "MENSAL_FIXO" and data_vencimento_base_cp) else None
+
+                if tipo_lancamento_cp == "NAO_MENSAL":
+                    df_save = df_parcelas_edit.copy()
+                    df_save["Valor"] = pd.to_numeric(df_save["Valor"], errors="coerce").fillna(0.0)
+                    if "Paga" not in df_save.columns:
+                        df_save["Paga"] = False
+                    df_save["Paga"] = df_save["Paga"].fillna(False).astype(bool)
+                    if df_save["Vencimento"].isna().any():
+                        st.warning("Preencha a data de todas as parcelas.")
+                        df_save = None
+                    else:
+                        datas_parcelas = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_save["Vencimento"].tolist()]
+                        valores_parcelas = [float(v) for v in df_save["Valor"].tolist()]
+                        detalhes_parcelas = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_parcelas, valores_parcelas))])
+                        parcelas_pagas_salvar = _cp_serializar_parcelas_pagas(
+                            [idx + 1 for idx, paga in enumerate(df_save["Paga"].tolist()) if bool(paga)]
+                        )
+                        valor_medio_parcela = (sum(valores_parcelas) / len(valores_parcelas)) if valores_parcelas else 0.0
+                        qtd_parcelas_salvar = int(qtd_parc_cp)
+                else:
+                    df_save = pd.DataFrame([{"ok": 1}])
+
+                if df_save is not None:
+                    nf_salvar = n_nf_cp if n_nf_cp else "RECORRENTE"
+                    with conn() as c:
+                        c.execute(
+                            """INSERT INTO contas_pagar
+                               (fornecedor_id, n_nf, data_entrada, valor_total_nf, obrigacao_id, dados_nf, quantidade_parcelas, vencimentos_parcelas, valor_parcela, tipo_lancamento, dia_vencimento_mensal, data_vencimento_base, parcelas_pagas, dias_alerta)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                mapa_forn[sel_forn],
+                                nf_salvar,
+                                dt_ent_cp.isoformat(),
+                                float(valor_total_nf_cp),
+                                mapa_obr[sel_obr],
+                                dados_nf_cp,
+                                int(qtd_parcelas_salvar),
+                                detalhes_parcelas,
+                                float(valor_medio_parcela),
+                                tipo_lancamento_cp,
+                                dia_venc_salvar,
+                                data_venc_base_salvar,
+                                parcelas_pagas_salvar if tipo_lancamento_cp == "NAO_MENSAL" else None,
+                                int(dias_alerta_cp),
+                            ),
+                        )
+                    alerta_gravado()
+                    st.rerun()
+
+    with conn() as c:
+        df_cp = pd.read_sql(
+            """SELECT cp.id,
+                      f.codigo AS codigo_fornecedor,
+                      f.nome AS fornecedor,
+                      cp.n_nf,
+                      cp.data_entrada,
+                      cp.valor_total_nf,
+                      o.descricao_obrigacao,
+                      cp.dados_nf,
+                      cp.quantidade_parcelas,
+                      cp.vencimentos_parcelas,
+                      cp.valor_parcela,
+                      cp.tipo_lancamento,
+                      cp.dia_vencimento_mensal,
+                      cp.data_vencimento_base,
+                      cp.parcelas_pagas,
+                      cp.dias_alerta
+               FROM contas_pagar cp
+               LEFT JOIN fornecedores f ON f.id = cp.fornecedor_id
+               LEFT JOIN obrigacoes o ON o.id = cp.obrigacao_id
+               ORDER BY cp.data_entrada DESC, cp.id DESC""",
+            c,
+        )
+    if not df_cp.empty:
+        df_cp["tipo_lancamento"] = df_cp["tipo_lancamento"].fillna("NAO_MENSAL")
+        df_cp["dias_alerta"] = pd.to_numeric(df_cp["dias_alerta"], errors="coerce").fillna(7).astype(int)
+        df_cp["dia_vencimento_mensal"] = pd.to_numeric(df_cp["dia_vencimento_mensal"], errors="coerce").fillna(0).astype(int)
+        df_cp["data_vencimento_base"] = pd.to_datetime(df_cp["data_vencimento_base"], errors="coerce").dt.date
+
+        df_alertas_cp = _cp_montar_alertas(df_cp)
+        st.markdown("##### 🔔 Alertas de Vencimento")
+        if not df_alertas_cp.empty:
+            total_alertas_cp = len(df_alertas_cp)
+            vencem_hoje_cp = int((df_alertas_cp["Dias"] == 0).sum())
+            ate_7_cp = int((df_alertas_cp["Dias"] <= 7).sum())
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Alertas Ativos", total_alertas_cp)
+            a2.metric("Vencem Hoje", vencem_hoje_cp)
+            a3.metric("Vencem até 7 dias", ate_7_cp)
+            st.warning("Existem parcelas/lançamentos próximos do vencimento.")
+            st.dataframe(
+                df_alertas_cp,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
+                    "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f"),
+                    "Dias": st.column_config.NumberColumn("Dias", format="%d"),
+                },
+            )
+        else:
+            st.success("Sem vencimentos próximos dentro da antecedência configurada.")
+
+        st.markdown("##### Lançamentos de Contas a Pagar")
+        if "cp_editando_id" not in st.session_state:
+            st.session_state.cp_editando_id = None
+
+        df_cp_grid = df_cp.copy()
+        df_cp_grid["data_entrada"] = pd.to_datetime(df_cp_grid["data_entrada"], errors="coerce").dt.date
+        df_cp_grid["data_vencimento_base"] = pd.to_datetime(df_cp_grid["data_vencimento_base"], errors="coerce").dt.date
+        df_cp_grid["quantidade_parcelas"] = pd.to_numeric(df_cp_grid["quantidade_parcelas"], errors="coerce").fillna(1).astype(int)
+        df_cp_grid["proximo_vencimento"] = df_cp_grid.apply(_cp_proximo_vencimento_grade, axis=1)
+        df_cp_grid["Tipo"] = df_cp_grid["tipo_lancamento"].map(
+            {"MENSAL_FIXO": "Mensal fixa", "NAO_MENSAL": "Não mensal"}
+        ).fillna("Não mensal")
+        df_cp_grid["Alterar"] = False
+        df_cp_grid["Excluir"] = False
+        df_cp_grid = df_cp_grid[
+            [
+                "id",
+                "Alterar",
+                "Excluir",
+                "data_entrada",
+                "fornecedor",
+                "descricao_obrigacao",
+                "n_nf",
+                "Tipo",
+                "quantidade_parcelas",
+                "proximo_vencimento",
+                "valor_total_nf",
+                "dias_alerta",
+            ]
+        ]
+
+        with st.form("form_excluir_contas_pagar"):
+            df_cp_ed = st.data_editor(
+                df_cp_grid,
+                use_container_width=True,
+                hide_index=True,
+                key="editor_contas_pagar",
+                column_config={
+                    "id": None,
+                    "Alterar": st.column_config.CheckboxColumn("✏️ Alterar", default=False),
+                    "Excluir": st.column_config.CheckboxColumn("🗑️ Excluir", default=False),
+                    "data_entrada": st.column_config.DateColumn("Entrada", format="DD/MM/YYYY"),
+                    "fornecedor": st.column_config.TextColumn("Fornecedor"),
+                    "descricao_obrigacao": st.column_config.TextColumn("Obrigação"),
+                    "n_nf": st.column_config.TextColumn("NF"),
+                    "Tipo": st.column_config.TextColumn("Tipo"),
+                    "quantidade_parcelas": st.column_config.NumberColumn("Parcelas", format="%d"),
+                    "proximo_vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
+                    "valor_total_nf": st.column_config.NumberColumn("Valor Total", format="R$ %.2f"),
+                    "dias_alerta": st.column_config.NumberColumn("Alerta (dias)", format="%d"),
+                },
+            )
+
+            bcp1, bcp2 = st.columns(2)
+            btn_alterar_cp = bcp1.form_submit_button("✏️ Alterar Selecionado", use_container_width=True)
+            btn_excluir_cp = bcp2.form_submit_button("🔴 Excluir Selecionados", type="primary", use_container_width=True)
+
+        if btn_alterar_cp:
+            ids_alterar = df_cp_ed.loc[(df_cp_ed["Alterar"] == True) & (df_cp_ed["Excluir"] != True), "id"].tolist()
+            if len(ids_alterar) == 1:
+                st.session_state.cp_editando_id = int(ids_alterar[0])
+                st.rerun()
+            elif len(ids_alterar) == 0:
+                st.warning("Marque um registro na coluna Alterar.")
+            else:
+                st.warning("Selecione apenas um registro para alterar.")
+
+        if btn_excluir_cp:
+            ids_excluir = df_cp_ed.loc[df_cp_ed["Excluir"] == True, "id"].tolist()
+            if ids_excluir:
+                with conn() as c:
+                    c.executemany("DELETE FROM contas_pagar WHERE id=?", [(int(i),) for i in ids_excluir])
+                st.success(f"{len(ids_excluir)} conta(s) excluída(s) com sucesso.")
+                st.rerun()
+            else:
+                st.warning("Marque pelo menos um registro para excluir.")
+
+        if st.session_state.cp_editando_id is not None:
+            row_edit_cp = df_cp[df_cp["id"] == st.session_state.cp_editando_id]
+            if row_edit_cp.empty:
+                st.session_state.cp_editando_id = None
+            else:
+                reg_cp = row_edit_cp.iloc[0]
+
+                with conn() as c:
+                    fornecedores_edit_cp = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
+                    obrigacoes_edit_cp = c.execute("SELECT id, descricao_obrigacao FROM obrigacoes ORDER BY descricao_obrigacao ASC").fetchall()
+
+                mapa_forn_edit = {f"{f['codigo']} - {f['nome']}": int(f["id"]) for f in fornecedores_edit_cp}
+                mapa_obr_edit = {o["descricao_obrigacao"]: int(o["id"]) for o in obrigacoes_edit_cp}
+                opcoes_forn_edit = list(mapa_forn_edit.keys())
+                opcoes_obr_edit = list(mapa_obr_edit.keys())
+
+                fornecedor_label_atual = f"{reg_cp['codigo_fornecedor']} - {reg_cp['fornecedor']}"
+                idx_forn_edit = opcoes_forn_edit.index(fornecedor_label_atual) if fornecedor_label_atual in opcoes_forn_edit else 0
+                obr_atual = reg_cp["descricao_obrigacao"]
+                idx_obr_edit = opcoes_obr_edit.index(obr_atual) if obr_atual in opcoes_obr_edit else 0
+
+                data_entrada_edit = pd.to_datetime(reg_cp["data_entrada"], errors="coerce")
+                data_entrada_edit = data_entrada_edit.date() if pd.notna(data_entrada_edit) else date.today()
+                tipo_edit_atual = str(reg_cp.get("tipo_lancamento") or "NAO_MENSAL")
+                dias_alerta_edit_atual = int(reg_cp.get("dias_alerta") or 7)
+                dia_venc_mensal_atual = int(reg_cp.get("dia_vencimento_mensal") or 10)
+                data_venc_base_edit_atual = pd.to_datetime(reg_cp.get("data_vencimento_base"), errors="coerce")
+                data_venc_base_edit_atual = data_venc_base_edit_atual.date() if pd.notna(data_venc_base_edit_atual) else (data_entrada_edit + timedelta(days=30))
+
+                st.markdown("##### ✏️ Alterar Conta a Pagar")
+                with st.form("form_alterar_conta_pagar"):
+                    e1, e2, e3 = st.columns(3)
+                    forn_edit = e1.selectbox(
+                        "Código Fornecedor",
+                        options=opcoes_forn_edit,
+                        index=idx_forn_edit if opcoes_forn_edit else None,
+                        placeholder="Selecione um fornecedor",
+                    )
+                    nf_edit = e2.text_input("N.NF", value=str(reg_cp["n_nf"] or "")).strip()
+                    dt_entrada_edit = e3.date_input("Data Entrada", value=data_entrada_edit, format="DD/MM/YYYY")
+
+                    e4, e5, e6 = st.columns(3)
+                    valor_total_edit = e4.number_input(
+                        "Valor Total da NF",
+                        min_value=0.0,
+                        step=0.01,
+                        value=float(reg_cp["valor_total_nf"] or 0.0),
+                    )
+                    obr_edit = e5.selectbox(
+                        "Obrigação",
+                        options=opcoes_obr_edit,
+                        index=idx_obr_edit if opcoes_obr_edit else None,
+                        placeholder="Selecione uma obrigação",
+                    )
+                    tipo_edit_label = e6.selectbox(
+                        "Tipo de Lançamento",
+                        options=["Não mensal (único/parcelado)", "Mensal fixa (todo mês)"],
+                        index=1 if tipo_edit_atual == "MENSAL_FIXO" else 0,
+                    )
+                    tipo_edit = "MENSAL_FIXO" if "Mensal fixa" in tipo_edit_label else "NAO_MENSAL"
+
+                    ec1, ec2, ec3 = st.columns(3)
+                    dias_alerta_edit = int(
+                        ec1.number_input(
+                            "Avisar com antecedência (dias)",
+                            min_value=0,
+                            max_value=90,
+                            step=1,
+                            value=dias_alerta_edit_atual,
+                        )
+                    )
+                    dia_venc_mensal_edit = None
+                    data_venc_base_edit = None
+                    qtd_parcelas_edit = int(reg_cp["quantidade_parcelas"] or 1)
+                    if tipo_edit == "MENSAL_FIXO":
+                        data_venc_base_edit = ec2.date_input(
+                            "Data de Vencimento",
+                            value=data_venc_base_edit_atual,
+                            format="DD/MM/YYYY",
+                        )
+                        dia_venc_mensal_edit = int(data_venc_base_edit.day)
+                        ec3.info("A recorrência usará a data de vencimento como referência.")
+                    else:
+                        qtd_parcelas_edit = int(
+                            ec2.number_input(
+                                "Quantidade Parcelas",
+                                min_value=1,
+                                step=1,
+                                value=int(reg_cp["quantidade_parcelas"] or 1),
+                            )
+                        )
+                        ec3.info("Lançamento não mensal.")
+
+                    dados_nf_edit = st.text_input("Dados da NF", value=str(reg_cp["dados_nf"] or "")).strip()
+                    vencimentos_edit = ""
+                    parcelas_pagas_edit = ""
+                    valor_parcela_edit = float(reg_cp["valor_parcela"] or 0.0)
+                    df_parcelas_edit_atual = pd.DataFrame()
+                    if tipo_edit == "NAO_MENSAL":
+                        st.markdown("###### Parcelas (edição automática)")
+                        id_edit_cp = int(st.session_state.cp_editando_id)
+                        key_df = f"cp_edit_parcelas_df_{id_edit_cp}"
+                        key_qtd = f"cp_edit_qtd_prev_{id_edit_cp}"
+                        key_total = f"cp_edit_total_prev_{id_edit_cp}"
+
+                        if key_df not in st.session_state:
+                            parcelas_existentes = _cp_extrair_parcelas(reg_cp.get("vencimentos_parcelas"))
+                            parcelas_pagas_existentes = _cp_parse_parcelas_pagas(reg_cp.get("parcelas_pagas"))
+                            valores_ini = _cp_distribuir_valor(float(valor_total_edit), int(qtd_parcelas_edit))
+                            linhas_ini = []
+                            for i in range(int(qtd_parcelas_edit)):
+                                data_default = dt_entrada_edit + timedelta(days=30 * (i + 1))
+                                data_parcela = parcelas_existentes[i]["data"] if i < len(parcelas_existentes) else data_default
+                                linhas_ini.append(
+                                    {
+                                        "Parcela": i + 1,
+                                        "Vencimento": data_parcela,
+                                        "Valor": valores_ini[i],
+                                        "Paga": (i + 1) in parcelas_pagas_existentes,
+                                    }
+                                )
+                            st.session_state[key_df] = pd.DataFrame(linhas_ini)
+                            st.session_state[key_qtd] = int(qtd_parcelas_edit)
+                            st.session_state[key_total] = float(valor_total_edit)
+
+                        qtd_prev = int(st.session_state.get(key_qtd, int(qtd_parcelas_edit)))
+                        total_prev = float(st.session_state.get(key_total, float(valor_total_edit)))
+                        df_prev = st.session_state[key_df].copy()
+                        if "Paga" not in df_prev.columns:
+                            df_prev["Paga"] = False
+                            st.session_state[key_df] = df_prev
+                        qtd_atual = int(qtd_parcelas_edit)
+                        total_atual = float(valor_total_edit)
+                        mudou_qtd = qtd_atual != qtd_prev
+                        mudou_total = abs(total_atual - total_prev) > 0.000001
+
+                        if mudou_qtd:
+                            novas_datas = []
+                            for i in range(qtd_atual):
+                                if i < len(df_prev):
+                                    novas_datas.append(df_prev.iloc[i]["Vencimento"])
+                                else:
+                                    novas_datas.append(dt_entrada_edit + timedelta(days=30 * (i + 1)))
+                            novos_valores = _cp_distribuir_valor(total_atual, qtd_atual)
+                            st.session_state[key_df] = pd.DataFrame(
+                                [
+                                    {
+                                        "Parcela": i + 1,
+                                        "Vencimento": novas_datas[i],
+                                        "Valor": novos_valores[i],
+                                        "Paga": bool(df_prev.iloc[i]["Paga"]) if (i < len(df_prev) and "Paga" in df_prev.columns) else False,
+                                    }
+                                    for i in range(qtd_atual)
+                                ]
+                            )
+                        elif mudou_total:
+                            df_recalc = df_prev.copy()
+                            novos_valores = _cp_distribuir_valor(total_atual, len(df_recalc))
+                            df_recalc["Valor"] = novos_valores
+                            st.session_state[key_df] = df_recalc
+
+                        st.session_state[key_qtd] = qtd_atual
+                        st.session_state[key_total] = total_atual
+
+                        if qtd_atual == 1:
+                            st.session_state.pop(f"cp_editor_parcelas_edit_{id_edit_cp}", None)
+                            linha_unica = st.session_state[key_df].iloc[0] if not st.session_state[key_df].empty else {"Vencimento": dt_entrada_edit + timedelta(days=30), "Valor": float(valor_total_edit)}
+                            venc_unico_default = pd.to_datetime(linha_unica.get("Vencimento"), errors="coerce")
+                            venc_unico_default = venc_unico_default.date() if pd.notna(venc_unico_default) else (dt_entrada_edit + timedelta(days=30))
+                            valor_unico_default = float(pd.to_numeric(linha_unica.get("Valor"), errors="coerce") if linha_unica.get("Valor") is not None else float(valor_total_edit))
+                            u1, u2 = st.columns(2)
+                            venc_unico_edit = u1.date_input(
+                                "Data Parcela",
+                                value=venc_unico_default,
+                                format="DD/MM/YYYY",
+                                key=f"cp_venc_unico_edit_{id_edit_cp}",
+                            )
+                            paga_unico_default = bool(linha_unica.get("Paga")) if linha_unica is not None else False
+                            valor_unico_edit = u2.number_input(
+                                "Valor Parcela (R$)",
+                                min_value=0.0,
+                                step=0.01,
+                                value=valor_unico_default,
+                                key=f"cp_valor_unico_edit_{id_edit_cp}",
+                            )
+                            paga_unico_edit = st.checkbox("Parcela paga", value=paga_unico_default, key=f"cp_paga_unico_edit_{id_edit_cp}")
+                            df_parcelas_edit = pd.DataFrame(
+                                [{"Parcela": 1, "Vencimento": venc_unico_edit, "Valor": float(valor_unico_edit), "Paga": bool(paga_unico_edit)}]
+                            )
+                        else:
+                            c_ed_p1, c_ed_p2 = st.columns([1, 1])
+                            if c_ed_p1.form_submit_button("🔄 Recalcular Parcelas Iguais", use_container_width=True):
+                                df_tmp = st.session_state[key_df].copy()
+                                novos_valores = _cp_distribuir_valor(float(valor_total_edit), len(df_tmp))
+                                df_tmp["Valor"] = novos_valores
+                                st.session_state[key_df] = df_tmp
+                                st.rerun()
+                            c_ed_p2.caption("As parcelas são recalculadas automaticamente ao mudar o valor total.")
+
+                            df_parcelas_edit = st.data_editor(
+                                st.session_state[key_df],
+                                hide_index=True,
+                                use_container_width=True,
+                                num_rows="fixed",
+                                disabled=["Parcela"],
+                                key=f"cp_editor_parcelas_edit_{id_edit_cp}",
+                                column_config={
+                                    "Parcela": st.column_config.NumberColumn("Parcela", format="%d"),
+                                    "Vencimento": st.column_config.DateColumn("Data Parcela", format="DD/MM/YYYY"),
+                                    "Valor": st.column_config.NumberColumn("Valor Parcela (R$)", format="R$ %.2f", min_value=0.0, step=0.01),
+                                    "Paga": st.column_config.CheckboxColumn("Paga", default=False),
+                                },
+                            )
+                        df_parcelas_edit_atual = df_parcelas_edit.copy()
+                        st.session_state[key_df] = df_parcelas_edit
+
+                        soma_edit = float(pd.to_numeric(df_parcelas_edit["Valor"], errors="coerce").fillna(0.0).sum()) if not df_parcelas_edit.empty else 0.0
+                        diff_edit = float(valor_total_edit) - soma_edit
+                        se1, se2, se3 = st.columns(3)
+                        se1.metric("Total NF", brl(valor_total_edit))
+                        se2.metric("Soma Parcelas", brl(soma_edit))
+                        se3.metric("Diferença", brl(diff_edit))
+
+                        if not df_parcelas_edit.empty and not df_parcelas_edit["Vencimento"].isna().any():
+                            datas_edit = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_parcelas_edit["Vencimento"].tolist()]
+                            valores_edit = [float(v) for v in pd.to_numeric(df_parcelas_edit["Valor"], errors="coerce").fillna(0.0).tolist()]
+                            vencimentos_edit = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_edit, valores_edit))])
+                            valor_parcela_edit = (sum(valores_edit) / len(valores_edit)) if valores_edit else 0.0
+                        else:
+                            vencimentos_edit = ""
+                            valor_parcela_edit = 0.0
+                    else:
+                        valor_parcela_edit = st.number_input(
+                            "Valor Parcela (médio)",
+                            min_value=0.0,
+                            step=0.01,
+                            value=float(reg_cp["valor_parcela"] or 0.0),
+                        )
+
+                    ac1, ac2 = st.columns(2)
+                    salvar_edit_cp = ac1.form_submit_button("💾 Gravar Alterações", type="primary", use_container_width=True)
+                    cancelar_edit_cp = ac2.form_submit_button("❌ Cancelar", use_container_width=True)
+
+                    if cancelar_edit_cp:
+                        id_clear = int(st.session_state.cp_editando_id)
+                        st.session_state.pop(f"cp_edit_parcelas_df_{id_clear}", None)
+                        st.session_state.pop(f"cp_edit_qtd_prev_{id_clear}", None)
+                        st.session_state.pop(f"cp_edit_total_prev_{id_clear}", None)
+                        st.session_state.pop(f"cp_editor_parcelas_edit_{id_clear}", None)
+                        st.session_state.cp_editando_id = None
+                        st.rerun()
+
+                    if salvar_edit_cp:
+                        if not nf_edit:
+                            st.warning("Informe o número da NF.")
+                        elif not opcoes_forn_edit:
+                            st.warning("Cadastre fornecedores para continuar.")
+                        elif not opcoes_obr_edit:
+                            st.warning("Cadastre obrigações para continuar.")
+                        elif tipo_edit == "NAO_MENSAL" and not vencimentos_edit:
+                            st.warning("Preencha as parcelas antes de gravar.")
+                        else:
+                            if tipo_edit == "NAO_MENSAL":
+                                id_edit_cp = int(st.session_state.cp_editando_id)
+                                key_df = f"cp_edit_parcelas_df_{id_edit_cp}"
+                                key_editor = f"cp_editor_parcelas_edit_{id_edit_cp}"
+                                if isinstance(df_parcelas_edit_atual, pd.DataFrame) and not df_parcelas_edit_atual.empty:
+                                    df_parcelas_salvar = df_parcelas_edit_atual.copy()
+                                else:
+                                    df_base_salvar = st.session_state.get(key_df, pd.DataFrame())
+                                    if not isinstance(df_base_salvar, pd.DataFrame):
+                                        df_base_salvar = pd.DataFrame(df_base_salvar)
+                                    df_parcelas_salvar = df_base_salvar.copy()
+
+                                estado_editor = st.session_state.get(key_editor)
+                                if int(qtd_parcelas_edit) == 1:
+                                    estado_editor = None
+                                if isinstance(estado_editor, pd.DataFrame):
+                                    df_parcelas_salvar = estado_editor.copy()
+                                elif isinstance(estado_editor, list):
+                                    df_parcelas_salvar = pd.DataFrame(estado_editor)
+                                elif isinstance(estado_editor, dict):
+                                    edited_rows = estado_editor.get("edited_rows", {}) or {}
+                                    for idx_row, mudancas in edited_rows.items():
+                                        try:
+                                            pos = int(idx_row)
+                                        except Exception:
+                                            continue
+                                        if 0 <= pos < len(df_parcelas_salvar) and isinstance(mudancas, dict):
+                                            idx_real = df_parcelas_salvar.index[pos]
+                                            for col_name, val in mudancas.items():
+                                                if col_name in df_parcelas_salvar.columns:
+                                                    df_parcelas_salvar.at[idx_real, col_name] = val
+
+                                    added_rows = estado_editor.get("added_rows", []) or []
+                                    if added_rows:
+                                        df_parcelas_salvar = pd.concat(
+                                            [df_parcelas_salvar, pd.DataFrame(added_rows)],
+                                            ignore_index=True,
+                                        )
+
+                                    deleted_rows = estado_editor.get("deleted_rows", []) or []
+                                    if deleted_rows:
+                                        posicoes_drop = []
+                                        for idx_del in deleted_rows:
+                                            try:
+                                                pos_del = int(idx_del)
+                                            except Exception:
+                                                continue
+                                            if 0 <= pos_del < len(df_parcelas_salvar):
+                                                posicoes_drop.append(pos_del)
+                                        if posicoes_drop:
+                                            labels_drop = [df_parcelas_salvar.index[p] for p in sorted(set(posicoes_drop), reverse=True)]
+                                            df_parcelas_salvar = df_parcelas_salvar.drop(index=labels_drop).reset_index(drop=True)
+
+                                if df_parcelas_salvar.empty:
+                                    st.warning("Preencha as parcelas antes de gravar.")
+                                    st.stop()
+                                df_parcelas_salvar["Valor"] = pd.to_numeric(df_parcelas_salvar["Valor"], errors="coerce").fillna(0.0)
+                                if "Paga" not in df_parcelas_salvar.columns:
+                                    df_parcelas_salvar["Paga"] = False
+                                df_parcelas_salvar["Paga"] = df_parcelas_salvar["Paga"].fillna(False).astype(bool)
+                                df_parcelas_salvar["Vencimento"] = pd.to_datetime(df_parcelas_salvar["Vencimento"], errors="coerce").dt.date
+                                if df_parcelas_salvar["Vencimento"].isna().any():
+                                    st.warning("Preencha a data de vencimento de todas as parcelas.")
+                                    st.stop()
+                                datas_edit = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_parcelas_salvar["Vencimento"].tolist()]
+                                valores_edit = [float(v) for v in df_parcelas_salvar["Valor"].tolist()]
+                                vencimentos_edit = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_edit, valores_edit))])
+                                parcelas_pagas_edit = _cp_serializar_parcelas_pagas(
+                                    [idx + 1 for idx, paga in enumerate(df_parcelas_salvar["Paga"].tolist()) if bool(paga)]
+                                )
+                                valor_parcela_edit = (sum(valores_edit) / len(valores_edit)) if valores_edit else 0.0
+
+                            with conn() as c:
+                                c.execute(
+                                    """UPDATE contas_pagar
+                                       SET fornecedor_id=?,
+                                           n_nf=?,
+                                           data_entrada=?,
+                                           valor_total_nf=?,
+                                           obrigacao_id=?,
+                                           dados_nf=?,
+                                           quantidade_parcelas=?,
+                                           vencimentos_parcelas=?,
+                                           valor_parcela=?,
+                                           tipo_lancamento=?,
+                                           dia_vencimento_mensal=?,
+                                           data_vencimento_base=?,
+                                           parcelas_pagas=?,
+                                           dias_alerta=?
+                                       WHERE id=?""",
+                                    (
+                                        mapa_forn_edit[forn_edit],
+                                        nf_edit,
+                                        dt_entrada_edit.isoformat(),
+                                        float(valor_total_edit),
+                                        mapa_obr_edit[obr_edit],
+                                        dados_nf_edit,
+                                        int(qtd_parcelas_edit),
+                                        vencimentos_edit,
+                                        float(valor_parcela_edit),
+                                        tipo_edit,
+                                        int(dia_venc_mensal_edit) if tipo_edit == "MENSAL_FIXO" else None,
+                                        data_venc_base_edit.isoformat() if (tipo_edit == "MENSAL_FIXO" and data_venc_base_edit) else None,
+                                        parcelas_pagas_edit if tipo_edit == "NAO_MENSAL" else None,
+                                        int(dias_alerta_edit),
+                                        int(st.session_state.cp_editando_id),
+                                    ),
+                                )
+                            id_clear = int(st.session_state.cp_editando_id)
+                            st.session_state.pop(f"cp_edit_parcelas_df_{id_clear}", None)
+                            st.session_state.pop(f"cp_edit_qtd_prev_{id_clear}", None)
+                            st.session_state.pop(f"cp_edit_total_prev_{id_clear}", None)
+                            st.session_state.pop(f"cp_editor_parcelas_edit_{id_clear}", None)
+                            st.session_state.cp_editando_id = None
+                            st.session_state["cp_flash_msg"] = "✅ Gravado com sucesso!"
+                            st.rerun()
+    else:
+        st.info("Nenhuma conta a pagar cadastrada.")
+
+# =========================
+# ABA 18 - ME LEMBRA
+# =========================
+with aba18:
+    st.subheader("🔔 ME LEMBRA")
+    st.caption("Cadastro de lembretes com aviso quando faltar 30 dias para o vencimento.")
+    st.info("Fluxo sugerido: 1) Cadastre Frota, 2) Cadastre Descrição, 3) Cadastre o Lembrete, 4) Acompanhe e edite na lista abaixo.")
+
+    st.markdown("### 1) Cadastro de Frota")
+    with st.form("form_ml_frota", clear_on_submit=True):
+        nova_frota_ml = st.text_input("Nova Frota", key="ml_nova_frota").strip()
+        if st.form_submit_button("💾 Gravar", key="btn_ml_frota_cadastro_gravar"):
+            if not nova_frota_ml:
+                st.warning("Informe a frota para salvar.")
+            else:
+                try:
+                    with conn() as c:
+                        c.execute(
+                            "INSERT INTO me_lembra_frotas (frota) VALUES (?)",
+                            (nova_frota_ml,),
+                        )
+                    alerta_gravado()
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.warning("Essa frota já está cadastrada.")
+
+    with conn() as c:
+        frotas_ml_db = c.execute(
+            "SELECT id, frota FROM me_lembra_frotas ORDER BY frota ASC"
+        ).fetchall()
+    lista_frotas_ml = [r["frota"] for r in frotas_ml_db]
+    mapa_frotas_ml = {f"{r['id']} - {r['frota']}": int(r["id"]) for r in frotas_ml_db}
+
+    c_fa1, c_fa2 = st.columns([2, 1])
+    if mapa_frotas_ml:
+        frota_sel_alt = c_fa1.selectbox(
+            "Frota cadastrada",
+            options=list(mapa_frotas_ml.keys()),
+            index=None,
+            placeholder="Selecione uma frota para alterar",
+            key="ml_frota_sel_alt",
+        )
+    else:
+        c_fa1.info("Nenhuma frota cadastrada ainda.")
+        frota_sel_alt = None
+    if "ml_frota_edit_id" not in st.session_state:
+        st.session_state.ml_frota_edit_id = None
+
+    if c_fa2.button("✏️ ALTERAR FROTA", key="ml_btn_alterar_frota", use_container_width=True):
+        if frota_sel_alt:
+            st.session_state.ml_frota_edit_id = mapa_frotas_ml[frota_sel_alt]
+        else:
+            st.warning("Selecione uma frota para alterar.")
+
+    if st.session_state.ml_frota_edit_id is not None:
+        row_frota_edit = next((r for r in frotas_ml_db if int(r["id"]) == int(st.session_state.ml_frota_edit_id)), None)
+        valor_atual_frota = row_frota_edit["frota"] if row_frota_edit else ""
+
+        with st.form("form_ml_gravar_frota"):
+            nova_frota_edit = st.text_input("Frota (Editar)", value=valor_atual_frota).strip()
+            bf1, bf2 = st.columns(2)
+            gravar_frota = bf1.form_submit_button("💾 Gravar", use_container_width=True, key="btn_ml_frota_edicao_gravar")
+            cancelar_frota = bf2.form_submit_button("❌ CANCELAR", use_container_width=True)
+
+            if cancelar_frota:
+                st.session_state.ml_frota_edit_id = None
+                st.rerun()
+
+            if gravar_frota:
+                if not nova_frota_edit:
+                    st.warning("Informe a frota para gravar.")
+                else:
+                    try:
+                        with conn() as c:
+                            old_frota = c.execute(
+                                "SELECT frota FROM me_lembra_frotas WHERE id=?",
+                                (int(st.session_state.ml_frota_edit_id),),
+                            ).fetchone()
+                            old_frota_txt = old_frota["frota"] if old_frota else ""
+
+                            c.execute(
+                                "UPDATE me_lembra_frotas SET frota=? WHERE id=?",
+                                (nova_frota_edit, int(st.session_state.ml_frota_edit_id)),
+                            )
+                            if old_frota_txt:
+                                c.execute(
+                                    "UPDATE me_lembra_descricoes SET frota=? WHERE frota=?",
+                                    (nova_frota_edit, old_frota_txt),
+                                )
+                                c.execute(
+                                    "UPDATE me_lembra SET frota=? WHERE frota=?",
+                                    (nova_frota_edit, old_frota_txt),
+                                )
+                        st.session_state.ml_frota_edit_id = None
+                        alerta_gravado()
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.warning("Já existe uma frota com esse nome.")
+
+    st.divider()
+    st.markdown("### 2) Cadastro de Descrição")
+    if not lista_frotas_ml:
+        st.warning("Cadastre pelo menos uma frota antes de cadastrar a descrição.")
+    else:
+        with st.form("form_ml_descricao", clear_on_submit=True):
+            d1, d2 = st.columns(2)
+            nova_descricao_ml = d1.text_input("Nova Descrição", key="ml_nova_descricao").strip()
+            nova_frota_desc_ml = d2.selectbox(
+                "Frota",
+                options=lista_frotas_ml,
+                index=None,
+                placeholder="Selecione uma frota cadastrada",
+                key="ml_nova_frota_desc_sel",
+            )
+            if st.form_submit_button("💾 Gravar", key="btn_ml_descricao_cadastro_gravar"):
+                if not nova_descricao_ml:
+                    st.warning("Informe a descrição para salvar.")
+                elif not nova_frota_desc_ml:
+                    st.warning("Informe a frota para salvar.")
+                else:
+                    try:
+                        with conn() as c:
+                            c.execute(
+                                "INSERT INTO me_lembra_descricoes (descricao, frota) VALUES (?, ?)",
+                                (nova_descricao_ml, nova_frota_desc_ml),
+                            )
+                        alerta_gravado()
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.warning("Essa descrição já está cadastrada.")
+
+    with conn() as c:
+        descricoes_ml_db = c.execute(
+            "SELECT id, descricao, frota FROM me_lembra_descricoes ORDER BY descricao ASC"
+        ).fetchall()
+    lista_descricoes_ml = [r["descricao"] for r in descricoes_ml_db]
+    mapa_frota_por_descricao_ml = {r["descricao"]: ((r["frota"] or "").strip()) for r in descricoes_ml_db}
+    mapa_descricoes_ml = {
+        f"{r['id']} - {r['descricao']} | Frota: {r['frota'] or '-'}": int(r["id"])
+        for r in descricoes_ml_db
+    }
+
+    c_alt1, c_alt2 = st.columns([2, 1])
+    descricao_sel_alt = c_alt1.selectbox(
+        "Descrição cadastrada",
+        options=list(mapa_descricoes_ml.keys()),
+        index=None,
+        placeholder="Selecione uma descrição para alterar",
+        key="ml_desc_sel_alt",
+    )
+    if "ml_desc_edit_id" not in st.session_state:
+        st.session_state.ml_desc_edit_id = None
+
+    if c_alt2.button("✏️ ALTERAR", key="ml_btn_alterar_desc", use_container_width=True):
+        if descricao_sel_alt:
+            st.session_state.ml_desc_edit_id = mapa_descricoes_ml[descricao_sel_alt]
+        else:
+            st.warning("Selecione uma descrição para alterar.")
+
+    if st.session_state.ml_desc_edit_id is not None:
+        row_desc_edit = next((r for r in descricoes_ml_db if int(r["id"]) == int(st.session_state.ml_desc_edit_id)), None)
+        valor_atual_desc = row_desc_edit["descricao"] if row_desc_edit else ""
+        valor_atual_frota_desc = (row_desc_edit["frota"] if row_desc_edit else "") or ""
+
+        with st.form("form_ml_gravar_descricao"):
+            de1, de2 = st.columns(2)
+            nova_desc_edit = de1.text_input("Descrição (Editar)", value=valor_atual_desc).strip()
+            opcoes_frota_desc = list(lista_frotas_ml)
+            if valor_atual_frota_desc and valor_atual_frota_desc not in opcoes_frota_desc:
+                opcoes_frota_desc.append(valor_atual_frota_desc)
+            idx_frota_desc = opcoes_frota_desc.index(valor_atual_frota_desc) if valor_atual_frota_desc in opcoes_frota_desc else None
+            nova_frota_desc_edit = de2.selectbox(
+                "Frota (Editar)",
+                options=opcoes_frota_desc,
+                index=idx_frota_desc,
+                placeholder="Selecione uma frota cadastrada",
+            )
+            b_desc1, b_desc2 = st.columns(2)
+            gravar_desc = b_desc1.form_submit_button("💾 Gravar", use_container_width=True, key="btn_ml_descricao_edicao_gravar")
+            cancelar_desc = b_desc2.form_submit_button("❌ CANCELAR", use_container_width=True)
+
+            if cancelar_desc:
+                st.session_state.ml_desc_edit_id = None
+                st.rerun()
+
+            if gravar_desc:
+                if not nova_desc_edit:
+                    st.warning("Informe a descrição para gravar.")
+                elif not nova_frota_desc_edit:
+                    st.warning("Informe a frota para gravar.")
+                else:
+                    try:
+                        with conn() as c:
+                            old_desc = c.execute(
+                                "SELECT descricao, frota FROM me_lembra_descricoes WHERE id=?",
+                                (int(st.session_state.ml_desc_edit_id),),
+                            ).fetchone()
+                            old_desc_txt = old_desc["descricao"] if old_desc else ""
+                            old_frota_txt = (old_desc["frota"] if old_desc else "") or ""
+
+                            c.execute(
+                                "UPDATE me_lembra_descricoes SET descricao=?, frota=? WHERE id=?",
+                                (nova_desc_edit, nova_frota_desc_edit, int(st.session_state.ml_desc_edit_id)),
+                            )
+                            if old_desc_txt:
+                                c.execute(
+                                    "UPDATE me_lembra SET descricao=?, frota=? WHERE descricao=? AND COALESCE(frota,'')=COALESCE(?, '')",
+                                    (nova_desc_edit, nova_frota_desc_edit, old_desc_txt, old_frota_txt),
+                                )
+                        st.session_state.ml_desc_edit_id = None
+                        alerta_gravado()
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.warning("Já existe uma descrição com esse nome.")
+
+    st.divider()
+    st.markdown("### 3) Cadastro do Lembrete")
+    if not lista_frotas_ml:
+        st.warning("Cadastre pelo menos uma frota antes de lançar lembretes.")
+    elif not lista_descricoes_ml:
+        st.warning("Cadastre pelo menos uma descrição antes de lançar lembretes.")
+    else:
+        with st.form("form_me_lembra", clear_on_submit=True):
+            c1, c2, c3, c4 = st.columns(4)
+            data_ativacao_ml = c1.date_input("Data Ativação", value=date.today(), format="DD/MM/YYYY", key="ml_data_ativacao")
+            data_vencimento_ml = c2.date_input("Data Vencimento", format="DD/MM/YYYY", key="ml_data_vencimento")
+            descricao_veiculo_ml = c3.selectbox(
+                "Descrição Veículo",
+                options=lista_veiculos_full,
+                index=None,
+                placeholder="Selecione no cadastro de veículos",
+                key="ml_descricao_veiculo",
+            )
+            descricao_ml = st.selectbox(
+                "Descrição",
+                options=lista_descricoes_ml,
+                index=None,
+                placeholder="Selecione uma descrição cadastrada",
+                key="ml_descricao_sel",
+            )
+            idx_frota_sel = None
+            if descricao_ml:
+                frota_sugerida = mapa_frota_por_descricao_ml.get(descricao_ml, "")
+                if frota_sugerida in lista_frotas_ml:
+                    idx_frota_sel = lista_frotas_ml.index(frota_sugerida)
+            frota_ml = c4.selectbox(
+                "Frota",
+                options=lista_frotas_ml,
+                index=idx_frota_sel,
+                placeholder="Selecione uma frota cadastrada",
+                key="ml_frota_sel",
+            )
+
+            if st.form_submit_button("💾 Gravar", type="primary", key="btn_ml_lembrete_cadastro_gravar"):
+                if not descricao_ml:
+                    st.warning("Cadastre e selecione uma descrição para continuar.")
+                elif not descricao_veiculo_ml:
+                    st.warning("Selecione a Descrição Veículo para continuar.")
+                elif not frota_ml:
+                    st.warning("Selecione a frota para continuar.")
+                elif data_vencimento_ml < data_ativacao_ml:
+                    st.warning("A Data de Vencimento não pode ser menor que a Data de Ativação.")
+                else:
+                    with conn() as c:
+                        c.execute(
+                            """INSERT INTO me_lembra
+                               (data_ativacao, data_vencimento, descricao, descricao_veiculo, frota)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (data_ativacao_ml.isoformat(), data_vencimento_ml.isoformat(), descricao_ml, descricao_veiculo_ml, frota_ml),
+                        )
+                    alerta_gravado()
+                    st.rerun()
+
+    def preparar_df_me_lembra(df_base: pd.DataFrame) -> pd.DataFrame:
+        df_preparado = df_base.copy()
+        hoje_ref = pd.Timestamp(date.today())
+
+        venc_ts = pd.to_datetime(df_preparado["data_vencimento"], errors="coerce").dt.normalize()
+        ativ_ts = pd.to_datetime(df_preparado["data_ativacao"], errors="coerce").dt.normalize()
+
+        df_preparado["data_ativacao"] = ativ_ts.dt.date
+        df_preparado["data_vencimento"] = venc_ts.dt.date
+        df_preparado["dias_para_vencer"] = (venc_ts - hoje_ref).dt.days
+
+        def _status_por_dias(dias):
+            if pd.isna(dias):
+                return "Sem vencimento"
+            dias_int = int(dias)
+            if dias_int < 0:
+                return "Vencido"
+            if dias_int == 30:
+                return "Faltam 30 dias"
+            if 0 <= dias_int < 30:
+                return "Dentro dos próximos 30 dias"
+            return "No prazo"
+
+        df_preparado["status"] = df_preparado["dias_para_vencer"].apply(_status_por_dias)
+        return df_preparado
+
+    with conn() as c:
+        df_ml = pd.read_sql(
+            """SELECT id, data_ativacao, data_vencimento, descricao, descricao_veiculo, frota
+               FROM me_lembra
+               ORDER BY date(data_vencimento) ASC, id DESC""",
+            c,
+        )
+
+    if not df_ml.empty:
+        df_ml = preparar_df_me_lembra(df_ml)
+
+        avisos_30 = df_ml[df_ml["dias_para_vencer"] == 30]
+        proximos_30 = df_ml[(df_ml["dias_para_vencer"] >= 0) & (df_ml["dias_para_vencer"] <= 30)]
+        vencidos = df_ml[df_ml["dias_para_vencer"] < 0]
+
+        if not avisos_30.empty:
+            descricoes = ", ".join(avisos_30["descricao"].astype(str).tolist())
+            st.warning(f"Alerta de 30 dias: {descricoes}")
+        if not proximos_30.empty:
+            st.info(f"Lembretes a vencer em até 30 dias: {len(proximos_30)}")
+        if not vencidos.empty:
+            st.error(f"Lembretes vencidos: {len(vencidos)}")
+
+        st.divider()
+        st.markdown("### 4) Acompanhamento dos Lembretes")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total", len(df_ml))
+        m2.metric("Vencidos", len(vencidos))
+        m3.metric("Vencem até 30 dias", len(proximos_30))
+
+        f1, f2 = st.columns([2, 1])
+        busca_ml = f1.text_input("Buscar (Descrição / Veículo / Frota)", key="ml_busca_texto").strip().lower()
+        opcoes_status_ml = sorted(df_ml["status"].dropna().astype(str).unique().tolist())
+        filtro_status_ml = f2.multiselect("Filtrar status", options=opcoes_status_ml, key="ml_filtro_status")
+
+        df_ml_exibir = df_ml.copy()
+        if busca_ml:
+            df_ml_exibir = df_ml_exibir[
+                df_ml_exibir["descricao"].astype(str).str.lower().str.contains(busca_ml, na=False)
+                | df_ml_exibir["descricao_veiculo"].astype(str).str.lower().str.contains(busca_ml, na=False)
+                | df_ml_exibir["frota"].astype(str).str.lower().str.contains(busca_ml, na=False)
+            ]
+        if filtro_status_ml:
+            df_ml_exibir = df_ml_exibir[df_ml_exibir["status"].isin(filtro_status_ml)]
+
+        st.dataframe(
+            df_ml_exibir[["id", "data_ativacao", "data_vencimento", "frota", "descricao_veiculo", "descricao", "dias_para_vencer", "status"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", format="%d"),
+                "data_ativacao": st.column_config.DateColumn("Data Ativação", format="DD/MM/YYYY"),
+                "data_vencimento": st.column_config.DateColumn("Data Vencimento", format="DD/MM/YYYY"),
+                "frota": st.column_config.TextColumn("Frota"),
+                "descricao_veiculo": st.column_config.TextColumn("Descrição Veículo"),
+                "descricao": st.column_config.TextColumn("Descrição"),
+                "dias_para_vencer": st.column_config.NumberColumn("Dias para vencer", format="%d"),
+                "status": st.column_config.TextColumn("Status"),
+            },
+        )
+
+        st.markdown("##### 4.1) Alterar Lembrete")
+        mapa_ml_edicao = {
+            (
+                f"ID: {int(r['id'])} | Descrição: {r['descricao']} | "
+                f"Veículo: {r['descricao_veiculo'] if pd.notna(r['descricao_veiculo']) and r['descricao_veiculo'] else '-'} | "
+                f"Frota: {r['frota'] if pd.notna(r['frota']) and r['frota'] else '-'} | "
+                f"Venc.: {r['data_vencimento'].strftime('%d/%m/%Y') if pd.notna(r['data_vencimento']) else '-'}"
+            ): int(r["id"])
+            for _, r in df_ml.sort_values(by="id", ascending=False).iterrows()
+        }
+        lembrete_sel_label = st.selectbox(
+            "Selecione o lembrete para alteração/exclusão (com ID)",
+            options=list(mapa_ml_edicao.keys()),
+            index=None,
+            placeholder="Escolha um registro",
+            key="ml_sel_alteracao",
+        )
+
+        if "ml_em_edicao_id" not in st.session_state:
+            st.session_state.ml_em_edicao_id = None
+        if "ml_excluir_id" not in st.session_state:
+            st.session_state.ml_excluir_id = None
+
+        if lembrete_sel_label:
+            id_sel = mapa_ml_edicao[lembrete_sel_label]
+            a1, a2 = st.columns(2)
+            if a1.button("✏️ EDITAR", key="btn_ml_alterar", use_container_width=True):
+                st.session_state.ml_em_edicao_id = id_sel
+                st.session_state.ml_excluir_id = None
+            if a2.button("🗑️ EXCLUIR", key="btn_ml_excluir", type="primary", use_container_width=True):
+                st.session_state.ml_excluir_id = id_sel
+
+        if st.session_state.ml_excluir_id is not None:
+            st.warning(f"Confirma a exclusão do lembrete ID {int(st.session_state.ml_excluir_id)}?")
+            e1, e2 = st.columns(2)
+            if e1.button("✅ Confirmar exclusão", key="btn_ml_confirmar_exclusao", type="primary", use_container_width=True):
+                with conn() as c:
+                    c.execute("DELETE FROM me_lembra WHERE id=?", (int(st.session_state.ml_excluir_id),))
+                st.session_state.ml_excluir_id = None
+                st.session_state.ml_em_edicao_id = None
+                st.success("Lembrete excluído com sucesso.")
+                st.rerun()
+            if e2.button("❌ Cancelar exclusão", key="btn_ml_cancelar_exclusao", use_container_width=True):
+                st.session_state.ml_excluir_id = None
+                st.rerun()
+
+        if st.session_state.ml_em_edicao_id is not None:
+            id_edit = st.session_state.ml_em_edicao_id
+            row_edit = df_ml[df_ml["id"] == id_edit]
+
+            if row_edit.empty:
+                st.session_state.ml_em_edicao_id = None
+            else:
+                reg = row_edit.iloc[0]
+                valor_data_ativ = reg["data_ativacao"] if pd.notna(reg["data_ativacao"]) else date.today()
+                valor_data_venc = reg["data_vencimento"] if pd.notna(reg["data_vencimento"]) else date.today()
+                valor_frota = reg["frota"] if pd.notna(reg["frota"]) else ""
+
+                opcoes_desc = list(lista_descricoes_ml)
+                if reg["descricao"] and reg["descricao"] not in opcoes_desc:
+                    opcoes_desc.append(reg["descricao"])
+                idx_desc = opcoes_desc.index(reg["descricao"]) if reg["descricao"] in opcoes_desc else 0
+
+                opcoes_veic = list(lista_veiculos_full)
+                valor_veic = reg["descricao_veiculo"] if pd.notna(reg["descricao_veiculo"]) else None
+                if valor_veic and valor_veic not in opcoes_veic:
+                    opcoes_veic.append(valor_veic)
+                idx_veic = opcoes_veic.index(valor_veic) if valor_veic in opcoes_veic else None
+
+                with st.form("form_ml_gravar"):
+                    e1, e2, e3, e4 = st.columns(4)
+                    nova_data_ativ = e1.date_input(
+                        "Data Ativação (Editar)",
+                        value=valor_data_ativ,
+                        format="DD/MM/YYYY",
+                        key=f"ml_edit_data_ativ_{int(id_edit)}",
+                    )
+                    nova_data_venc = e2.date_input(
+                        "Data Vencimento (Editar)",
+                        value=valor_data_venc,
+                        format="DD/MM/YYYY",
+                        key=f"ml_edit_data_venc_{int(id_edit)}",
+                    )
+                    novo_veiculo = e3.selectbox(
+                        "Descrição Veículo (Editar)",
+                        options=opcoes_veic,
+                        index=idx_veic,
+                        key=f"ml_edit_veiculo_{int(id_edit)}",
+                    )
+                    opcoes_frota_edit = list(lista_frotas_ml)
+                    if valor_frota and valor_frota not in opcoes_frota_edit:
+                        opcoes_frota_edit.append(valor_frota)
+                    idx_frota_edit = opcoes_frota_edit.index(valor_frota) if valor_frota in opcoes_frota_edit else None
+                    nova_frota = e4.selectbox(
+                        "Frota (Editar)",
+                        options=opcoes_frota_edit,
+                        index=idx_frota_edit,
+                        placeholder="Selecione uma frota",
+                        key=f"ml_edit_frota_{int(id_edit)}",
+                    )
+                    nova_descricao = st.selectbox(
+                        "Descrição (Editar)",
+                        options=opcoes_desc,
+                        index=idx_desc,
+                        key=f"ml_edit_desc_{int(id_edit)}",
+                    )
+
+                    b1, b2 = st.columns(2)
+                    gravar_ml = b1.form_submit_button("💾 Gravar", use_container_width=True, key=f"btn_ml_lembrete_edicao_gravar_{int(id_edit)}")
+                    cancelar_ml = b2.form_submit_button("❌ CANCELAR", use_container_width=True)
+
+                    if cancelar_ml:
+                        st.session_state.ml_em_edicao_id = None
+                        st.rerun()
+
+                    if gravar_ml:
+                        if nova_data_venc < nova_data_ativ:
+                            st.warning("A Data de Vencimento não pode ser menor que a Data de Ativação.")
+                        elif not nova_frota:
+                            st.warning("Informe a Frota para gravar.")
+                        else:
+                            with conn() as c:
+                                c.execute(
+                                    """UPDATE me_lembra
+                                       SET data_ativacao=?, data_vencimento=?, descricao=?, descricao_veiculo=?, frota=?
+                                       WHERE id=?""",
+                                    (
+                                        nova_data_ativ.isoformat(),
+                                        nova_data_venc.isoformat(),
+                                        nova_descricao,
+                                        novo_veiculo,
+                                        nova_frota,
+                                        int(id_edit),
+                                    ),
+                                )
+                            st.session_state.ml_em_edicao_id = None
+                            alerta_gravado()
+                            st.rerun()
+    else:
+        st.info("Nenhum lembrete cadastrado.")
