@@ -24,6 +24,35 @@ def format_br(valor, prefixo="", casas_decimais=2):
 
 def brl(valor): return format_br(valor, "R$ ")
 
+def calcular_qtd_estadia(data_chegada, hora_chegada, data_descarregamento, hora_descarregamento, franquia_horas=5):
+    try:
+        dt_chegada = pd.to_datetime(data_chegada, errors="coerce")
+        dt_desc = pd.to_datetime(data_descarregamento, errors="coerce")
+        if pd.isna(dt_chegada) or pd.isna(dt_desc):
+            return 0
+
+        txt_hora_chegada = str(hora_chegada or "").strip()
+        txt_hora_desc = str(hora_descarregamento or "").strip()
+        hora_chegada_ok = datetime.strptime(txt_hora_chegada, "%H:%M").time() if txt_hora_chegada else datetime.strptime("00:00", "%H:%M").time()
+        hora_desc_ok = datetime.strptime(txt_hora_desc, "%H:%M").time() if txt_hora_desc else datetime.strptime("00:00", "%H:%M").time()
+
+        dt_chegada_full = datetime.combine(dt_chegada.date(), hora_chegada_ok)
+        dt_desc_full = datetime.combine(dt_desc.date(), hora_desc_ok)
+        if dt_desc_full <= dt_chegada_full:
+            return 0
+
+        horas_total = (dt_desc_full - dt_chegada_full).total_seconds() / 3600.0
+        horas_excedentes = horas_total - float(franquia_horas)
+        if horas_excedentes <= 0:
+            return 0
+
+        qtd = int(horas_excedentes // 24.0)
+        if (horas_excedentes % 24.0) > 0:
+            qtd += 1
+        return max(0, qtd)
+    except Exception:
+        return 0
+
 def format_pct(valor, casas_decimais=2):
     try:
         s = f"{float(valor):.{casas_decimais}f}".replace(".", ",")
@@ -38,6 +67,9 @@ def normalizar_tipo_combustivel(valor):
         return ""
     return " ".join(txt.split())
 
+def alerta_gravado(mensagem="✅ Gravado com sucesso!"):
+    st.success(mensagem)
+
 def conn():
     c = sqlite3.connect(DB, check_same_thread=False)
     c.row_factory = sqlite3.Row
@@ -46,6 +78,27 @@ def conn():
     c.execute("PRAGMA temp_store=MEMORY")
     c.execute("PRAGMA cache_size=-64000")
     return c
+
+def salvar_anexos_pedido_fornecedor(arquivos):
+    if not arquivos:
+        return []
+    pasta_destino = Path("uploads") / "pedidos_fornecedor"
+    pasta_destino.mkdir(parents=True, exist_ok=True)
+    anexos_salvos = []
+    for arq in arquivos:
+        nome_original = Path(str(getattr(arq, "name", "") or "anexo")).name
+        timestamp = datetime.now().strftime("%d%m%y%H%M%S%f")
+        nome_final = f"{Path(nome_original).stem}-{timestamp}{Path(nome_original).suffix}"
+        caminho_final = pasta_destino / nome_final
+        with caminho_final.open("wb") as f_out:
+            f_out.write(arq.getbuffer())
+        anexos_salvos.append(
+            {
+                "nome_arquivo": nome_original,
+                "caminho_arquivo": str(caminho_final),
+            }
+        )
+    return anexos_salvos
 
 
 def cache_data_compat(ttl=90, show_spinner=False):
@@ -105,6 +158,12 @@ def _carregar_viagens_periodo_raw(data_ini_iso: str, data_fim_iso: str):
             params=(data_ini_iso, data_fim_iso),
         )
 
+def limpar_cache_viagens():
+    try:
+        _carregar_viagens_periodo_raw.clear()
+    except Exception:
+        pass
+
 
 @cache_data_compat(ttl=120, show_spinner=False)
 def _carregar_rotas_ref_exec_raw():
@@ -145,8 +204,8 @@ def init_db():
             imposto_pct REAL DEFAULT 0.0)""")
         
         c.execute("INSERT OR IGNORE INTO parametros (id) VALUES (1)")
-        c.execute("CREATE TABLE IF NOT EXISTS veiculos (id INTEGER PRIMARY KEY AUTOINCREMENT, descricao TEXT, modelo TEXT, ano TEXT, cor TEXT, placa TEXT UNIQUE, renavan TEXT, observacao TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS viagens (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, cliente TEXT, origem TEXT, destino TEXT, km REAL, toneladas REAL, valor_ton REAL, valor_km REAL DEFAULT 0.0, tipo_cobranca TEXT DEFAULT 'TONELADA', pedagio REAL, gasto_extra REAL DEFAULT 0.0, pagto_estadia REAL DEFAULT 0.0, descricao_gasto_extra TEXT, diesel REAL, consumo REAL, arla REAL DEFAULT 0.0, consumo_arla REAL DEFAULT 0.0, obs TEXT, nf TEXT, veiculo_placa TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS veiculos (id INTEGER PRIMARY KEY AUTOINCREMENT, descricao TEXT, modelo TEXT, ano TEXT, cor TEXT, placa TEXT UNIQUE, renavan TEXT, observacao TEXT, quantidade_eixo INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS viagens (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, cliente TEXT, origem TEXT, destino TEXT, km REAL, toneladas REAL, valor_ton REAL, valor_km REAL DEFAULT 0.0, tipo_cobranca TEXT DEFAULT 'TONELADA', pedagio REAL, qtd_pedagio INTEGER DEFAULT 0, gasto_extra REAL DEFAULT 0.0, pagto_estadia REAL DEFAULT 0.0, valor_adicional_frete REAL DEFAULT 0.0, descricao_valor_adicional_frete TEXT, descricao_gasto_extra TEXT, diesel REAL, consumo REAL, arla REAL DEFAULT 0.0, consumo_arla REAL DEFAULT 0.0, hora_carregamento TEXT, data_chegada TEXT, hora_chegada TEXT, data_descarregamento TEXT, hora_descarregamento TEXT, obs TEXT, nf TEXT, veiculo_placa TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS cidades (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT UNIQUE)")
         c.execute("CREATE TABLE IF NOT EXISTS rotas (id INTEGER PRIMARY KEY AUTOINCREMENT, origem TEXT, destino TEXT, nome_empresa_origem TEXT, nome_empresa_destino TEXT, km REAL, valor_ton REAL DEFAULT 0.0, UNIQUE(origem, destino))")
         c.execute("CREATE TABLE IF NOT EXISTS abastecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, local TEXT, doc_nf TEXT, km_inicial REAL, tipo_combustivel TEXT, qtde_litros REAL, valor_unit REAL, total_gasto REAL)")
@@ -176,7 +235,8 @@ def init_db():
             cidade TEXT,
             bairro TEXT,
             cep TEXT,
-            telefone TEXT
+            telefone TEXT,
+            pix TEXT
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS obrigacoes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,6 +256,7 @@ def init_db():
             tipo_lancamento TEXT DEFAULT 'NAO_MENSAL',
             dia_vencimento_mensal INTEGER,
             data_vencimento_base TEXT,
+            competencia_paga_mensal TEXT,
             parcelas_pagas TEXT,
             dias_alerta INTEGER DEFAULT 7
         )""")
@@ -255,6 +316,17 @@ def init_db():
             oficina_id INTEGER, defeito TEXT, servico TEXT, 
             valor_mo REAL, valor_pecas REAL, garantia TEXT, 
             km_servico REAL, mecanico TEXT, obs TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS praca_pedagio (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rota TEXT,
+            praca_pedagio TEXT,
+            rodovia TEXT,
+            concessionaria TEXT,
+            sentido_viagem TEXT,
+            quantidade_eixos REAL DEFAULT 1.0,
+            valor_por_eixo REAL DEFAULT 0.0,
+            valor_todos_eixos REAL DEFAULT 0.0
+        )""")
 # --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS MANUTENÇÃO ---
         cursor = c.execute("PRAGMA table_info(manutencoes)")
         colunas_existentes = [coluna[1] for coluna in cursor.fetchall()]
@@ -293,6 +365,66 @@ def init_db():
         colunas_veic = [coluna[1] for coluna in cursor_veic.fetchall()]
         if "observacao" not in colunas_veic:
             c.execute("ALTER TABLE veiculos ADD COLUMN observacao TEXT")
+        if "quantidade_eixo" not in colunas_veic:
+            c.execute("ALTER TABLE veiculos ADD COLUMN quantidade_eixo INTEGER DEFAULT 0")
+
+        cursor_pp = c.execute("PRAGMA table_info(praca_pedagio)")
+        colunas_pp = [coluna[1] for coluna in cursor_pp.fetchall()]
+        if "sentido_viagem" not in colunas_pp:
+            c.execute("ALTER TABLE praca_pedagio ADD COLUMN sentido_viagem TEXT")
+            colunas_pp.append("sentido_viagem")
+        if "quantidade_eixos" not in colunas_pp:
+            c.execute("ALTER TABLE praca_pedagio ADD COLUMN quantidade_eixos REAL DEFAULT 1.0")
+            colunas_pp.append("quantidade_eixos")
+        if "valor_todos_eixos" not in colunas_pp:
+            c.execute("ALTER TABLE praca_pedagio ADD COLUMN valor_todos_eixos REAL DEFAULT 0.0")
+            colunas_pp.append("valor_todos_eixos")
+        if "ida" in colunas_pp or "volta" in colunas_pp:
+            expr_sentido = "''"
+            if "sentido_viagem" in colunas_pp and "ida" in colunas_pp and "volta" in colunas_pp:
+                expr_sentido = "COALESCE(NULLIF(TRIM(sentido_viagem), ''), NULLIF(TRIM(ida), ''), NULLIF(TRIM(volta), ''), '')"
+            elif "sentido_viagem" in colunas_pp and "ida" in colunas_pp:
+                expr_sentido = "COALESCE(NULLIF(TRIM(sentido_viagem), ''), NULLIF(TRIM(ida), ''), '')"
+            elif "sentido_viagem" in colunas_pp and "volta" in colunas_pp:
+                expr_sentido = "COALESCE(NULLIF(TRIM(sentido_viagem), ''), NULLIF(TRIM(volta), ''), '')"
+            elif "sentido_viagem" in colunas_pp:
+                expr_sentido = "COALESCE(NULLIF(TRIM(sentido_viagem), ''), '')"
+            elif "ida" in colunas_pp and "volta" in colunas_pp:
+                expr_sentido = "COALESCE(NULLIF(TRIM(ida), ''), NULLIF(TRIM(volta), ''), '')"
+            elif "ida" in colunas_pp:
+                expr_sentido = "COALESCE(NULLIF(TRIM(ida), ''), '')"
+            elif "volta" in colunas_pp:
+                expr_sentido = "COALESCE(NULLIF(TRIM(volta), ''), '')"
+
+            c.execute("DROP TABLE IF EXISTS praca_pedagio_nova")
+            c.execute("""CREATE TABLE praca_pedagio_nova (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rota TEXT,
+                praca_pedagio TEXT,
+                rodovia TEXT,
+                concessionaria TEXT,
+                sentido_viagem TEXT,
+                quantidade_eixos REAL DEFAULT 1.0,
+                valor_por_eixo REAL DEFAULT 0.0,
+                valor_todos_eixos REAL DEFAULT 0.0
+            )""")
+            c.execute(f"""
+                INSERT INTO praca_pedagio_nova (id, rota, praca_pedagio, rodovia, concessionaria, sentido_viagem, quantidade_eixos, valor_por_eixo, valor_todos_eixos)
+                SELECT id, rota, praca_pedagio, rodovia, concessionaria, {expr_sentido},
+                       COALESCE(quantidade_eixos, 1.0),
+                       COALESCE(valor_por_eixo, 0.0),
+                       COALESCE(valor_todos_eixos, COALESCE(valor_por_eixo, 0.0) * COALESCE(quantidade_eixos, 1.0))
+                FROM praca_pedagio
+            """)
+            c.execute("DROP TABLE praca_pedagio")
+            c.execute("ALTER TABLE praca_pedagio_nova RENAME TO praca_pedagio")
+            colunas_pp = ["id", "rota", "praca_pedagio", "rodovia", "concessionaria", "sentido_viagem", "quantidade_eixos", "valor_por_eixo", "valor_todos_eixos"]
+
+        c.execute(
+            """UPDATE praca_pedagio
+               SET valor_todos_eixos = COALESCE(valor_por_eixo, 0.0) * COALESCE(quantidade_eixos, 1.0)
+               WHERE valor_todos_eixos IS NULL OR ABS(valor_todos_eixos - (COALESCE(valor_por_eixo, 0.0) * COALESCE(quantidade_eixos, 1.0))) > 0.000001"""
+        )
 
         # --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS DE VIAGENS ---
         cursor_viagens = c.execute("PRAGMA table_info(viagens)")
@@ -301,11 +433,19 @@ def init_db():
             "qtd_viagens": "INTEGER DEFAULT 1",
             "valor_km": "REAL DEFAULT 0.0",
             "tipo_cobranca": "TEXT DEFAULT 'TONELADA'",
+            "qtd_pedagio": "INTEGER DEFAULT 0",
             "gasto_extra": "REAL DEFAULT 0.0",
             "pagto_estadia": "REAL DEFAULT 0.0",
+            "valor_adicional_frete": "REAL DEFAULT 0.0",
+            "descricao_valor_adicional_frete": "TEXT",
             "descricao_gasto_extra": "TEXT",
             "arla": "REAL DEFAULT 0.0",
             "consumo_arla": "REAL DEFAULT 0.0",
+            "hora_carregamento": "TEXT",
+            "data_chegada": "TEXT",
+            "hora_chegada": "TEXT",
+            "data_descarregamento": "TEXT",
+            "hora_descarregamento": "TEXT",
         }
         for col, tipo in novas_colunas_viagens.items():
             if col not in colunas_viagens:
@@ -346,10 +486,17 @@ def init_db():
             c.execute("ALTER TABLE contas_pagar ADD COLUMN dia_vencimento_mensal INTEGER")
         if "data_vencimento_base" not in colunas_cp:
             c.execute("ALTER TABLE contas_pagar ADD COLUMN data_vencimento_base TEXT")
+        if "competencia_paga_mensal" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN competencia_paga_mensal TEXT")
         if "parcelas_pagas" not in colunas_cp:
             c.execute("ALTER TABLE contas_pagar ADD COLUMN parcelas_pagas TEXT")
         if "dias_alerta" not in colunas_cp:
             c.execute("ALTER TABLE contas_pagar ADD COLUMN dias_alerta INTEGER DEFAULT 7")
+
+        cursor_forn = c.execute("PRAGMA table_info(fornecedores)")
+        colunas_forn = [coluna[1] for coluna in cursor_forn.fetchall()]
+        if "pix" not in colunas_forn:
+            c.execute("ALTER TABLE fornecedores ADD COLUMN pix TEXT")
 
         cursor_trocas = c.execute("PRAGMA table_info(controle_trocas)")
         colunas_trocas = [coluna[1] for coluna in cursor_trocas.fetchall()]
@@ -924,6 +1071,10 @@ if not st.session_state.popup_cp_exibido:
                 return pagas
             for token in str(parcelas_pagas_texto).replace(",", ";").split(";"):
                 t = token.strip()
+                if not t:
+                    continue
+                if "@" in t:
+                    t = t.split("@", 1)[0].strip()
                 if t.isdigit():
                     pagas.add(int(t))
             return pagas
@@ -952,6 +1103,12 @@ if not st.session_state.popup_cp_exibido:
                 venc_atual = date(ano, mes, min(dia_ref, dias_mes))
             return venc_atual
 
+        def _cp_competencia_ref(data_ref):
+            dt = pd.to_datetime(data_ref, errors="coerce")
+            if pd.isna(dt):
+                return ""
+            return dt.strftime("%Y-%m")
+
         with conn() as c:
             df_cp_popup = pd.read_sql(
                 """SELECT cp.id,
@@ -964,6 +1121,7 @@ if not st.session_state.popup_cp_exibido:
                           cp.tipo_lancamento,
                           cp.dia_vencimento_mensal,
                           cp.data_vencimento_base,
+                          cp.competencia_paga_mensal,
                           cp.parcelas_pagas,
                           cp.dias_alerta
                    FROM contas_pagar cp
@@ -988,6 +1146,10 @@ if not st.session_state.popup_cp_exibido:
                         r.get("dia_vencimento_mensal"),
                         r.get("data_vencimento_base"),
                     )
+                    comp_prox = _cp_competencia_ref(prox)
+                    comp_paga = str(r.get("competencia_paga_mensal") or "").strip()
+                    if comp_paga == comp_prox:
+                        continue
                     dias = (prox - hoje_cp).days
                     if -30 <= dias <= dias_alerta:
                         alertas_cp.append(
@@ -1055,10 +1217,11 @@ if not st.session_state.popup_cp_exibido:
                     )
                     st.markdown("**Contas a pagar em alerta:**")
                     st.dataframe(
-                        df_alerta_cp[["Fornecedor", "Obrigação", "NF", "Parcela", "Vencimento", "Valor", "Situação"]],
+                        df_alerta_cp[["Situação", "Fornecedor", "Obrigação", "NF", "Parcela", "Vencimento", "Valor"]],
                         use_container_width=True,
                         hide_index=True,
                         column_config={
+                            "Situação": st.column_config.TextColumn("Situação"),
                             "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
                             "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f"),
                         },
@@ -1104,6 +1267,10 @@ if not df_db.empty:
         df_db["gasto_extra"] = 0.0
     if "pagto_estadia" not in df_db.columns:
         df_db["pagto_estadia"] = 0.0
+    if "valor_adicional_frete" not in df_db.columns:
+        df_db["valor_adicional_frete"] = 0.0
+    if "descricao_valor_adicional_frete" not in df_db.columns:
+        df_db["descricao_valor_adicional_frete"] = ""
     if "descricao_gasto_extra" not in df_db.columns:
         df_db["descricao_gasto_extra"] = ""
     df_db["km"] = pd.to_numeric(df_db["km"], errors="coerce").fillna(0.0)
@@ -1112,6 +1279,8 @@ if not df_db.empty:
     df_db["valor_km"] = pd.to_numeric(df_db["valor_km"], errors="coerce").fillna(0.0)
     df_db["gasto_extra"] = pd.to_numeric(df_db["gasto_extra"], errors="coerce").fillna(0.0)
     df_db["pagto_estadia"] = pd.to_numeric(df_db["pagto_estadia"], errors="coerce").fillna(0.0)
+    df_db["valor_adicional_frete"] = pd.to_numeric(df_db["valor_adicional_frete"], errors="coerce").fillna(0.0)
+    df_db["descricao_valor_adicional_frete"] = df_db["descricao_valor_adicional_frete"].fillna("").astype(str)
     df_db["descricao_gasto_extra"] = df_db["descricao_gasto_extra"].fillna("").astype(str)
     df_db["tipo_cobranca"] = df_db["tipo_cobranca"].astype(str).str.upper().str.strip()
     frete_km_db = df_db["km"] * df_db["valor_km"]
@@ -1129,9 +1298,9 @@ aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14,
 ])
 
 with aba_cadastro:
-    aba5, aba6, aba7, aba10, aba12, aba15, aba16, aba19 = st.tabs([
+    aba5, aba6, aba7, aba10, aba12, aba15, aba16, aba19, aba21 = st.tabs([
         "🏢 Oficinas", "🏙️ Cidades", "🛣️ KM Rotas", "⚙️ Parâmetros",
-        "🚚 Veículos", "🏭 Fornecedores", "📌 Obrigação", "⛽ Comparativo Diesel"
+        "🚚 Veículos", "🏭 Fornecedores", "📌 Obrigação", "⛽ Comparativo Diesel", "🛣️ Praça Pedágio"
     ])
 
 with aba_home:
@@ -1268,6 +1437,10 @@ with aba_home:
             df_dash["gasto_extra"] = 0.0
         if "pagto_estadia" not in df_dash.columns:
             df_dash["pagto_estadia"] = 0.0
+        if "valor_adicional_frete" not in df_dash.columns:
+            df_dash["valor_adicional_frete"] = 0.0
+        if "descricao_valor_adicional_frete" not in df_dash.columns:
+            df_dash["descricao_valor_adicional_frete"] = ""
         if "diesel" not in df_dash.columns:
             df_dash["diesel"] = 0.0
         if "consumo" not in df_dash.columns:
@@ -1287,6 +1460,8 @@ with aba_home:
         df_dash["pedagio"] = pd.to_numeric(df_dash["pedagio"], errors="coerce").fillna(0.0)
         df_dash["gasto_extra"] = pd.to_numeric(df_dash["gasto_extra"], errors="coerce").fillna(0.0)
         df_dash["pagto_estadia"] = pd.to_numeric(df_dash["pagto_estadia"], errors="coerce").fillna(0.0)
+        df_dash["valor_adicional_frete"] = pd.to_numeric(df_dash["valor_adicional_frete"], errors="coerce").fillna(0.0)
+        df_dash["descricao_valor_adicional_frete"] = df_dash["descricao_valor_adicional_frete"].fillna("").astype(str)
         df_dash["diesel"] = pd.to_numeric(df_dash["diesel"], errors="coerce").fillna(0.0)
         df_dash["consumo"] = pd.to_numeric(df_dash["consumo"], errors="coerce").fillna(0.0)
         df_dash["arla"] = pd.to_numeric(df_dash["arla"], errors="coerce").fillna(0.0)
@@ -1296,7 +1471,12 @@ with aba_home:
             lambda r: (r["km"] * r["valor_km"]) if r["tipo_cobranca"] == "KM" else (r["toneladas"] * r["valor_ton"]),
             axis=1,
         )
-        df_dash["receita_total"] = ((df_dash["frete_base"] + df_dash["pagto_estadia"]) * df_dash["qtd_viagens"]).fillna(0.0)
+        df_dash["receita_comissionavel_unit"] = (
+            df_dash["frete_base"] + df_dash["pagto_estadia"]
+        )
+        df_dash["receita_total"] = (
+            (df_dash["receita_comissionavel_unit"] + df_dash["valor_adicional_frete"]) * df_dash["qtd_viagens"]
+        ).fillna(0.0)
         df_dash["km_total"] = (df_dash["km"] * df_dash["qtd_viagens"]).fillna(0.0)
         df_dash["litros_diesel"] = (df_dash["km_total"] / df_dash["consumo"].where(df_dash["consumo"] > 0)).fillna(0.0)
         df_dash["custo_diesel"] = (df_dash["litros_diesel"] * df_dash["diesel"]).fillna(0.0)
@@ -1452,7 +1632,10 @@ with aba_home:
             df_tend["custo_pneu"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_pneu"], errors="coerce").fillna(0.0)
             df_tend["custo_manut"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_manut"], errors="coerce").fillna(0.0)
             df_tend["custo_depre"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_depre"], errors="coerce").fillna(0.0)
-            df_tend["custo_comissao"] = df_tend["receita_total"] * (pd.to_numeric(df_tend["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)
+            df_tend["custo_comissao"] = (
+                (df_tend["receita_comissionavel_unit"] * df_tend["qtd_viagens"])
+                * (pd.to_numeric(df_tend["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)
+            )
             df_tend["custo_imposto"] = df_tend["receita_total"] * (pd.to_numeric(df_tend["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)
 
             df_tend_g = (
@@ -1637,7 +1820,7 @@ with aba_home:
                 tipo_grafico_perf = st.selectbox(
                     "Tipo de gráfico",
                     ["Combinado", "Barras", "Linhas", "Área"],
-                    index=0,
+                    index=1,
                     key="dash_tipo_grafico_perf",
                 )
 
@@ -1866,8 +2049,23 @@ with aba1:
                 if rota: km_sug, vt_sug, vk_sug, trecho_existe = rota['km'], rota['valor_ton'], rota['valor_km'], True
             if not trecho_existe:
                 st.warning("Rota Não cadastrada")
-        ca, cb, cc = st.columns(3); d_v, cl_v, nf_v = ca.date_input("Data", format="DD/MM/YYYY"), cb.text_input("Cliente", value="CONTATTO"), cc.text_input("N.NF")
-        c0, c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(9)
+        ca, cb, cc, cd = st.columns(4)
+        d_v = ca.date_input("Data carregamento", format="DD/MM/YYYY")
+        hora_carregamento_v = cb.text_input("Hora carregamento", placeholder="HH:MM")
+        cl_v = cc.text_input("Cliente", value="CONTATTO")
+        nf_v = cd.text_input("N.NF")
+        ct2, ct3, ct4, ct5 = st.columns(4)
+        data_chegada_v = ct2.date_input("Data Chegada Descarregamento", format="DD/MM/YYYY")
+        hora_chegada_v = ct3.text_input("Hora Chegada Descarregamento", placeholder="HH:MM")
+        data_descarregamento_tmp_v = ct4.date_input("Data descarregamento", format="DD/MM/YYYY", key="cad_data_descarregamento")
+        deixar_data_descarregamento_em_branco_v = ct4.checkbox("Salvar data descarregamento em branco", value=True, key="cad_data_descarregamento_em_branco")
+        if deixar_data_descarregamento_em_branco_v:
+            data_descarregamento_v = None
+            ct4.caption("Você pode preencher depois na edição.")
+        else:
+            data_descarregamento_v = data_descarregamento_tmp_v
+        hora_descarregamento_v = ct5.text_input("Hora descarregamento", placeholder="HH:MM")
+        c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns(11)
         tipo_cobranca_v = c0.selectbox("Tipo Cálculo", ["TONELADA", "KM"], key="cad_tipo_calc")
         modo_ton = (tipo_cobranca_v == "TONELADA")
         km_v = c1.number_input("KM", value=km_sug, disabled=True)
@@ -1910,9 +2108,23 @@ with aba1:
         vt_v = c3.number_input("Val Ton", value=vt_sug, disabled=True)
         vk_v = c4.number_input("Val KM", value=vk_sug, step=0.01, disabled=modo_ton)
         pd_v = c5.number_input("Pedágio", value=0.0)
-        c6.markdown("&nbsp;", unsafe_allow_html=True)
-        gx_v = c7.number_input("Gasto Extra", min_value=0.0, value=0.0, step=0.01)
-        est_v = c8.number_input("Pagto Estadia", min_value=0.0, value=0.0, step=0.01)
+        qtd_pedagio_volta_padrao = 0
+        if o_v and d_dest:
+            rota_pp_ref = f"{str(o_v).strip()} → {str(d_dest).strip()}"
+            with conn() as c:
+                qtd_row_pp = c.execute(
+                    """SELECT COUNT(*) AS qtd
+                       FROM praca_pedagio
+                       WHERE TRIM(COALESCE(rota, '')) = ?
+                         AND UPPER(TRIM(COALESCE(sentido_viagem, ''))) = 'VOLTA'""",
+                    (rota_pp_ref,),
+                ).fetchone()
+            qtd_pedagio_volta_padrao = int(qtd_row_pp["qtd"] if qtd_row_pp else 0)
+        qtd_pedagio_v = c6.number_input("Qtde Pedágio", min_value=0, value=int(qtd_pedagio_volta_padrao), step=1)
+        vaf_v = c7.number_input("Vl Adic Frete", min_value=0.0, value=0.0, step=0.01)
+        desc_vaf_v = c8.text_input("Desc Vl Adic Frete")
+        gx_v = c9.number_input("Gasto Extra", min_value=0.0, value=0.0, step=0.01)
+        est_v = c10.number_input("Pagto Estadia", min_value=0.0, value=0.0, step=0.01)
         desc_gx_v = st.text_input("Descrição Gasto Extra")
         cf1, cf2, cf3, cf4 = st.columns(4)
         di_v = cf1.number_input("VL/L/Diesel", value=v_diesel_sug)
@@ -1923,7 +2135,7 @@ with aba1:
         kg_digitos = "".join(ch for ch in str(kg_txt or "") if ch.isdigit())
         kg_v = float(kg_digitos) if kg_digitos else 0.0
         tn_v_calc = (kg_v / 1000.0) if modo_ton else 0.0
-        total_frete_prev = (km_v * vk_v) if not modo_ton else (tn_v_calc * vt_v)
+        total_frete_prev = ((km_v * vk_v) if not modo_ton else (tn_v_calc * vt_v)) + vaf_v + est_v
         st.info(f"Total Frete Previsto ({tipo_cobranca_v}): {brl(total_frete_prev)}")
         if modo_ton:
             st.caption("Tipo TONELADA: informe apenas o KG. O Valor/Ton é lido da rota cadastrada.")
@@ -1937,8 +2149,8 @@ with aba1:
                 with conn() as c:
                     c.execute(
                         """INSERT INTO viagens
-                           (data, cliente, origem, destino, km, toneladas, valor_ton, valor_km, tipo_cobranca, pedagio, gasto_extra, pagto_estadia, descricao_gasto_extra, diesel, consumo, arla, consumo_arla, nf, veiculo_placa, qtd_viagens)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           (data, cliente, origem, destino, km, toneladas, valor_ton, valor_km, tipo_cobranca, pedagio, qtd_pedagio, gasto_extra, pagto_estadia, valor_adicional_frete, descricao_valor_adicional_frete, descricao_gasto_extra, diesel, consumo, arla, consumo_arla, hora_carregamento, data_chegada, hora_chegada, data_descarregamento, hora_descarregamento, nf, veiculo_placa, qtd_viagens)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             d_v.isoformat(),
                             cl_v,
@@ -1950,18 +2162,27 @@ with aba1:
                             vk_v if not modo_ton else 0.0,
                             tipo_cobranca_v,
                             pd_v,
+                            int(qtd_pedagio_v or 0),
                             gx_v,
                             est_v,
+                            vaf_v,
+                            desc_vaf_v.strip(),
                             desc_gx_v.strip(),
                             di_v,
                             cons_v,
                             arla_v,
                             cons_arla_v,
+                            str(hora_carregamento_v or "").strip(),
+                            data_chegada_v.isoformat() if data_chegada_v else None,
+                            str(hora_chegada_v or "").strip(),
+                            data_descarregamento_v.isoformat() if data_descarregamento_v else None,
+                            str(hora_descarregamento_v or "").strip(),
                             nf_v,
                             placa,
                             1,
                         ),
                     )
+                limpar_cache_viagens()
                 st.session_state.msg_frete = "✅ Gravado com sucesso!"
                 st.rerun()
             else:
@@ -2032,8 +2253,24 @@ with aba2:
             df_exibir["gasto_extra"] = 0.0
         if "pagto_estadia" not in df_exibir.columns:
             df_exibir["pagto_estadia"] = 0.0
+        if "valor_adicional_frete" not in df_exibir.columns:
+            df_exibir["valor_adicional_frete"] = 0.0
+        if "descricao_valor_adicional_frete" not in df_exibir.columns:
+            df_exibir["descricao_valor_adicional_frete"] = ""
+        if "qtd_pedagio" not in df_exibir.columns:
+            df_exibir["qtd_pedagio"] = 0
         if "descricao_gasto_extra" not in df_exibir.columns:
             df_exibir["descricao_gasto_extra"] = ""
+        if "hora_carregamento" not in df_exibir.columns:
+            df_exibir["hora_carregamento"] = ""
+        if "data_chegada" not in df_exibir.columns:
+            df_exibir["data_chegada"] = ""
+        if "hora_chegada" not in df_exibir.columns:
+            df_exibir["hora_chegada"] = ""
+        if "data_descarregamento" not in df_exibir.columns:
+            df_exibir["data_descarregamento"] = ""
+        if "hora_descarregamento" not in df_exibir.columns:
+            df_exibir["hora_descarregamento"] = ""
 
         df_exibir["diesel"] = pd.to_numeric(df_exibir["diesel"], errors="coerce").fillna(0.0)
         df_exibir["consumo"] = pd.to_numeric(df_exibir["consumo"], errors="coerce").fillna(0.0)
@@ -2044,10 +2281,13 @@ with aba2:
         df_exibir["km"] = pd.to_numeric(df_exibir["km"], errors="coerce").fillna(0.0)
         df_exibir["valor_km"] = pd.to_numeric(df_exibir["valor_km"], errors="coerce").fillna(0.0)
         df_exibir["pedagio"] = pd.to_numeric(df_exibir["pedagio"], errors="coerce").fillna(0.0)
+        df_exibir["qtd_pedagio"] = pd.to_numeric(df_exibir["qtd_pedagio"], errors="coerce").fillna(0).astype(int)
         df_exibir["qtd_viagens"] = pd.to_numeric(df_exibir["qtd_viagens"], errors="coerce").fillna(1.0)
         df_exibir["qtd_viagens"] = df_exibir["qtd_viagens"].apply(lambda x: max(1, int(round(float(x)))))
         df_exibir["gasto_extra"] = pd.to_numeric(df_exibir["gasto_extra"], errors="coerce").fillna(0.0)
         df_exibir["pagto_estadia"] = pd.to_numeric(df_exibir["pagto_estadia"], errors="coerce").fillna(0.0)
+        df_exibir["valor_adicional_frete"] = pd.to_numeric(df_exibir["valor_adicional_frete"], errors="coerce").fillna(0.0)
+        df_exibir["descricao_valor_adicional_frete"] = df_exibir["descricao_valor_adicional_frete"].fillna("").astype(str)
         df_exibir["descricao_gasto_extra"] = df_exibir["descricao_gasto_extra"].fillna("").astype(str)
         df_exibir["tipo_cobranca"] = df_exibir["tipo_cobranca"].astype(str).str.upper().str.strip()
         df_exibir["origem"] = df_exibir["origem"].fillna("").astype(str).str.strip()
@@ -2071,12 +2311,25 @@ with aba2:
         ).fillna(0.0)
         df_exibir["Gasto Arla"] = (df_exibir["Litros Arla"] * df_exibir["arla"]).fillna(0.0)
         df_exibir["peso_kg"] = (pd.to_numeric(df_exibir["toneladas"], errors="coerce").fillna(0.0) * 1000.0)
+        df_exibir["qtd_estadia_calc"] = df_exibir.apply(
+            lambda rr: calcular_qtd_estadia(
+                rr.get("data_chegada"),
+                rr.get("hora_chegada"),
+                rr.get("data_descarregamento"),
+                rr.get("hora_descarregamento"),
+            ),
+            axis=1,
+        )
 
         # Mantém valor numérico para cálculos e exibe máscara BRL no grid.
+        df_exibir["Receita Comissionável"] = (
+            pd.to_numeric(df_exibir["Total Frete"], errors="coerce").fillna(0.0)
+            + pd.to_numeric(df_exibir["pagto_estadia"], errors="coerce").fillna(0.0)
+        )
         df_exibir["Total Frete Valor"] = (
             (
-                pd.to_numeric(df_exibir["Total Frete"], errors="coerce").fillna(0.0)
-                + pd.to_numeric(df_exibir["pagto_estadia"], errors="coerce").fillna(0.0)
+                df_exibir["Receita Comissionável"]
+                + pd.to_numeric(df_exibir["valor_adicional_frete"], errors="coerce").fillna(0.0)
             )
             * df_exibir["qtd_viagens"]
         )
@@ -2098,20 +2351,28 @@ with aba2:
         destinos_disponiveis = sorted([d for d in df_exibir["destino"].dropna().unique().tolist() if str(d).strip()])
         opcoes_origem = ["Todas as origens"] + origens_disponiveis
         opcoes_destino = ["Todos os destinos"] + destinos_disponiveis
+        opcoes_estadia = ["Todos", "Com Estadia", "Sem Estadia"]
 
         if "filtro_origem_exec" not in st.session_state or st.session_state.filtro_origem_exec not in opcoes_origem:
             st.session_state.filtro_origem_exec = "Todas as origens"
         if "filtro_destino_exec" not in st.session_state or st.session_state.filtro_destino_exec not in opcoes_destino:
             st.session_state.filtro_destino_exec = "Todos os destinos"
+        if "filtro_estadia_exec" not in st.session_state or st.session_state.filtro_estadia_exec not in opcoes_estadia:
+            st.session_state.filtro_estadia_exec = "Todos"
 
-        f_exec_1, f_exec_2 = st.columns(2)
+        f_exec_1, f_exec_2, f_exec_3 = st.columns(3)
         f_exec_1.selectbox("Filtro Origem", options=opcoes_origem, key="filtro_origem_exec")
         f_exec_2.selectbox("Filtro Destino", options=opcoes_destino, key="filtro_destino_exec")
+        f_exec_3.selectbox("Filtro Estadia", options=opcoes_estadia, key="filtro_estadia_exec")
 
         if st.session_state.filtro_origem_exec != "Todas as origens":
             df_exibir = df_exibir[df_exibir["origem"] == st.session_state.filtro_origem_exec].copy()
         if st.session_state.filtro_destino_exec != "Todos os destinos":
             df_exibir = df_exibir[df_exibir["destino"] == st.session_state.filtro_destino_exec].copy()
+        if st.session_state.filtro_estadia_exec == "Com Estadia":
+            df_exibir = df_exibir[pd.to_numeric(df_exibir["qtd_estadia_calc"], errors="coerce").fillna(0).astype(int) > 0].copy()
+        elif st.session_state.filtro_estadia_exec == "Sem Estadia":
+            df_exibir = df_exibir[pd.to_numeric(df_exibir["qtd_estadia_calc"], errors="coerce").fillna(0).astype(int) <= 0].copy()
 
         # 3. CÁLCULOS DOS TOTAIS
         tot_km = float((df_exibir["km"] * df_exibir["qtd_viagens"]).sum())
@@ -2124,6 +2385,7 @@ with aba2:
         tot_litros_arla = float(df_exibir["Litros Arla"].sum())
         tot_valor_arla = float(df_exibir["Gasto Arla"].sum())
         tot_viagens = int(df_exibir["qtd_viagens"].sum())
+        tot_qtd_estadias_calc = int(pd.to_numeric(df_exibir["qtd_estadia_calc"], errors="coerce").fillna(0).sum())
         datas_exec = pd.to_datetime(df_exibir["data"], errors="coerce").dropna()
         if datas_exec.empty:
             dias_gastos = 0
@@ -2162,194 +2424,271 @@ with aba2:
         m10.metric("Total Gasto Arla", brl(tot_valor_arla))
         m11.metric("Faturamento Liquido", brl(tot_faturamento_liquido_periodo))
         m12.metric("Dias Gastos", dias_gastos)
+        m13, _, _, _, _, _ = st.columns(6)
+        m13.metric("Total Estadia no Período", int(tot_qtd_estadias_calc))
 
         st.markdown("---")
         tab_grid_exec, tab_lucro_exec = st.tabs(["📋 Grid de Viagens", "📈 Lucro e Viabilidade"])
 
         with tab_grid_exec:
-            if "viagens_exec_editando" not in st.session_state:
-                st.session_state.viagens_exec_editando = False
+            colunas_tab = ["id", "data", "veiculo_placa", "nf", "cliente", "origem", "destino", "tipo_cobranca", "km", "peso_kg", "valor_ton", "valor_km", "diesel", "consumo", "arla", "consumo_arla", "Diesel/KM", "Gasto Arla", "Total Frete Valor", "Total Frete", "Frete Líquido", "pedagio", "qtd_pedagio", "gasto_extra", "pagto_estadia", "valor_adicional_frete", "descricao_valor_adicional_frete", "descricao_gasto_extra", "hora_carregamento", "data_chegada", "hora_chegada", "data_descarregamento", "hora_descarregamento", "qtd_estadia_calc", "qtd_viagens"]
+            df_ed = df_exibir[colunas_tab].copy()
 
-            # 4. DEFINIR COLUNAS PARA O EDITOR
-            colunas_tab = ["id", "data", "veiculo_placa", "nf", "cliente", "origem", "destino", "tipo_cobranca", "km", "peso_kg", "valor_ton", "valor_km", "diesel", "consumo", "arla", "consumo_arla", "Diesel/KM", "Gasto Arla", "Total Frete Valor", "Total Frete", "Frete Líquido", "pedagio", "gasto_extra", "pagto_estadia", "descricao_gasto_extra", "qtd_viagens", "Editar", "Excluir"]
-
-            def largura_por_conteudo(df, coluna):
-                if coluna not in df.columns or df.empty:
-                    return "small"
-                tam = int(df[coluna].fillna("").astype(str).str.len().max())
-                if tam <= 8:
-                    return "small"
-                if tam <= 18:
-                    return "medium"
-                return "large"
-
-            w_placa = "small"
-            w_nf = "small"
-            w_cliente = "small"
-            w_origem = "small"
-            w_destino = "small"
-            col_ed1, col_ed2 = st.columns(2)
-            if col_ed1.button("✏️ Editar", key="btn_viagens_exec_editar", use_container_width=True, disabled=st.session_state.viagens_exec_editando):
-                st.session_state.viagens_exec_editando = True
-                st.rerun()
-            if col_ed2.button("❌ Cancelar Edição", key="btn_viagens_exec_cancelar", use_container_width=True, disabled=not st.session_state.viagens_exec_editando):
-                st.session_state.viagens_exec_editando = False
-                st.rerun()
-
-            colunas_somente_leitura = ["Total Frete Valor", "Total Frete", "Frete Líquido", "Diesel/KM", "Gasto Arla"]
-            editor_disabled = colunas_somente_leitura if st.session_state.viagens_exec_editando else True
-
-            # Filtrar apenas as colunas que definimos acima
-            df_ed = st.data_editor(
-                df_exibir[colunas_tab], 
-                key="editor_historico_v2",
-                hide_index=True, 
+            st.dataframe(
+                df_ed.rename(
+                    columns={
+                        "data": "Data",
+                        "veiculo_placa": "Placa",
+                        "nf": "NF",
+                        "cliente": "Cliente",
+                        "origem": "Origem",
+                        "destino": "Destino",
+                        "tipo_cobranca": "Tipo Cobrança",
+                        "km": "KM",
+                        "peso_kg": "KG",
+                        "valor_ton": "Val Ton",
+                        "valor_km": "Val KM",
+                        "diesel": "VL/L/Diesel",
+                        "consumo": "Gasto Diesel P/KM",
+                        "arla": "VL/Litro Arla",
+                        "consumo_arla": "Gasto Arla P/KM",
+                        "pedagio": "Pedágio",
+                        "qtd_pedagio": "Qtd Pedágio",
+                        "gasto_extra": "Gasto Extra",
+                        "pagto_estadia": "Pagto Estadia",
+                        "valor_adicional_frete": "Adicional Frete",
+                        "descricao_valor_adicional_frete": "Descrição Adicional Frete",
+                        "descricao_gasto_extra": "Descrição Gasto Extra",
+                        "hora_carregamento": "Hora Carregamento",
+                        "data_chegada": "Data Chegada",
+                        "hora_chegada": "Hora Chegada",
+                        "data_descarregamento": "Data Descarregamento",
+                        "hora_descarregamento": "Hora Descarregamento",
+                        "qtd_estadia_calc": "Qtd Estadia (Calc)",
+                        "qtd_viagens": "Qtd",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
                 height=470,
-                row_height=30,
-                use_container_width=True, 
-                disabled=editor_disabled,
-                column_config={
-                    "id": None, 
-                    "Total Frete Valor": None,
-                    "Editar": st.column_config.CheckboxColumn("✏️", width="small"),
-                    "Excluir": st.column_config.CheckboxColumn("🗑️", width="small"),
-                    "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", width="small"),
-                    "veiculo_placa": st.column_config.TextColumn("Placa", width=w_placa),
-                    "nf": st.column_config.TextColumn("NF", width=w_nf),
-                    "cliente": None,
-                    "origem": st.column_config.TextColumn("Origem", width=w_origem),
-                    "destino": st.column_config.TextColumn("Destino", width=w_destino),
-                    "tipo_cobranca": None,
-                    "km": st.column_config.NumberColumn("KM", format="%.0f", width="small"),
-                    "peso_kg": st.column_config.NumberColumn("KG", format="%.0f", width="small"),
-                    "valor_ton": st.column_config.NumberColumn("Val Ton", min_value=0.0, format="R$ %.2f", width="small"),
-                    "valor_km": None,
-                    "qtd_viagens": st.column_config.NumberColumn("Qtd", min_value=1, width="small"),
-                    "diesel": st.column_config.NumberColumn("VL/L/Diesel", min_value=0.0, format="R$ %.2f", width="small"),
-                    "consumo": st.column_config.NumberColumn("Gasto Diesel P/KM", min_value=0.0, format="%.2f", width="small"),
-                    "Diesel/KM": None,
-                    "arla": st.column_config.NumberColumn("VL/Litro Arla", min_value=0.0, format="R$ %.2f", width="small"),
-                    "consumo_arla": st.column_config.NumberColumn("Gasto Arla P/KM", min_value=0.0, format="%.2f", width="small"),
-                    "Gasto Arla": None,
-                    "Total Frete": st.column_config.TextColumn("Total Frete", width="small"),
-                    "Frete Líquido": st.column_config.NumberColumn("Frete Líquido", format="R$ %.2f", width="small"),
-                    "pedagio": None,
-                    "gasto_extra": None,
-                    "pagto_estadia": st.column_config.NumberColumn("Pagto Estadia", min_value=0.0, format="R$ %.2f", width="small"),
-                    "descricao_gasto_extra": None,
-                }
             )
 
-            # 5. BOTÕES DE AÇÃO
-            c_h1, c_h2, c_h3 = st.columns(3)
-            if c_h1.button("💾 Gravar", key="save_hist_final", disabled=not st.session_state.viagens_exec_editando):
-                ids_excluir = set(df_ed[df_ed["Excluir"] == True]["id"].tolist())
-                ids_marcados_editar = set(df_ed[(df_ed["Editar"] == True) & (df_ed["Excluir"] != True)]["id"].tolist())
-                campos_comparacao = [
-                    "data",
-                    "veiculo_placa",
-                    "nf",
-                    "cliente",
-                    "origem",
-                    "destino",
-                    "tipo_cobranca",
-                    "km",
-                    "peso_kg",
-                    "valor_ton",
-                    "valor_km",
-                    "diesel",
-                    "consumo",
-                    "arla",
-                    "consumo_arla",
-                    "pedagio",
-                    "gasto_extra",
-                    "pagto_estadia",
-                    "descricao_gasto_extra",
-                    "qtd_viagens",
-                ]
-                campos_numericos = {
-                    "km",
-                    "peso_kg",
-                    "valor_ton",
-                    "valor_km",
-                    "diesel",
-                    "consumo",
-                    "arla",
-                    "consumo_arla",
-                    "pedagio",
-                    "gasto_extra",
-                    "pagto_estadia",
-                    "qtd_viagens",
-                }
-                df_old_cmp = df_exibir.set_index("id")
-                df_new_cmp = df_ed.set_index("id")
-                ids_comuns = set(df_old_cmp.index.tolist()) & set(df_new_cmp.index.tolist())
-                ids_alterados = set()
+            if "viagens_exec_id_editando" not in st.session_state:
+                st.session_state.viagens_exec_id_editando = None
 
-                for id_linha in ids_comuns:
-                    if id_linha in ids_excluir:
-                        continue
-                    for campo in campos_comparacao:
-                        antigo = df_old_cmp.at[id_linha, campo] if campo in df_old_cmp.columns else None
-                        novo = df_new_cmp.at[id_linha, campo] if campo in df_new_cmp.columns else None
+            df_sel_exec = df_exibir.copy()
+            df_sel_exec["rotulo_edicao"] = (
+                "ID "
+                + df_sel_exec["id"].astype(str)
+                + " | "
+                + pd.to_datetime(df_sel_exec["data"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("-")
+                + " | "
+                + df_sel_exec["origem"].fillna("").astype(str)
+                + " → "
+                + df_sel_exec["destino"].fillna("").astype(str)
+                + " | NF "
+                + df_sel_exec["nf"].fillna("").astype(str)
+            )
+            id_viagem_sel = st.selectbox(
+                "Escolha uma viagem para editar",
+                options=df_sel_exec["id"].tolist(),
+                format_func=lambda x: df_sel_exec.loc[df_sel_exec["id"] == x, "rotulo_edicao"].iloc[0],
+                key="viagem_exec_select_editar",
+            )
+            c_v1, c_v2 = st.columns(2)
+            if c_v1.button("✏️ Editar Registro", key="btn_viagem_exec_abrir_form", use_container_width=True):
+                st.session_state.viagens_exec_id_editando = int(id_viagem_sel)
+                st.rerun()
+            if c_v2.button("❌ Cancelar Edição", key="btn_viagem_exec_cancelar_form", use_container_width=True):
+                st.session_state.viagens_exec_id_editando = None
+                st.rerun()
 
-                        if campo == "data":
-                            antigo_dt = pd.to_datetime(antigo, errors="coerce")
-                            novo_dt = pd.to_datetime(novo, errors="coerce")
-                            antigo_val = antigo_dt.strftime("%Y-%m-%d") if pd.notna(antigo_dt) else ""
-                            novo_val = novo_dt.strftime("%Y-%m-%d") if pd.notna(novo_dt) else ""
-                            if antigo_val != novo_val:
-                                ids_alterados.add(id_linha)
-                                break
-                        elif campo in campos_numericos:
-                            antigo_num = float(pd.to_numeric(pd.Series([antigo]), errors="coerce").fillna(0.0).iloc[0])
-                            novo_num = float(pd.to_numeric(pd.Series([novo]), errors="coerce").fillna(0.0).iloc[0])
-                            if abs(antigo_num - novo_num) > 1e-9:
-                                ids_alterados.add(id_linha)
-                                break
+            if st.session_state.viagens_exec_id_editando is not None:
+                reg_sel = df_exibir[df_exibir["id"] == st.session_state.viagens_exec_id_editando]
+                if reg_sel.empty:
+                    st.session_state.viagens_exec_id_editando = None
+                    st.warning("Registro selecionado não foi encontrado.")
+                else:
+                    r = reg_sel.iloc[0]
+                    st.markdown("### ✏️ Editar Viagem Executada")
+                    with st.form("form_edicao_viagem_exec"):
+                        ce1, ce2, ce3, ce4 = st.columns(4)
+                        data_ed = ce1.date_input("Data carregamento", value=pd.to_datetime(r["data"], errors="coerce").date(), format="DD/MM/YYYY")
+                        hora_carregamento_ed = ce2.text_input("Hora carregamento", value=str(r.get("hora_carregamento", "") or ""), placeholder="HH:MM")
+                        cliente_ed = ce3.text_input("Cliente", value=str(r["cliente"] or ""))
+                        nf_ed = ce4.text_input("N.NF", value=str(r["nf"] or ""))
+                        ce_data1, ce_data2, ce_data3, ce_data4 = st.columns(4)
+                        data_chegada_default = pd.to_datetime(r.get("data_chegada"), errors="coerce")
+                        if pd.isna(data_chegada_default):
+                            data_chegada_default = pd.to_datetime(r["data"], errors="coerce")
+                        data_chegada_ed = ce_data1.date_input(
+                            "Data Chegada Descarregamento",
+                            value=data_chegada_default.date(),
+                            format="DD/MM/YYYY",
+                        )
+                        hora_chegada_ed = ce_data2.text_input("Hora Chegada Descarregamento", value=str(r.get("hora_chegada", "") or ""), placeholder="HH:MM")
+                        data_descarregamento_default = pd.to_datetime(r.get("data_descarregamento"), errors="coerce")
+                        if pd.isna(data_descarregamento_default):
+                            data_descarregamento_default = pd.to_datetime(r["data"], errors="coerce")
+                        data_descarregamento_tmp_ed = ce_data3.date_input(
+                            "Data descarregamento",
+                            value=data_descarregamento_default.date(),
+                            format="DD/MM/YYYY",
+                            key=f"edit_data_descarregamento_{int(r['id'])}",
+                        )
+                        deixar_data_descarregamento_em_branco_ed = ce_data3.checkbox(
+                            "Salvar em branco",
+                            value=pd.isna(pd.to_datetime(r.get("data_descarregamento"), errors="coerce")),
+                            key=f"edit_data_descarregamento_em_branco_{int(r['id'])}",
+                        )
+                        if deixar_data_descarregamento_em_branco_ed:
+                            data_descarregamento_ed = None
+                            ce_data3.caption("Data descarregamento ficará em branco.")
                         else:
-                            antigo_txt = str(antigo or "").strip()
-                            novo_txt = str(novo or "").strip()
-                            if campo == "tipo_cobranca":
-                                antigo_txt = antigo_txt.upper()
-                                novo_txt = novo_txt.upper()
-                            if antigo_txt != novo_txt:
-                                ids_alterados.add(id_linha)
+                            data_descarregamento_ed = data_descarregamento_tmp_ed
+                        hora_descarregamento_ed = ce_data4.text_input("Hora descarregamento", value=str(r.get("hora_descarregamento", "") or ""), placeholder="HH:MM")
+                        qtd_estadia_form_calc = calcular_qtd_estadia(
+                            data_chegada_ed,
+                            hora_chegada_ed,
+                            data_descarregamento_ed,
+                            hora_descarregamento_ed,
+                        )
+                        st.number_input(
+                            "Qtd Estadia (Calculada)",
+                            min_value=0,
+                            value=int(qtd_estadia_form_calc),
+                            step=1,
+                            disabled=True,
+                        )
+                        st.caption("Regra aplicada: começa a contar após 5h da chegada; depois conta 1 estadia a cada 24h (ou fração) excedente.")
+
+                        ce4, ce5, ce6 = st.columns(3)
+                        origem_atual_ed = str(r["origem"] or "").strip()
+                        destino_atual_ed = str(r["destino"] or "").strip()
+                        opcoes_origem_ed = list(lista_cidades) if isinstance(lista_cidades, list) else []
+                        opcoes_destino_ed = list(lista_cidades) if isinstance(lista_cidades, list) else []
+                        if origem_atual_ed and origem_atual_ed not in opcoes_origem_ed:
+                            opcoes_origem_ed = [origem_atual_ed] + opcoes_origem_ed
+                        if destino_atual_ed and destino_atual_ed not in opcoes_destino_ed:
+                            opcoes_destino_ed = [destino_atual_ed] + opcoes_destino_ed
+                        idx_origem_ed = opcoes_origem_ed.index(origem_atual_ed) if origem_atual_ed in opcoes_origem_ed else 0
+                        idx_destino_ed = opcoes_destino_ed.index(destino_atual_ed) if destino_atual_ed in opcoes_destino_ed else 0
+                        origem_ed = ce4.selectbox("Origem", options=opcoes_origem_ed, index=idx_origem_ed, key=f"exec_origem_ed_{int(r['id'])}")
+                        destino_ed = ce5.selectbox("Destino", options=opcoes_destino_ed, index=idx_destino_ed, key=f"exec_destino_ed_{int(r['id'])}")
+                        placa_atual_ed = str(r["veiculo_placa"] or "").strip()
+                        opcoes_veiculo_ed = list(lista_veiculos_full) if isinstance(lista_veiculos_full, list) else []
+                        rotulo_placa_manual = f"{placa_atual_ed} - (placa manual)" if placa_atual_ed else None
+                        if rotulo_placa_manual and rotulo_placa_manual not in opcoes_veiculo_ed:
+                            opcoes_veiculo_ed = [rotulo_placa_manual] + opcoes_veiculo_ed
+                        idx_veiculo_ed = 0
+                        for i_opt, opt_veic in enumerate(opcoes_veiculo_ed):
+                            if str(opt_veic).split(" - ")[0].strip().upper() == placa_atual_ed.upper():
+                                idx_veiculo_ed = i_opt
                                 break
+                        if opcoes_veiculo_ed:
+                            veic_sel_ed = ce6.selectbox(
+                                "Veículo",
+                                options=opcoes_veiculo_ed,
+                                index=idx_veiculo_ed,
+                                key=f"exec_veic_ed_{int(r['id'])}",
+                            )
+                            placa_ed = str(veic_sel_ed).split(" - ")[0].strip()
+                        else:
+                            placa_ed = ce6.text_input("Placa", value=placa_atual_ed)
 
-                ids_para_atualizar = (ids_marcados_editar | ids_alterados) - ids_excluir
-                if not ids_para_atualizar:
-                    st.warning("Nenhuma alteração detectada para gravar.")
-                    st.stop()
+                        ce7, ce8, ce9, ce10 = st.columns(4)
+                        tipo_cobranca_ed = ce7.selectbox("Tipo Cálculo", ["TONELADA", "KM"], index=0 if str(r["tipo_cobranca"]).upper() != "KM" else 1)
+                        km_ed = ce8.number_input("KM", min_value=0.0, value=float(r["km"] or 0.0), step=1.0)
+                        kg_ed = ce9.number_input("KG", min_value=0.0, value=float(r["peso_kg"] or 0.0), step=1.0)
+                        qtd_viagens_ed = ce10.number_input("Qtd", min_value=1, value=int(r["qtd_viagens"] or 1), step=1)
 
-                with conn() as c:
-                    for _, r in df_ed.iterrows():
-                        if int(r["id"]) in ids_para_atualizar:
-                            dt_sql = pd.to_datetime(r["data"], errors="coerce")
-                            data_sql = dt_sql.strftime("%Y-%m-%d") if pd.notna(dt_sql) else str(r["data"])[:10]
-                            tipo_cobranca_sql = str(r["tipo_cobranca"]).upper().strip()
-                            valor_ton_sql = float(pd.to_numeric(r["valor_ton"], errors="coerce") or 0.0)
-                            c.execute("""UPDATE viagens SET 
-                                data=?, cliente=?, tipo_cobranca=?, km=?, toneladas=?, valor_ton=?, valor_km=?, pedagio=?, gasto_extra=?, pagto_estadia=?, descricao_gasto_extra=?, diesel=?, consumo=?, arla=?, consumo_arla=?,
-                                origem=?, destino=?, nf=?, veiculo_placa=?, qtd_viagens=? 
-                                WHERE id=?""", 
-                                (data_sql, r["cliente"], tipo_cobranca_sql, r["km"], (float(r["peso_kg"]) / 1000.0), valor_ton_sql, r["valor_km"],
-                                 r["pedagio"], r["gasto_extra"], r["pagto_estadia"], str(r["descricao_gasto_extra"]).strip(), r["diesel"], r["consumo"], r["arla"], r["consumo_arla"], r["origem"], r["destino"], r["nf"], r["veiculo_placa"], 
-                                 int(r["qtd_viagens"]), r["id"]))
-                alerta_gravado()
-                st.session_state.viagens_exec_editando = False
-                st.rerun()
+                        ce11, ce12, ce13, ce14, ce15 = st.columns(5)
+                        valor_ton_ed = ce11.number_input("Val Ton", min_value=0.0, value=float(r["valor_ton"] or 0.0), step=0.01)
+                        valor_km_ed = ce12.number_input("Val KM", min_value=0.0, value=float(r["valor_km"] or 0.0), step=0.01)
+                        pedagio_ed = ce13.number_input("Pedágio", min_value=0.0, value=float(r["pedagio"] or 0.0), step=0.01)
+                        qtd_pedagio_ed = ce14.number_input("Qtd Pedágio", min_value=0, value=int(r.get("qtd_pedagio", 0) or 0), step=1)
+                        gasto_extra_ed = ce15.number_input("Gasto Extra", min_value=0.0, value=float(r["gasto_extra"] or 0.0), step=0.01)
 
-            if c_h2.button("🔴 Excluir Selecionados", type="primary", disabled=not st.session_state.viagens_exec_editando):
-                ids = df_ed[df_ed["Excluir"] == True]["id"].tolist()
-                if not ids:
-                    st.warning("Marque pelo menos uma linha na coluna 🗑️ para excluir.")
-                    st.stop()
-                with conn() as c:
-                    for i in ids: c.execute("DELETE FROM viagens WHERE id=?", (i,))
-                st.session_state.viagens_exec_editando = False
-                st.rerun()
+                        ce15, ce16, ce17 = st.columns(3)
+                        pagto_estadia_ed = ce15.number_input("Pagto Estadia", min_value=0.0, value=float(r["pagto_estadia"] or 0.0), step=0.01)
+                        diesel_ed = ce16.number_input("VL/L/Diesel", min_value=0.0, value=float(r["diesel"] or 0.0), step=0.01)
+                        consumo_ed = ce17.number_input("Gasto Diesel P/KM", min_value=0.0, value=float(r["consumo"] or 0.0), step=0.01)
 
+                        ce20, ce21 = st.columns(2)
+                        valor_adic_frete_ed = ce20.number_input("Valor Adicional no Frete", min_value=0.0, value=float(r.get("valor_adicional_frete", 0.0) or 0.0), step=0.01)
+                        desc_valor_adic_frete_ed = ce21.text_input("Descrição Valor Adicional no Frete", value=str(r.get("descricao_valor_adicional_frete", "") or ""))
+
+                        ce18, ce19 = st.columns(2)
+                        arla_ed = ce18.number_input("VL/Litro Arla", min_value=0.0, value=float(r["arla"] or 0.0), step=0.01)
+                        consumo_arla_ed = ce19.number_input("Gasto Arla P/KM", min_value=0.0, value=float(r["consumo_arla"] or 0.0), step=0.01)
+                        desc_gasto_extra_ed = st.text_input("Descrição Gasto Extra", value=str(r["descricao_gasto_extra"] or ""))
+
+                        b1, b2 = st.columns(2)
+                        btn_atualizar_viagem = b1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
+                        btn_excluir_viagem = b2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
+
+                    if btn_atualizar_viagem:
+                        if not origem_ed.strip() or not destino_ed.strip() or not placa_ed.strip():
+                            st.warning("Preencha origem, destino e placa para atualizar.")
+                        else:
+                            tipo_sql = str(tipo_cobranca_ed).upper().strip()
+                            toneladas_sql = (kg_ed / 1000.0) if tipo_sql == "TONELADA" else 0.0
+                            valor_ton_sql = valor_ton_ed if tipo_sql == "TONELADA" else 0.0
+                            valor_km_sql = valor_km_ed if tipo_sql == "KM" else 0.0
+                            with conn() as c:
+                                c.execute(
+                                    """UPDATE viagens SET
+                                       data=?, cliente=?, origem=?, destino=?, km=?, toneladas=?, valor_ton=?, valor_km=?, tipo_cobranca=?,
+                                       pedagio=?, qtd_pedagio=?, gasto_extra=?, pagto_estadia=?, valor_adicional_frete=?, descricao_valor_adicional_frete=?, descricao_gasto_extra=?, diesel=?, consumo=?, arla=?, consumo_arla=?,
+                                       hora_carregamento=?, data_chegada=?, hora_chegada=?, data_descarregamento=?, hora_descarregamento=?,
+                                       nf=?, veiculo_placa=?, qtd_viagens=?
+                                       WHERE id=?""",
+                                    (
+                                        data_ed.isoformat(),
+                                        cliente_ed.strip(),
+                                        origem_ed.strip(),
+                                        destino_ed.strip(),
+                                        km_ed,
+                                        toneladas_sql,
+                                        valor_ton_sql,
+                                        valor_km_sql,
+                                        tipo_sql,
+                                        pedagio_ed,
+                                        int(qtd_pedagio_ed or 0),
+                                        gasto_extra_ed,
+                                        pagto_estadia_ed,
+                                        valor_adic_frete_ed,
+                                        desc_valor_adic_frete_ed.strip(),
+                                        desc_gasto_extra_ed.strip(),
+                                        diesel_ed,
+                                        consumo_ed,
+                                        arla_ed,
+                                        consumo_arla_ed,
+                                        str(hora_carregamento_ed or "").strip(),
+                                        data_chegada_ed.isoformat() if data_chegada_ed else None,
+                                        str(hora_chegada_ed or "").strip(),
+                                        data_descarregamento_ed.isoformat() if data_descarregamento_ed else None,
+                                        str(hora_descarregamento_ed or "").strip(),
+                                        nf_ed.strip(),
+                                        placa_ed.strip(),
+                                        int(qtd_viagens_ed),
+                                        int(st.session_state.viagens_exec_id_editando),
+                                    ),
+                                )
+                            limpar_cache_viagens()
+                            alerta_gravado("✅ Viagem atualizada com sucesso!")
+                            st.session_state.viagens_exec_id_editando = None
+                            st.rerun()
+
+                    if btn_excluir_viagem:
+                        with conn() as c:
+                            c.execute("DELETE FROM viagens WHERE id=?", (int(st.session_state.viagens_exec_id_editando),))
+                        limpar_cache_viagens()
+                        alerta_gravado("✅ Viagem excluída com sucesso!")
+                        st.session_state.viagens_exec_id_editando = None
+                        st.rerun()
+
+            c_h3 = st.columns(1)[0]
             if c_h3.button("🖨️ Imprimir", use_container_width=True, key="btn_print_historico_data"):
                 total_frete_periodo = float(pd.to_numeric(df_ed["Total Frete Valor"], errors="coerce").fillna(0.0).sum())
                 total_frete_periodo += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
@@ -2444,7 +2783,7 @@ with aba2:
 
         with tab_lucro_exec:
             df_rank = df_exibir.copy()
-            for col in ["km", "qtd_viagens", "pedagio", "gasto_extra", "pagto_estadia", "consumo", "diesel", "arla"]:
+            for col in ["km", "qtd_viagens", "pedagio", "gasto_extra", "pagto_estadia", "valor_adicional_frete", "consumo", "diesel", "arla"]:
                 if col not in df_rank.columns:
                     df_rank[col] = 0.0 if col != "qtd_viagens" else 1
             df_rank["km"] = pd.to_numeric(df_rank["km"], errors="coerce").fillna(0.0)
@@ -2453,6 +2792,7 @@ with aba2:
             df_rank["pedagio"] = pd.to_numeric(df_rank["pedagio"], errors="coerce").fillna(0.0)
             df_rank["gasto_extra"] = pd.to_numeric(df_rank["gasto_extra"], errors="coerce").fillna(0.0)
             df_rank["pagto_estadia"] = pd.to_numeric(df_rank["pagto_estadia"], errors="coerce").fillna(0.0)
+            df_rank["valor_adicional_frete"] = pd.to_numeric(df_rank["valor_adicional_frete"], errors="coerce").fillna(0.0)
             df_rank["consumo"] = pd.to_numeric(df_rank["consumo"], errors="coerce").fillna(0.0)
             df_rank["diesel"] = pd.to_numeric(df_rank["diesel"], errors="coerce").fillna(0.0)
             df_rank["arla"] = pd.to_numeric(df_rank["arla"], errors="coerce").fillna(0.0)
@@ -2466,7 +2806,10 @@ with aba2:
             df_rank = aplicar_parametros_por_data(df_rank, col_data="data")
             pct_comissao_series_rank = (pd.to_numeric(df_rank["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)
             pct_imposto_series_rank = (pd.to_numeric(df_rank["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)
-            df_rank["custo_motorista_comissao_total"] = (df_rank["frete_total"] * pct_comissao_series_rank).fillna(0.0)
+            df_rank["frete_comissionavel_total"] = (
+                df_rank["frete_total"] - (df_rank["valor_adicional_frete"] * df_rank["qtd_viagens"])
+            ).fillna(0.0)
+            df_rank["custo_motorista_comissao_total"] = (df_rank["frete_comissionavel_total"] * pct_comissao_series_rank).fillna(0.0)
             df_rank["custo_imposto_total"] = (df_rank["frete_total"] * pct_imposto_series_rank).fillna(0.0)
 
             df_rank["custo_total_profissional"] = (
@@ -2722,6 +3065,7 @@ with aba3:
                 (
                     pd.to_numeric(df_ana["Total Frete"], errors="coerce").fillna(0.0)
                     + pd.to_numeric(df_ana["pagto_estadia"], errors="coerce").fillna(0.0)
+                    + pd.to_numeric(df_ana.get("valor_adicional_frete", 0.0), errors="coerce").fillna(0.0)
                 )
                 * df_ana["qtd_viagens"]
             ).sum()
@@ -2744,6 +3088,14 @@ with aba3:
             (
                 pd.to_numeric(df_ana["Total Frete"], errors="coerce").fillna(0.0)
                 + pd.to_numeric(df_ana["pagto_estadia"], errors="coerce").fillna(0.0)
+                + pd.to_numeric(df_ana.get("valor_adicional_frete", 0.0), errors="coerce").fillna(0.0)
+            )
+            * df_ana["qtd_viagens"]
+        ).fillna(0.0)
+        df_ana["receita_comissionavel_viagem"] = (
+            (
+                pd.to_numeric(df_ana["Total Frete"], errors="coerce").fillna(0.0)
+                + pd.to_numeric(df_ana["pagto_estadia"], errors="coerce").fillna(0.0)
             )
             * df_ana["qtd_viagens"]
         ).fillna(0.0)
@@ -2755,7 +3107,7 @@ with aba3:
         t_extra = float((df_ana["gasto_extra"] * df_ana["qtd_viagens"]).sum())
         t_estadia = float((df_ana["pagto_estadia"] * df_ana["qtd_viagens"]).sum())
         t_comis_viagens = float(
-            (df_ana["receita_viagem"] * (pd.to_numeric(df_ana["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
+            (df_ana["receita_comissionavel_viagem"] * (pd.to_numeric(df_ana["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
         )
         t_imposto_viagens = float(
             (df_ana["receita_viagem"] * (pd.to_numeric(df_ana["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
@@ -2880,13 +3232,13 @@ with aba3:
 
         fig.update_layout(
             title="Distribuição de Custos (Efeito 3D)",
-            margin=dict(l=10, r=10, t=60, b=90),
+            margin=dict(l=10, r=200, t=60, b=30),
             height=520,
             legend=dict(
-                orientation="h",
-                y=-0.18,
-                yanchor="top",
-                x=0,
+                orientation="v",
+                y=0.5,
+                yanchor="middle",
+                x=1.02,
                 xanchor="left",
                 font=dict(size=11),
             ),
@@ -2915,8 +3267,16 @@ with aba4:
                 c_e1, c_e2 = st.columns(2)
                 d_e = c_e1.date_input("Data de Entrada", format="DD/MM/YYYY")
                 num_os = c_e2.text_input("Nº O.S.")
-                
-                v_m = st.selectbox("Veículo", apenas_placas)
+
+                opcoes_veiculo_manut = (
+                    [f"{str(v.get('descricao') or '').strip()} - {str(v.get('placa') or '').strip()}" for v in veiculos_db]
+                    if veiculos_db else apenas_placas
+                )
+                veic_sel_manut = st.selectbox("Veículo", opcoes_veiculo_manut)
+                if " - " in str(veic_sel_manut):
+                    v_m = str(veic_sel_manut).rsplit(" - ", 1)[1].strip()
+                else:
+                    v_m = str(veic_sel_manut).strip()
                 k_m = st.number_input("KM Entrada", step=1.0)
                 o_m = st.selectbox("Oficina", list(dict_oficinas.keys()))
                 def_m = st.text_area("Relato do Defeito")
@@ -3178,35 +3538,36 @@ with aba5:
     if "oficina_editando" not in st.session_state:
         st.session_state.oficina_editando = False
     
-    # --- FORMULÁRIO DE CADASTRO ---
-    with st.form("f_of", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        n_o = c1.text_input("Nome da Oficina")
-        cnpj_o = c2.text_input("CNPJ")
-        ie_o = c3.text_input("Inscrição Estadual")
-        e_o = c1.text_input("Endereço")
-        num_o = c2.text_input("Numero")
-        compl_o = c3.text_input("Complemento")
-        b_o = c1.text_input("Bairro")
-        ci_o = c2.text_input("Cidade")
-        uf_o = c3.text_input("Estado")
-        cep_o = c1.text_input("CEP")
-        tel_o = c2.text_input("Telefone Contato")
-        email_o = c3.text_input("E-mail")
-        r_o = c1.text_input("Responsável / Contato")
-        
-        if st.form_submit_button("💾 Gravar", key="btn_oficina_cadastro_gravar"):
-            if n_o:
-                with conn() as c:
-                    c.execute("""INSERT INTO oficinas (
-                                    nome, cnpj, endereco, numero, complemento, bairro, cidade, estado, cep,
-                                    inscricao_estadual, telefone_contato, email, responsavel
-                                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                              (n_o, cnpj_o, e_o, num_o, compl_o, b_o, ci_o, uf_o, cep_o, ie_o, tel_o, email_o, r_o))
-                alerta_gravado()
-                st.rerun()
-            else:
-                st.error("O nome da oficina é obrigatório.")
+    with st.expander("➕ Cadastro de Oficina", expanded=False):
+        # --- FORMULÁRIO DE CADASTRO ---
+        with st.form("f_of", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            n_o = c1.text_input("Nome da Oficina")
+            cnpj_o = c2.text_input("CNPJ")
+            ie_o = c3.text_input("Inscrição Estadual")
+            e_o = c1.text_input("Endereço")
+            num_o = c2.text_input("Numero")
+            compl_o = c3.text_input("Complemento")
+            b_o = c1.text_input("Bairro")
+            ci_o = c2.text_input("Cidade")
+            uf_o = c3.text_input("Estado")
+            cep_o = c1.text_input("CEP")
+            tel_o = c2.text_input("Telefone Contato")
+            email_o = c3.text_input("E-mail")
+            r_o = c1.text_input("Responsável / Contato")
+            
+            if st.form_submit_button("💾 Gravar", key="btn_oficina_cadastro_gravar"):
+                if n_o:
+                    with conn() as c:
+                        c.execute("""INSERT INTO oficinas (
+                                        nome, cnpj, endereco, numero, complemento, bairro, cidade, estado, cep,
+                                        inscricao_estadual, telefone_contato, email, responsavel
+                                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                 (n_o, cnpj_o, e_o, num_o, compl_o, b_o, ci_o, uf_o, cep_o, ie_o, tel_o, email_o, r_o))
+                    alerta_gravado()
+                    st.rerun()
+                else:
+                    st.error("O nome da oficina é obrigatório.")
 
     st.markdown("---")
     st.markdown("### 📋 Editar ou Excluir Oficinas")
@@ -3563,8 +3924,12 @@ with aba8:
         else:
             qtd_rel = pd.Series(1, index=df_db.index, dtype=int)
         pagto_estadia_rel = pd.to_numeric(df_db.get("pagto_estadia", 0.0), errors="coerce").fillna(0.0)
+        adicional_frete_rel = pd.to_numeric(df_db.get("valor_adicional_frete", 0.0), errors="coerce").fillna(0.0)
+        total_estadia_rel = float((pagto_estadia_rel * qtd_rel).sum())
+        pagamento_estadia_10_rel = total_estadia_rel * 0.10
+        total_adicional_frete_rel = float((adicional_frete_rel * qtd_rel).sum())
         total_frete_rel = (
-            (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_rel) * qtd_rel
+            (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_rel + adicional_frete_rel) * qtd_rel
         )
         df_rel_param = df_db.copy()
         df_rel_param["total_frete_rel"] = total_frete_rel
@@ -3572,26 +3937,36 @@ with aba8:
         total_f = float(total_frete_rel.sum())
         frete_fixo_periodo_rel = frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
         total_f += frete_fixo_periodo_rel
+        total_frete_comissao_rel = (
+            (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_rel) * qtd_rel
+        )
         v_comis_viagens = float(
-            (df_rel_param["total_frete_rel"] * (pd.to_numeric(df_rel_param["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
+            (total_frete_comissao_rel * (pd.to_numeric(df_rel_param["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
         )
         v_comis_frete_fixo = float(
             (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
              * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim) / 100.0)).sum()
         )
         v_comis = v_comis_viagens + v_comis_frete_fixo
-        pct_db = (v_comis / total_f * 100.0) if total_f > 0 else 0.0
+        base_comissionavel_total = float(total_frete_comissao_rel.sum()) + float(frete_fixo_periodo_rel)
+        pct_db = (v_comis / base_comissionavel_total * 100.0) if base_comissionavel_total > 0 else 0.0
         pct_db_txt = format_pct(pct_db)
-        total_pg = v_comis + fixo_db
+        total_pg = v_comis + fixo_db + pagamento_estadia_10_rel
         qtde_fretes = int(qtd_rel.sum())
 
         # Visualização no Streamlit
-        m0, m1, m2, m3 = st.columns(4)
+        m0, m1, m2, m3, m4, m5 = st.columns(6)
         m0.metric("Qtd. Fretes", qtde_fretes)
         m1.metric("Total Fretes", brl(total_f))
         m2.metric(f"Comissão ({pct_db_txt})", brl(v_comis))
         m3.metric("Total a Pagar", brl(total_pg))
+        m4.metric("Pagamento Estadia 10%", brl(pagamento_estadia_10_rel))
+        m5.metric("Adicional Frete (Sem Comissão)", brl(total_adicional_frete_rel))
         st.caption(f"Salário fixo do motorista: {brl(fixo_db)}")
+        st.caption(
+            "Base da comissão = Total Bruto - Adicional Frete (Sem Comissão). "
+            f"Base comissionável no período: {brl(base_comissionavel_total)}"
+        )
         
         if st.button("🔍 PREPARAR IMPRESSÃO", use_container_width=True, key="btn_print_rel_final"):
             # Início do HTML
@@ -3647,8 +4022,9 @@ with aba8:
             for i_rel, r in df_db.iterrows():
                 qtd_linha = int(qtd_rel.loc[i_rel]) if i_rel in qtd_rel.index else 1
                 pagto_estadia_linha = pd.to_numeric(pd.Series([r.get("pagto_estadia", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+                adicional_frete_linha = pd.to_numeric(pd.Series([r.get("valor_adicional_frete", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
                 frete_base_linha = pd.to_numeric(pd.Series([r.get("Total Frete", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
-                total_frete_linha = float((frete_base_linha + pagto_estadia_linha) * qtd_linha)
+                total_frete_linha = float((frete_base_linha + pagto_estadia_linha + adicional_frete_linha) * qtd_linha)
                 html += f"""
                 <tr>
                     <td>{r['data'].strftime('%d/%m/%Y')}</td>
@@ -3670,8 +4046,11 @@ with aba8:
                     <div class="tot">
                         <div class="ln"><span>Qtd. de Fretes:</span> <span>{qtde_fretes}</span></div>
                         <div class="ln"><span>Total Bruto:</span> <span>{brl(total_f)}</span></div>
+                        <div class="ln"><span>(-) Adicional Frete (Sem Comissão):</span> <span>{brl(total_adicional_frete_rel)}</span></div>
+                        <div class="ln"><span>Base da Comissão:</span> <span>{brl(base_comissionavel_total)}</span></div>
                         <div class="ln"><span>Frete Fixo Rateado:</span> <span>{brl(frete_fixo_periodo_rel)}</span></div>
                         <div class="ln"><span>Comissão ({pct_db_txt}):</span> <span>{brl(v_comis)}</span></div>
+                        <div class="ln"><span>Pagamento Estadia 10%:</span> <span>{brl(pagamento_estadia_10_rel)}</span></div>
                         <div class="ln"><span>Salário Fixo:</span> <span>{brl(fixo_db)}</span></div>
                         <div class="ln fin"><span>TOTAL A PAGAR:</span> <span>{brl(total_pg)}</span></div>
                     </div>
@@ -3700,6 +4079,8 @@ with aba8:
 # ==================================================================================
 with aba9:
     st.subheader("⛽ Lançar Abastecimento")
+    if "abastecimento_editando" not in st.session_state:
+        st.session_state.abastecimento_editando = False
     with conn() as c:
         tipos_combustivel_db = [
             normalizar_tipo_combustivel(r["tipo_combustivel"])
@@ -3878,154 +4259,128 @@ with aba9:
         if not df_abs.empty:
             df_abs["Data_BR"] = pd.to_datetime(df_abs["data_dt"]).dt.strftime('%d/%m/%Y')
             df_abs["Excluir"] = False
-            df_base_abs = df_abs[["id", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit"]].copy()
+            df_base_abs = df_abs[["id", "data", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit"]].copy()
             df_base_abs = df_base_abs.set_index("id")
-            df_editor_abs = df_abs[["id", "Data_BR", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto", "Excluir"]].copy().reset_index(drop=True)
+            df_editor_abs = df_abs[["id", "data_dt", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto", "Excluir"]].copy().reset_index(drop=True)
 
-            # Reaplica mudanças já feitas no data_editor (estado da sessão) para recalcular o total em tempo real.
-            estado_editor = st.session_state.get("editor_abs_v16", {})
-            linhas_editadas = estado_editor.get("edited_rows", {}) if isinstance(estado_editor, dict) else {}
-            for idx_linha, alteracoes in linhas_editadas.items():
-                try:
-                    i = int(idx_linha)
-                except (TypeError, ValueError):
-                    continue
-                if i < 0 or i >= len(df_editor_abs):
-                    continue
-                for campo, valor in alteracoes.items():
-                    if campo in df_editor_abs.columns:
-                        df_editor_abs.at[i, campo] = valor
+            if "abastecimento_id_editando" not in st.session_state:
+                st.session_state.abastecimento_id_editando = None
 
-            df_editor_abs["km_inicial"] = pd.to_numeric(df_editor_abs["km_inicial"], errors="coerce").fillna(0.0)
-            df_editor_abs["qtde_litros"] = pd.to_numeric(df_editor_abs["qtde_litros"], errors="coerce").fillna(0.0)
-            df_editor_abs["valor_unit"] = pd.to_numeric(df_editor_abs["valor_unit"], errors="coerce").fillna(0.0)
-            df_editor_abs["tipo_combustivel"] = df_editor_abs["tipo_combustivel"].apply(normalizar_tipo_combustivel)
-            df_editor_abs["total_gasto"] = (df_editor_abs["qtde_litros"] * df_editor_abs["valor_unit"]).round(2)
-            df_editor_abs["Excluir"] = df_editor_abs["Excluir"].fillna(False).astype(bool)
-            tipos_comb_editor = sorted(
-                set(["DIESEL", "ARLA"] + [t for t in df_editor_abs["tipo_combustivel"].dropna().astype(str).tolist() if t.strip()])
+            df_lista_abs = df_editor_abs.assign(
+                Data_BR=pd.to_datetime(df_editor_abs["data_dt"], errors="coerce").dt.strftime('%d/%m/%Y'),
+                Rotulo=lambda d: (
+                    "ID "
+                    + d["id"].astype(str)
+                    + " | "
+                    + d["Data_BR"].fillna("-")
+                    + " | "
+                    + d["local"].fillna("").astype(str)
+                ),
             )
-            colunas_bloqueadas_abs = ["Data_BR", "total_gasto"]
-            st.caption("Edite diretamente os campos na tabela e clique em `💾 Gravar`. Para excluir, marque a coluna `🗑️` e clique em `🔴 Excluir Selecionados`.")
 
-            with st.form("form_editor_abs_v16"):
-                df_ed = st.data_editor(
-                    df_editor_abs,
-                    column_config={
-                        "id": None,
+            st.dataframe(
+                df_lista_abs[["Data_BR", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto"]].rename(
+                    columns={
                         "Data_BR": "Data",
                         "local": "Local",
                         "doc_nf": "N.NF",
-                        "km_inicial": "Km Incial",
-                        "tipo_combustivel": st.column_config.SelectboxColumn("Tipo Combustível", options=tipos_comb_editor),
+                        "km_inicial": "Km Inicial",
+                        "tipo_combustivel": "Tipo Combustível",
                         "qtde_litros": "Qtde Litros",
-                        "valor_unit": st.column_config.NumberColumn("Valor Unitario", format="R$ %.2f"),
-                        "total_gasto": st.column_config.NumberColumn("Total Gasto", format="R$ %.2f"),
-                        "Excluir": st.column_config.CheckboxColumn("🗑️"),
-                    },
-                    disabled=colunas_bloqueadas_abs,
-                    hide_index=True, use_container_width=True, key="editor_abs_v16"
-                )
+                        "valor_unit": "Valor Unitário",
+                        "total_gasto": "Total Gasto",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-                col_btn_gravar, col_btn_del = st.columns(2)
-                btn_gravar = col_btn_gravar.form_submit_button("💾 Gravar", use_container_width=True, type="primary", key="btn_abastecimento_editor_gravar")
-                btn_excluir_sel = col_btn_del.form_submit_button("🔴 Excluir Selecionados", use_container_width=True)
+            id_para_editar = st.selectbox(
+                "Escolha um abastecimento para editar",
+                options=df_lista_abs["id"].tolist(),
+                format_func=lambda x: df_lista_abs.loc[df_lista_abs["id"] == x, "Rotulo"].iloc[0],
+                key="abs_id_select_editar",
+            )
+            col_abs_ed1, col_abs_ed2 = st.columns(2)
+            if col_abs_ed1.button("✏️ Editar Registro", key="btn_abs_abrir_form_edicao", use_container_width=True):
+                st.session_state.abastecimento_id_editando = int(id_para_editar)
+                st.rerun()
+            if col_abs_ed2.button("❌ Cancelar Edição", key="btn_abs_cancelar_form_edicao", use_container_width=True):
+                st.session_state.abastecimento_id_editando = None
+                st.rerun()
 
-            if btn_gravar:
-                alteracoes = 0
-                erros_validacao = []
-                registros_alterados = []
-                with conn() as c:
-                    for _, row in df_ed.iterrows():
-                        id_abs = int(row["id"])
-                        if id_abs not in df_base_abs.index:
-                            continue
-
-                        try:
-                            km_edit = float(row["km_inicial"])
-                            litros_edit = float(row["qtde_litros"])
-                            valor_edit = float(row["valor_unit"])
-                        except (TypeError, ValueError):
-                            erros_validacao.append(f"ID {id_abs}: valores numéricos inválidos.")
-                            continue
-
-                        if km_edit < 0 or litros_edit < 0 or valor_edit < 0:
-                            erros_validacao.append(f"ID {id_abs}: não é permitido valor negativo.")
-                            continue
-
-                        tipo_edit = normalizar_tipo_combustivel(row["tipo_combustivel"])
-                        if not tipo_edit:
-                            erros_validacao.append(f"ID {id_abs}: informe o tipo de combustível.")
-                            continue
-
-                        antigo = df_base_abs.loc[id_abs]
-                        if (
-                            str(row["local"]).strip() != str(antigo["local"]).strip()
-                            or str(row["doc_nf"]).strip() != str(antigo["doc_nf"]).strip()
-                            or km_edit != float(antigo["km_inicial"])
-                            or tipo_edit != str(antigo["tipo_combustivel"]).strip().upper()
-                            or litros_edit != float(antigo["qtde_litros"])
-                            or valor_edit != float(antigo["valor_unit"])
-                        ):
-                            novo_total = litros_edit * valor_edit
-                            c.execute(
-                                """UPDATE abastecimentos
-                                   SET local=?, doc_nf=?, km_inicial=?, tipo_combustivel=?, qtde_litros=?, valor_unit=?, total_gasto=?
-                                   WHERE id=?""",
-                                (
-                                    str(row["local"]).strip(),
-                                    str(row["doc_nf"]).strip(),
-                                    km_edit,
-                                    tipo_edit,
-                                    litros_edit,
-                                    valor_edit,
-                                    novo_total,
-                                    id_abs,
-                                ),
-                            )
-                            alteracoes += 1
-                            registros_alterados.append(
-                                f"ID {id_abs} | {str(row['local']).strip()} | {tipo_edit} | KM {km_edit:,.0f}".replace(",", ".")
-                            )
-
-                if erros_validacao:
-                    st.warning("Alguns registros não foram salvos: " + " | ".join(erros_validacao[:3]))
-
-                if alteracoes > 0:
-                    alerta_gravado()
-                    st.info("Registros alterados:\n" + "\n".join(registros_alterados[:10]))
+            if st.session_state.abastecimento_id_editando is not None:
+                registro_sel = df_abs[df_abs["id"] == st.session_state.abastecimento_id_editando]
+                if registro_sel.empty:
+                    st.session_state.abastecimento_id_editando = None
+                    st.warning("Registro selecionado não foi encontrado.")
                 else:
-                    st.info("Nenhuma alteração detectada para salvar.")
+                    r = registro_sel.iloc[0]
+                    st.markdown("### ✏️ Editar Abastecimento")
+                    with st.form("form_edicao_abastecimento"):
+                        c1, c2, c3 = st.columns(3)
+                        data_ed = c1.date_input("Data", value=r["data_dt"], format="DD/MM/YYYY")
+                        local_ed = c2.text_input("Local do Abastecimento", value=str(r["local"] or ""))
+                        doc_nf_ed = c3.text_input("Documento / NF", value=str(r["doc_nf"] or ""))
 
-            if btn_excluir_sel:
-                ids_del_set = set()
+                        c4, c5, c6, c7 = st.columns(4)
+                        km_inicial_ed = c4.number_input("KM Inicial", min_value=0.0, value=float(r["km_inicial"] or 0.0), step=1.0)
+                        tipo_cadastrado_ed = c5.selectbox(
+                            "Tipo Cadastrado (opcional)",
+                            options=[""] + tipos_combustivel_sugeridos,
+                            index=0,
+                            placeholder="Selecione um tipo já cadastrado",
+                        )
+                        tipo_comb_ed = c5.text_input(
+                            "Tipo de Combustível",
+                            value=str(r["tipo_combustivel"] or tipo_cadastrado_ed),
+                            help="Você pode escolher um tipo já cadastrado acima ou digitar um novo aqui.",
+                        ).strip()
+                        qtde_litros_ed = c6.number_input("Qtde Litros", min_value=0.0, value=float(r["qtde_litros"] or 0.0), step=1.0)
+                        valor_unit_ed = c7.number_input("Valor Unitário (R$)", min_value=0.0, value=float(r["valor_unit"] or 0.0), step=0.01)
 
-                # 1) IDs vindos do DataFrame retornado pelo editor
-                try:
-                    ids_del_df = df_ed.loc[df_ed["Excluir"] == True, "id"].tolist()
-                    ids_del_set.update(int(i) for i in ids_del_df)
-                except Exception:
-                    pass
+                        total_gasto_ed = qtde_litros_ed * valor_unit_ed
+                        st.caption(f"Total calculado: {brl(total_gasto_ed)}")
 
-                # 2) IDs vindos do estado interno do data_editor (mais confiável em alguns ciclos)
-                estado_editor_del = st.session_state.get("editor_abs_v16", {})
-                linhas_editadas_del = estado_editor_del.get("edited_rows", {}) if isinstance(estado_editor_del, dict) else {}
-                for idx_linha, alteracoes in linhas_editadas_del.items():
-                    if isinstance(alteracoes, dict) and alteracoes.get("Excluir") is True:
-                        try:
-                            i = int(idx_linha)
-                            if 0 <= i < len(df_editor_abs):
-                                ids_del_set.add(int(df_editor_abs.iloc[i]["id"]))
-                        except (TypeError, ValueError):
-                            continue
+                        a1, a2 = st.columns(2)
+                        btn_atualizar = a1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
+                        btn_excluir = a2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
 
-                ids_del = sorted(ids_del_set)
-                if ids_del:
-                    with conn() as c:
-                        c.executemany("DELETE FROM abastecimentos WHERE id=?", [(i,) for i in ids_del])
-                    st.rerun()
-                else:
-                    st.warning("Marque pelo menos um registro na coluna Excluir.")
+                    if btn_atualizar:
+                        if not local_ed.strip():
+                            st.warning("Informe o local do abastecimento para atualizar o registro.")
+                        elif not normalizar_tipo_combustivel(tipo_comb_ed):
+                            st.warning("Informe o tipo de combustível para atualizar o registro.")
+                        elif qtde_litros_ed <= 0 or valor_unit_ed <= 0:
+                            st.warning("Informe quantidade de litros e valor unitário maiores que zero.")
+                        else:
+                            with conn() as c:
+                                c.execute(
+                                    """UPDATE abastecimentos
+                                       SET data=?, local=?, doc_nf=?, km_inicial=?, tipo_combustivel=?, qtde_litros=?, valor_unit=?, total_gasto=?
+                                       WHERE id=?""",
+                                    (
+                                        data_ed.isoformat(),
+                                        local_ed.strip(),
+                                        doc_nf_ed.strip(),
+                                        km_inicial_ed,
+                                        normalizar_tipo_combustivel(tipo_comb_ed),
+                                        qtde_litros_ed,
+                                        valor_unit_ed,
+                                        total_gasto_ed,
+                                        int(st.session_state.abastecimento_id_editando),
+                                    ),
+                                )
+                            alerta_gravado("✅ Abastecimento atualizado com sucesso!")
+                            st.session_state.abastecimento_id_editando = None
+                            st.rerun()
+
+                    if btn_excluir:
+                        with conn() as c:
+                            c.execute("DELETE FROM abastecimentos WHERE id=?", (int(st.session_state.abastecimento_id_editando),))
+                        alerta_gravado("✅ Abastecimento excluído com sucesso!")
+                        st.session_state.abastecimento_id_editando = None
+                        st.rerun()
     else:
         st.info("Sem abastecimentos no período filtrado.")
 
@@ -4133,9 +4488,10 @@ with aba10:
         qtd_imposto = pd.to_numeric(df_db.get("qtd_viagens", 1), errors="coerce").fillna(1.0)
         qtd_imposto = qtd_imposto.apply(lambda x: max(1, int(round(float(x)))))
         pagto_estadia_imposto = pd.to_numeric(df_db.get("pagto_estadia", 0.0), errors="coerce").fillna(0.0)
+        adicional_frete_imposto = pd.to_numeric(df_db.get("valor_adicional_frete", 0.0), errors="coerce").fillna(0.0)
         total_frete_base_imposto = float(
             (
-                (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_imposto)
+                (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_imposto + adicional_frete_imposto)
                 * qtd_imposto
             ).sum()
         )
@@ -4464,9 +4820,10 @@ with aba11:
         else:
             qtd_meta = pd.Series(1, index=df_db.index, dtype=int)
         pagto_estadia_meta = pd.to_numeric(df_db.get("pagto_estadia", 0.0), errors="coerce").fillna(0.0)
+        adicional_frete_meta = pd.to_numeric(df_db.get("valor_adicional_frete", 0.0), errors="coerce").fillna(0.0)
         fat_at = float(
             (
-                (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_meta)
+                (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_meta + adicional_frete_meta)
                 * qtd_meta
             ).sum()
         )
@@ -4487,19 +4844,21 @@ with aba12:
     st.subheader("🚚 Veículos")
     if "veiculo_editando" not in st.session_state:
         st.session_state.veiculo_editando = False
-    with st.form("f_v"):
-        c1, c2 = st.columns(2)
-        d_v, m_v, a_v = c1.text_input("Desc"), c1.text_input("Modelo"), c1.text_input("Ano")
-        co_v, pl_v, re_v = c2.text_input("Cor"), c2.text_input("Placa").upper(), c2.text_input("Renavan")
-        ob_v = st.text_area("Observação")
-        if st.form_submit_button("💾 Gravar", key="btn_veiculo_gravar"):
-            with conn() as c:
-                c.execute(
-                    "INSERT OR REPLACE INTO veiculos (descricao, modelo, ano, cor, placa, renavan, observacao) VALUES (?,?,?,?,?,?,?)",
-                    (d_v, m_v, a_v, co_v, pl_v, re_v, ob_v),
-                )
-            alerta_gravado()
-            st.rerun()
+    with st.expander("➕ Cadastro de Veículo", expanded=False):
+        with st.form("f_v"):
+            c1, c2 = st.columns(2)
+            d_v, m_v, a_v = c1.text_input("Desc"), c1.text_input("Modelo"), c1.text_input("Ano")
+            co_v, pl_v, re_v = c2.text_input("Cor"), c2.text_input("Placa").upper(), c2.text_input("Renavan")
+            qtd_eixo_v = c2.number_input("Quantidade Eixo", min_value=0, step=1, value=0)
+            ob_v = st.text_area("Observação")
+            if st.form_submit_button("💾 Gravar", key="btn_veiculo_gravar"):
+                with conn() as c:
+                    c.execute(
+                        "INSERT OR REPLACE INTO veiculos (descricao, modelo, ano, cor, placa, renavan, observacao, quantidade_eixo) VALUES (?,?,?,?,?,?,?,?)",
+                        (d_v, m_v, a_v, co_v, pl_v, re_v, ob_v, int(qtd_eixo_v)),
+                    )
+                alerta_gravado()
+                st.rerun()
     with conn() as c:
         df_veic = pd.read_sql("SELECT * FROM veiculos ORDER BY descricao ASC", c)
     st.dataframe(df_veic, use_container_width=True, hide_index=True)
@@ -4523,9 +4882,19 @@ with aba12:
                 for _, r in df_veic_ed.iterrows():
                     c.execute(
                         """UPDATE veiculos
-                           SET descricao=?, modelo=?, ano=?, cor=?, placa=?, renavan=?, observacao=?
+                           SET descricao=?, modelo=?, ano=?, cor=?, placa=?, renavan=?, observacao=?, quantidade_eixo=?
                            WHERE id=?""",
-                        (r["descricao"], r["modelo"], r["ano"], r["cor"], r["placa"], r["renavan"], r["observacao"], int(r["id"])),
+                        (
+                            r["descricao"],
+                            r["modelo"],
+                            r["ano"],
+                            r["cor"],
+                            r["placa"],
+                            r["renavan"],
+                            r["observacao"],
+                            int(pd.to_numeric(r["quantidade_eixo"], errors="coerce")) if pd.notna(pd.to_numeric(r["quantidade_eixo"], errors="coerce")) else 0,
+                            int(r["id"]),
+                        ),
                     )
             alerta_gravado()
             st.session_state.veiculo_editando = False
@@ -4689,7 +5058,7 @@ with aba14:
 
     with conn() as c:
         df_viagens_liq = pd.read_sql(
-            """SELECT data, origem, destino, veiculo_placa, km, toneladas, valor_ton, valor_km, tipo_cobranca, qtd_viagens, pedagio, gasto_extra, pagto_estadia, diesel, consumo
+            """SELECT data, origem, destino, veiculo_placa, km, toneladas, valor_ton, valor_km, tipo_cobranca, qtd_viagens, pedagio, gasto_extra, pagto_estadia, valor_adicional_frete, diesel, consumo
                FROM viagens
                WHERE date(data) BETWEEN ? AND ?""",
             c,
@@ -4735,6 +5104,8 @@ with aba14:
             df_viagens_liq["pedagio"] = 0.0
         if "pagto_estadia" not in df_viagens_liq.columns:
             df_viagens_liq["pagto_estadia"] = 0.0
+        if "valor_adicional_frete" not in df_viagens_liq.columns:
+            df_viagens_liq["valor_adicional_frete"] = 0.0
         if "diesel" not in df_viagens_liq.columns:
             df_viagens_liq["diesel"] = 0.0
         if "consumo" not in df_viagens_liq.columns:
@@ -4745,6 +5116,7 @@ with aba14:
         df_viagens_liq["pedagio"] = pd.to_numeric(df_viagens_liq["pedagio"], errors="coerce").fillna(0.0)
         df_viagens_liq["gasto_extra"] = pd.to_numeric(df_viagens_liq["gasto_extra"], errors="coerce").fillna(0.0)
         df_viagens_liq["pagto_estadia"] = pd.to_numeric(df_viagens_liq["pagto_estadia"], errors="coerce").fillna(0.0)
+        df_viagens_liq["valor_adicional_frete"] = pd.to_numeric(df_viagens_liq["valor_adicional_frete"], errors="coerce").fillna(0.0)
         df_viagens_liq["diesel"] = pd.to_numeric(df_viagens_liq["diesel"], errors="coerce").fillna(0.0)
         df_viagens_liq["consumo"] = pd.to_numeric(df_viagens_liq["consumo"], errors="coerce").fillna(0.0)
         origem_norm_liq = df_viagens_liq["origem"].fillna("").astype(str).str.strip().str.upper()
@@ -4765,6 +5137,7 @@ with aba14:
         df_viagens_liq["pedagio_total"] = df_viagens_liq["pedagio"] * df_viagens_liq["qtd_viagens"]
         df_viagens_liq["gasto_extra_total"] = df_viagens_liq["gasto_extra"] * df_viagens_liq["qtd_viagens"]
         df_viagens_liq["pagto_estadia_total"] = df_viagens_liq["pagto_estadia"] * df_viagens_liq["qtd_viagens"]
+        df_viagens_liq["valor_adicional_frete_total"] = df_viagens_liq["valor_adicional_frete"] * df_viagens_liq["qtd_viagens"]
         consumo_valido_liq = df_viagens_liq["consumo"] > 0
         df_viagens_liq["litros_diesel_total"] = 0.0
         df_viagens_liq.loc[consumo_valido_liq, "litros_diesel_total"] = (
@@ -4772,7 +5145,7 @@ with aba14:
         )
         df_viagens_liq["valor_diesel_total"] = df_viagens_liq["litros_diesel_total"] * df_viagens_liq["diesel"]
     else:
-        df_viagens_liq = pd.DataFrame(columns=["km", "qtd_viagens", "total_frete", "pedagio", "gasto_extra", "pagto_estadia", "km_total", "pedagio_total", "gasto_extra_total", "pagto_estadia_total", "litros_diesel_total", "valor_diesel_total"])
+        df_viagens_liq = pd.DataFrame(columns=["km", "qtd_viagens", "total_frete", "pedagio", "gasto_extra", "pagto_estadia", "valor_adicional_frete", "km_total", "pedagio_total", "gasto_extra_total", "pagto_estadia_total", "valor_adicional_frete_total", "litros_diesel_total", "valor_diesel_total"])
 
     if not df_abs_periodo.empty:
         df_abs_periodo["tipo_combustivel"] = df_abs_periodo["tipo_combustivel"].apply(normalizar_tipo_combustivel)
@@ -4801,7 +5174,8 @@ with aba14:
     valor_total_pedagio = float(df_viagens_liq["pedagio_total"].sum()) if not df_viagens_liq.empty else 0.0
     valor_total_gasto_extra = float(df_viagens_liq["gasto_extra_total"].sum()) if not df_viagens_liq.empty else 0.0
     valor_total_pagto_estadia = float(df_viagens_liq["pagto_estadia_total"].sum()) if not df_viagens_liq.empty else 0.0
-    valor_total_viagem += valor_total_pagto_estadia
+    valor_total_adicional_frete = float(df_viagens_liq["valor_adicional_frete_total"].sum()) if not df_viagens_liq.empty else 0.0
+    valor_total_viagem += (valor_total_pagto_estadia + valor_total_adicional_frete)
     valor_total_viagem += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
     valor_pago_por_viagem = (valor_total_viagem / qtde_viagem) if qtde_viagem > 0 else 0.0
     km_total = float(df_viagens_liq["km_total"].sum()) if not df_viagens_liq.empty else 0.0
@@ -4850,12 +5224,16 @@ with aba14:
 
     if not df_viagens_liq.empty:
         df_viagens_liq = aplicar_parametros_por_data(df_viagens_liq, col_data="data")
-        df_viagens_liq["receita_viagem"] = (
+        df_viagens_liq["receita_comissionavel_viagem"] = (
             pd.to_numeric(df_viagens_liq["total_frete"], errors="coerce").fillna(0.0)
             + pd.to_numeric(df_viagens_liq["pagto_estadia_total"], errors="coerce").fillna(0.0)
         )
+        df_viagens_liq["receita_viagem"] = (
+            df_viagens_liq["receita_comissionavel_viagem"]
+            + pd.to_numeric(df_viagens_liq["valor_adicional_frete_total"], errors="coerce").fillna(0.0)
+        )
         valor_motorista_viagens = float(
-            (df_viagens_liq["receita_viagem"] * (pd.to_numeric(df_viagens_liq["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
+            (df_viagens_liq["receita_comissionavel_viagem"] * (pd.to_numeric(df_viagens_liq["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
         )
         valor_imposto_viagens = float(
             (df_viagens_liq["receita_viagem"] * (pd.to_numeric(df_viagens_liq["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
@@ -5042,41 +5420,43 @@ with aba15:
     st.subheader("🏭 Cadastro de Fornecedores")
     if "fornecedor_editando" not in st.session_state:
         st.session_state.fornecedor_editando = False
-    with st.form("form_fornecedor", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        cod_forn = c1.text_input("Código Fornecedor").strip().upper()
-        nome_forn = c2.text_input("Nome do Fornecedor").strip()
-        cnpj_forn = c3.text_input("CNPJ").strip()
+    with st.expander("➕ Cadastro de Fornecedor", expanded=False):
+        with st.form("form_fornecedor", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            cod_forn = c1.text_input("Código Fornecedor").strip().upper()
+            nome_forn = c2.text_input("Nome do Fornecedor").strip()
+            cnpj_forn = c3.text_input("CNPJ").strip()
 
-        c4, c5, c6 = st.columns(3)
-        ie_forn = c4.text_input("Insc. Est.").strip()
-        end_forn = c5.text_input("Endereço").strip()
-        cidade_forn = c6.text_input("Cidade").strip()
+            c4, c5, c6 = st.columns(3)
+            ie_forn = c4.text_input("Insc. Est.").strip()
+            end_forn = c5.text_input("Endereço").strip()
+            cidade_forn = c6.text_input("Cidade").strip()
 
-        c7, c8, c9 = st.columns(3)
-        bairro_forn = c7.text_input("Bairro").strip()
-        cep_forn = c8.text_input("CEP").strip()
-        tel_forn = c9.text_input("Telefone").strip()
+            c7, c8, c9, c10 = st.columns(4)
+            bairro_forn = c7.text_input("Bairro").strip()
+            cep_forn = c8.text_input("CEP").strip()
+            tel_forn = c9.text_input("Telefone").strip()
+            pix_forn = c10.text_input("PIX").strip()
 
-        if st.form_submit_button("💾 Gravar", type="primary", key="btn_fornecedor_gravar"):
-            if not cod_forn or not nome_forn:
-                st.warning("Informe Código Fornecedor e Nome do Fornecedor.")
-            else:
-                try:
-                    with conn() as c:
-                        c.execute(
-                            """INSERT INTO fornecedores
-                               (codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (cod_forn, nome_forn, cnpj_forn, ie_forn, end_forn, cidade_forn, bairro_forn, cep_forn, tel_forn),
-                        )
-                    alerta_gravado()
-                    st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("Código Fornecedor já cadastrado.")
+            if st.form_submit_button("💾 Gravar", type="primary", key="btn_fornecedor_gravar"):
+                if not cod_forn or not nome_forn:
+                    st.warning("Informe Código Fornecedor e Nome do Fornecedor.")
+                else:
+                    try:
+                        with conn() as c:
+                            c.execute(
+                                """INSERT INTO fornecedores
+                                   (codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone, pix)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (cod_forn, nome_forn, cnpj_forn, ie_forn, end_forn, cidade_forn, bairro_forn, cep_forn, tel_forn, pix_forn),
+                            )
+                        alerta_gravado()
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Código Fornecedor já cadastrado.")
 
     with conn() as c:
-        df_forn = pd.read_sql("SELECT codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone FROM fornecedores ORDER BY nome ASC", c)
+        df_forn = pd.read_sql("SELECT codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone, pix FROM fornecedores ORDER BY nome ASC", c)
     st.dataframe(df_forn, use_container_width=True, hide_index=True)
     c_fed1, c_fed2 = st.columns(2)
     if c_fed1.button("✏️ Editar", key="btn_fornecedor_editar", use_container_width=True, disabled=st.session_state.fornecedor_editando):
@@ -5087,16 +5467,16 @@ with aba15:
         st.rerun()
     if st.session_state.fornecedor_editando and not df_forn.empty:
         with conn() as c:
-            df_forn_ed = pd.read_sql("SELECT id, codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone FROM fornecedores ORDER BY nome ASC", c)
+            df_forn_ed = pd.read_sql("SELECT id, codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone, pix FROM fornecedores ORDER BY nome ASC", c)
         df_forn_ed2 = st.data_editor(df_forn_ed, key="editor_fornecedores_cad", hide_index=True, use_container_width=True, column_config={"id": None})
         if st.button("💾 Gravar", key="btn_fornecedor_gravar_edicao", type="primary", use_container_width=True):
             with conn() as c:
                 for _, r in df_forn_ed2.iterrows():
                     c.execute(
                         """UPDATE fornecedores
-                           SET codigo=?, nome=?, cnpj=?, insc_est=?, endereco=?, cidade=?, bairro=?, cep=?, telefone=?
+                           SET codigo=?, nome=?, cnpj=?, insc_est=?, endereco=?, cidade=?, bairro=?, cep=?, telefone=?, pix=?
                            WHERE id=?""",
-                        (r["codigo"], r["nome"], r["cnpj"], r["insc_est"], r["endereco"], r["cidade"], r["bairro"], r["cep"], r["telefone"], int(r["id"])),
+                        (r["codigo"], r["nome"], r["cnpj"], r["insc_est"], r["endereco"], r["cidade"], r["bairro"], r["cep"], r["telefone"], r["pix"], int(r["id"])),
                     )
             alerta_gravado()
             st.session_state.fornecedor_editando = False
@@ -5179,116 +5559,117 @@ with aba19:
         st.session_state["cmp_consumo_003"] = consumo_003_padrao
         st.session_state["cmp_custo_escritorio"] = custo_escritorio_padrao
 
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    c1.metric("Total KM Mensal (Histórico)", format_br(total_km_mensal, casas_decimais=0))
-    with c2:
-        if st.button("✏️ Editar", use_container_width=True, disabled=st.session_state.cmp_editando):
-            st.session_state.cmp_editando = True
-            st.rerun()
-    with c3:
-        if st.button("💾 Gravar", use_container_width=True, type="primary", disabled=not st.session_state.cmp_editando, key="btn_cmp_gravar"):
-            novo_valor_litro = float(st.session_state.get("cmp_valor_litro_diesel", valor_litro_padrao))
-            novo_consumo_001 = float(st.session_state.get("cmp_consumo_001", consumo_001_padrao))
-            novo_consumo_002 = float(st.session_state.get("cmp_consumo_002", consumo_002_padrao))
-            novo_consumo_003 = float(st.session_state.get("cmp_consumo_003", consumo_003_padrao))
-            novo_custo_escritorio = float(st.session_state.get("cmp_custo_escritorio", custo_escritorio_padrao))
+    with st.expander("➕ Configuração do Comparativo", expanded=False):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        c1.metric("Total KM Mensal (Histórico)", format_br(total_km_mensal, casas_decimais=0))
+        with c2:
+            if st.button("✏️ Editar", use_container_width=True, disabled=st.session_state.cmp_editando):
+                st.session_state.cmp_editando = True
+                st.rerun()
+        with c3:
+            if st.button("💾 Gravar", use_container_width=True, type="primary", disabled=not st.session_state.cmp_editando, key="btn_cmp_gravar"):
+                novo_valor_litro = float(st.session_state.get("cmp_valor_litro_diesel", valor_litro_padrao))
+                novo_consumo_001 = float(st.session_state.get("cmp_consumo_001", consumo_001_padrao))
+                novo_consumo_002 = float(st.session_state.get("cmp_consumo_002", consumo_002_padrao))
+                novo_consumo_003 = float(st.session_state.get("cmp_consumo_003", consumo_003_padrao))
+                novo_custo_escritorio = float(st.session_state.get("cmp_custo_escritorio", custo_escritorio_padrao))
 
-            if st.session_state.simulacao_ativa:
-                if not st.session_state.p_simulado:
+                if st.session_state.simulacao_ativa:
+                    if not st.session_state.p_simulado:
+                        with conn() as c:
+                            p_base = dict(c.execute("SELECT * FROM parametros WHERE id=1").fetchone())
+                        st.session_state.p_simulado = p_base
+                    st.session_state.p_simulado["cmp_valor_litro_diesel"] = novo_valor_litro
+                    st.session_state.p_simulado["cmp_consumo_001"] = novo_consumo_001
+                    st.session_state.p_simulado["cmp_consumo_002"] = novo_consumo_002
+                    st.session_state.p_simulado["cmp_consumo_003"] = novo_consumo_003
+                    st.session_state.p_simulado["cmp_custo_escritorio"] = novo_custo_escritorio
+                    alerta_gravado()
+                else:
                     with conn() as c:
-                        p_base = dict(c.execute("SELECT * FROM parametros WHERE id=1").fetchone())
-                    st.session_state.p_simulado = p_base
-                st.session_state.p_simulado["cmp_valor_litro_diesel"] = novo_valor_litro
-                st.session_state.p_simulado["cmp_consumo_001"] = novo_consumo_001
-                st.session_state.p_simulado["cmp_consumo_002"] = novo_consumo_002
-                st.session_state.p_simulado["cmp_consumo_003"] = novo_consumo_003
-                st.session_state.p_simulado["cmp_custo_escritorio"] = novo_custo_escritorio
-                alerta_gravado()
-            else:
-                with conn() as c:
-                    c.execute(
-                        """UPDATE parametros
-                           SET cmp_valor_litro_diesel=?, cmp_consumo_001=?, cmp_consumo_002=?, cmp_consumo_003=?, cmp_custo_escritorio=?
-                           WHERE id=1""",
-                        (novo_valor_litro, novo_consumo_001, novo_consumo_002, novo_consumo_003, novo_custo_escritorio),
-                    )
-                    p_hist_base = c.execute(
-                        """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro, financiamento,
-                                  pagto_ipva, imposto_pct, valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
-                           FROM parametros WHERE id=1"""
-                    ).fetchone()
-                    data_vigencia_cmp = str(p.get("data_filtro_ini", date.today().isoformat()) or date.today().isoformat())
-                    c.execute(
-                        """INSERT INTO parametros_historico (
-                               vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                               seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
-                               qtde_pneu, vl_gasto_pneu_km
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                           ON CONFLICT(vigencia_data) DO UPDATE SET
-                               cmp_custo_escritorio=excluded.cmp_custo_escritorio""",
-                        (
-                            data_vigencia_cmp,
-                            float(p_hist_base["consumo"] or 0.0),
-                            float(p_hist_base["manut"] or 0.0),
-                            float(p_hist_base["pneu"] or 0.0),
-                            float(p_hist_base["depre"] or 0.0),
-                            float(p_hist_base["motora_fixo"] or 0.0),
-                            float(p_hist_base["motora_pct"] or 0.0),
-                            float(p_hist_base["seguro"] or 0.0),
-                            float(p_hist_base["financiamento"] or 0.0),
-                            float(p_hist_base["pagto_ipva"] or 0.0),
-                            float(novo_custo_escritorio or 0.0),
-                            float(p_hist_base["imposto_pct"] or 0.0),
-                            float(p_hist_base["valor_frete_mensal_fixo"] or 0.0),
-                            float(p_hist_base["qtde_pneu"] or 0.0),
-                            float(p_hist_base["vl_gasto_pneu_km"] or 0.0),
-                        ),
-                    )
-                alerta_gravado()
+                        c.execute(
+                            """UPDATE parametros
+                               SET cmp_valor_litro_diesel=?, cmp_consumo_001=?, cmp_consumo_002=?, cmp_consumo_003=?, cmp_custo_escritorio=?
+                               WHERE id=1""",
+                            (novo_valor_litro, novo_consumo_001, novo_consumo_002, novo_consumo_003, novo_custo_escritorio),
+                        )
+                        p_hist_base = c.execute(
+                            """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro, financiamento,
+                                      pagto_ipva, imposto_pct, valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
+                               FROM parametros WHERE id=1"""
+                        ).fetchone()
+                        data_vigencia_cmp = str(p.get("data_filtro_ini", date.today().isoformat()) or date.today().isoformat())
+                        c.execute(
+                            """INSERT INTO parametros_historico (
+                                   vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                                   seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                                   qtde_pneu, vl_gasto_pneu_km
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ON CONFLICT(vigencia_data) DO UPDATE SET
+                                   cmp_custo_escritorio=excluded.cmp_custo_escritorio""",
+                            (
+                                data_vigencia_cmp,
+                                float(p_hist_base["consumo"] or 0.0),
+                                float(p_hist_base["manut"] or 0.0),
+                                float(p_hist_base["pneu"] or 0.0),
+                                float(p_hist_base["depre"] or 0.0),
+                                float(p_hist_base["motora_fixo"] or 0.0),
+                                float(p_hist_base["motora_pct"] or 0.0),
+                                float(p_hist_base["seguro"] or 0.0),
+                                float(p_hist_base["financiamento"] or 0.0),
+                                float(p_hist_base["pagto_ipva"] or 0.0),
+                                float(novo_custo_escritorio or 0.0),
+                                float(p_hist_base["imposto_pct"] or 0.0),
+                                float(p_hist_base["valor_frete_mensal_fixo"] or 0.0),
+                                float(p_hist_base["qtde_pneu"] or 0.0),
+                                float(p_hist_base["vl_gasto_pneu_km"] or 0.0),
+                            ),
+                        )
+                    alerta_gravado()
 
-            st.session_state.cmp_editando = False
-            st.rerun()
-    with c4:
-        st.write("")
+                st.session_state.cmp_editando = False
+                st.rerun()
+        with c4:
+            st.write("")
 
-    valor_litro_diesel = st.number_input(
-        "Valor Litro Diesel (R$)",
-        min_value=0.0,
-        step=0.01,
-        key="cmp_valor_litro_diesel",
-        disabled=not st.session_state.cmp_editando,
-    )
-    custo_escritorio = st.number_input(
-        "Custo Escritório (R$)",
-        min_value=0.0,
-        step=10.0,
-        key="cmp_custo_escritorio",
-        disabled=not st.session_state.cmp_editando,
-    )
+        valor_litro_diesel = st.number_input(
+            "Valor Litro Diesel (R$)",
+            min_value=0.0,
+            step=0.01,
+            key="cmp_valor_litro_diesel",
+            disabled=not st.session_state.cmp_editando,
+        )
+        custo_escritorio = st.number_input(
+            "Custo Escritório (R$)",
+            min_value=0.0,
+            step=10.0,
+            key="cmp_custo_escritorio",
+            disabled=not st.session_state.cmp_editando,
+        )
 
-    st.markdown("#### Consumo por KM/L")
-    p1, p2, p3 = st.columns(3)
-    consumo_001 = p1.number_input(
-        "Consumo por KM 001",
-        min_value=0.0,
-        step=0.01,
-        key="cmp_consumo_001",
-        disabled=not st.session_state.cmp_editando,
-    )
-    consumo_002 = p2.number_input(
-        "Consumo por KM 002",
-        min_value=0.0,
-        step=0.01,
-        key="cmp_consumo_002",
-        disabled=not st.session_state.cmp_editando,
-    )
-    consumo_003 = p3.number_input(
-        "Consumo por KM 003",
-        min_value=0.0,
-        step=0.01,
-        key="cmp_consumo_003",
-        disabled=not st.session_state.cmp_editando,
-    )
+        st.markdown("#### Consumo por KM/L")
+        p1, p2, p3 = st.columns(3)
+        consumo_001 = p1.number_input(
+            "Consumo por KM 001",
+            min_value=0.0,
+            step=0.01,
+            key="cmp_consumo_001",
+            disabled=not st.session_state.cmp_editando,
+        )
+        consumo_002 = p2.number_input(
+            "Consumo por KM 002",
+            min_value=0.0,
+            step=0.01,
+            key="cmp_consumo_002",
+            disabled=not st.session_state.cmp_editando,
+        )
+        consumo_003 = p3.number_input(
+            "Consumo por KM 003",
+            min_value=0.0,
+            step=0.01,
+            key="cmp_consumo_003",
+            disabled=not st.session_state.cmp_editando,
+        )
 
     comparativos = [
         ("Consumo 001", float(consumo_001)),
@@ -5362,6 +5743,391 @@ with aba19:
             st.caption("A economia é estimada com base no KM total do período filtrado, no valor do litro e no custo de escritório informado.")
 
 # =========================
+# ABA 21 - PRAÇA PEDÁGIO
+# =========================
+with aba21:
+    st.subheader("🛣️ Praça Pedágio")
+    with conn() as c:
+        df_rotas_pp = pd.read_sql(
+            """SELECT origem, destino
+               FROM rotas
+               ORDER BY origem ASC, destino ASC""",
+            c,
+        )
+    opcoes_rotas_pp = []
+    if not df_rotas_pp.empty:
+        opcoes_rotas_pp = (
+            df_rotas_pp["origem"].fillna("").astype(str).str.strip()
+            + " → "
+            + df_rotas_pp["destino"].fillna("").astype(str).str.strip()
+        ).tolist()
+        opcoes_rotas_pp = [r for r in opcoes_rotas_pp if r != " → "]
+        opcoes_rotas_pp = sorted(list(dict.fromkeys(opcoes_rotas_pp)))
+    else:
+        st.info("Cadastre rotas na aba '🛣️ KM Rotas' para selecionar aqui.")
+
+    with st.expander("➕ Cadastro de Praça Pedágio", expanded=False):
+        with st.form("f_praca_pedagio", clear_on_submit=True):
+            pp1, pp2 = st.columns(2)
+            rota_pp = pp1.selectbox(
+                "Rota",
+                options=opcoes_rotas_pp,
+                index=None,
+                placeholder="Selecione a rota do pré-cadastro",
+                key="praca_pedagio_rota",
+            )
+            praca_pp = pp2.text_input("Praça de pedágio")
+            pp3, pp4 = st.columns(2)
+            rodovia_pp = pp3.text_input("Rodovia")
+            concessionaria_pp = pp4.text_input("Concessionária")
+            sentido_viagem_pp = st.text_input("Sentido Viagem")
+            pp5, pp6, pp7 = st.columns(3)
+            quantidade_eixos_pp = pp5.number_input("Quantidade Eixos", min_value=1.0, step=1.0, value=1.0, format="%.0f")
+            valor_eixo_pp = pp6.number_input("Valor por Eixo", min_value=0.0, step=0.000001, format="%.6f")
+            valor_todos_eixos_pp = float(quantidade_eixos_pp) * float(valor_eixo_pp)
+            pp7.number_input("Valor Todos os Eixos", min_value=0.0, step=0.01, format="%.2f", value=float(valor_todos_eixos_pp), disabled=True)
+
+            if st.form_submit_button("💾 Gravar", key="btn_praca_pedagio_gravar"):
+                if not str(rota_pp or "").strip():
+                    st.warning("Selecione a rota no pré-cadastro.")
+                elif not str(praca_pp or "").strip():
+                    st.warning("Informe a praça de pedágio.")
+                else:
+                    with conn() as c:
+                        c.execute(
+                            """INSERT INTO praca_pedagio (rota, praca_pedagio, rodovia, concessionaria, sentido_viagem, quantidade_eixos, valor_por_eixo, valor_todos_eixos)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                str(rota_pp).strip(),
+                                str(praca_pp).strip(),
+                                str(rodovia_pp or "").strip(),
+                                str(concessionaria_pp or "").strip(),
+                                str(sentido_viagem_pp or "").strip(),
+                                float(quantidade_eixos_pp or 1.0),
+                                float(valor_eixo_pp or 0.0),
+                                float(valor_todos_eixos_pp or 0.0),
+                            ),
+                        )
+                    alerta_gravado()
+                    st.rerun()
+
+    with conn() as c:
+        df_praca_pedagio = pd.read_sql(
+            """SELECT id, rota, praca_pedagio, rodovia, concessionaria, sentido_viagem, quantidade_eixos, valor_por_eixo, valor_todos_eixos
+               FROM praca_pedagio
+               ORDER BY rota ASC, praca_pedagio ASC, id DESC""",
+            c,
+        )
+    opcoes_filtro_rota_pp = sorted(df_praca_pedagio["rota"].dropna().astype(str).str.strip().unique().tolist()) if not df_praca_pedagio.empty else []
+    opcoes_filtro_sentido_pp = sorted(df_praca_pedagio["sentido_viagem"].dropna().astype(str).str.strip().unique().tolist()) if not df_praca_pedagio.empty else []
+    rota_filtro_pendente_pp = st.session_state.pop("praca_pedagio_filtro_rota_pendente", None)
+    if (
+        rota_filtro_pendente_pp
+        and opcoes_filtro_rota_pp
+        and str(rota_filtro_pendente_pp).strip() in opcoes_filtro_rota_pp
+    ):
+        st.session_state["praca_pedagio_filtro_rota"] = str(rota_filtro_pendente_pp).strip()
+    ff1, ff2 = st.columns(2)
+    rota_filtro_pp = ff1.selectbox(
+        "Filtrar por Rota",
+        options=opcoes_filtro_rota_pp,
+        index=None,
+        placeholder="Selecione uma rota para filtrar",
+        key="praca_pedagio_filtro_rota",
+    )
+    sentido_filtro_pp = ff2.selectbox(
+        "Filtrar por Sentido Viagem",
+        options=opcoes_filtro_sentido_pp,
+        index=None,
+        placeholder="Selecione o sentido",
+        key="praca_pedagio_filtro_sentido",
+    )
+    df_praca_pedagio_exibir = df_praca_pedagio.copy()
+    if rota_filtro_pp:
+        df_praca_pedagio_exibir = df_praca_pedagio_exibir[
+            df_praca_pedagio_exibir["rota"].astype(str).str.strip() == str(rota_filtro_pp).strip()
+        ]
+    if sentido_filtro_pp:
+        df_praca_pedagio_exibir = df_praca_pedagio_exibir[
+            df_praca_pedagio_exibir["sentido_viagem"].astype(str).str.strip() == str(sentido_filtro_pp).strip()
+        ]
+
+    valores_pp = pd.to_numeric(df_praca_pedagio_exibir.get("valor_todos_eixos", 0.0), errors="coerce").fillna(0.0)
+    total_pedagio_rota = float(valores_pp.sum())
+    label_total_pedagio = "Valor Total Pedágio por Rota" if rota_filtro_pp else "Valor Total Pedágio (Todas as Rotas)"
+
+    df_sentido_metricas = df_praca_pedagio_exibir.copy()
+    df_sentido_metricas["sentido_norm"] = (
+        df_sentido_metricas["sentido_viagem"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+    df_sentido_metricas["valor_todos_eixos"] = pd.to_numeric(
+        df_sentido_metricas["valor_todos_eixos"], errors="coerce"
+    ).fillna(0.0)
+
+    total_ida = float(
+        df_sentido_metricas.loc[
+            df_sentido_metricas["sentido_norm"] == "IDA", "valor_todos_eixos"
+        ].sum()
+    )
+    total_volta = float(
+        df_sentido_metricas.loc[
+            df_sentido_metricas["sentido_norm"] == "VOLTA", "valor_todos_eixos"
+        ].sum()
+    )
+    qtd_pedagios_ida = int((df_sentido_metricas["sentido_norm"] == "IDA").sum())
+    qtd_pedagios_volta = int((df_sentido_metricas["sentido_norm"] == "VOLTA").sum())
+    qtd_pedagios_checar = int((df_sentido_metricas["sentido_norm"] == "CHECAR").sum())
+    total_checar = float(
+        df_sentido_metricas.loc[
+            df_sentido_metricas["sentido_norm"] == "CHECAR", "valor_todos_eixos"
+        ].sum()
+    )
+    qtd_pedagios_total = int(len(df_sentido_metricas))
+
+    exibir_checar_metricas = qtd_pedagios_checar > 0
+    if exibir_checar_metricas:
+        mpp1, mpp2, mpp3, mpp4, mpp5, mpp6, mpp7, mpp8 = st.columns(8)
+    else:
+        mpp1, mpp2, mpp3, mpp5, mpp6, mpp7 = st.columns(6)
+
+    mpp1.metric(label_total_pedagio, brl(total_pedagio_rota))
+    mpp2.metric("Total Ida", brl(total_ida))
+    mpp3.metric("Total Volta", brl(total_volta))
+    mpp5.metric("Qtd Pedágios", f"{qtd_pedagios_total}")
+    mpp6.metric("Qtd Ida", f"{qtd_pedagios_ida}")
+    mpp7.metric("Qtd Volta", f"{qtd_pedagios_volta}")
+    if exibir_checar_metricas:
+        mpp4.metric("Total Checar", brl(total_checar))
+        mpp8.metric("Qtd Checar", f"{qtd_pedagios_checar}")
+
+    st.dataframe(
+        df_praca_pedagio_exibir,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "id": st.column_config.NumberColumn("ID", format="%d"),
+            "rota": st.column_config.TextColumn("Rota"),
+            "praca_pedagio": st.column_config.TextColumn("Praça de pedágio"),
+            "rodovia": st.column_config.TextColumn("Rodovia"),
+            "concessionaria": st.column_config.TextColumn("Concessionária"),
+            "sentido_viagem": st.column_config.TextColumn("Sentido Viagem"),
+            "quantidade_eixos": st.column_config.NumberColumn("Qtd. Eixos", format="%.0f"),
+            "valor_por_eixo": st.column_config.NumberColumn("Valor por Eixo", format="R$ %.2f"),
+            "valor_todos_eixos": st.column_config.NumberColumn("Valor Todos os Eixos", format="R$ %.2f"),
+        },
+    )
+    if "praca_pedagio_editando_id" not in st.session_state:
+        st.session_state.praca_pedagio_editando_id = None
+    if "praca_pedagio_excluir_id" not in st.session_state:
+        st.session_state.praca_pedagio_excluir_id = None
+
+    if not df_praca_pedagio_exibir.empty:
+        st.markdown("##### Replicar Registros por Rota")
+        mapa_registros_replica_pp = {
+            (
+                f"ID: {int(r['id'])} | Rota: {r['rota']} | Praça: {r['praca_pedagio']} | "
+                f"Sentido: {r['sentido_viagem'] if pd.notna(r['sentido_viagem']) and str(r['sentido_viagem']).strip() else '-'}"
+            ): int(r["id"])
+            for _, r in df_praca_pedagio_exibir.sort_values(by="id", ascending=False).iterrows()
+        }
+        rp1, rp2 = st.columns(2)
+        registros_replica_sel = rp1.multiselect(
+            "Marque os registros para replicar",
+            options=list(mapa_registros_replica_pp.keys()),
+            key="praca_pedagio_replica_registros",
+        )
+        rota_destino_replica_pp = rp2.selectbox(
+            "Rota de destino da réplica",
+            options=opcoes_rotas_pp,
+            index=None,
+            placeholder="Selecione a rota de destino",
+            key="praca_pedagio_replica_rota_destino",
+        )
+        if st.button("🔁 Replicar Marcados", key="btn_praca_pedagio_replicar_marcados", use_container_width=True):
+            if not registros_replica_sel:
+                st.warning("Marque pelo menos um registro para replicar.")
+            elif not str(rota_destino_replica_pp or "").strip():
+                st.warning("Selecione a rota de destino para replicar.")
+            else:
+                ids_replica = [mapa_registros_replica_pp[x] for x in registros_replica_sel]
+                df_replica_base = df_praca_pedagio[df_praca_pedagio["id"].isin(ids_replica)].copy()
+                novos_ids_pp = []
+                with conn() as c:
+                    for _, rr in df_replica_base.iterrows():
+                        c.execute(
+                            """INSERT INTO praca_pedagio (rota, praca_pedagio, rodovia, concessionaria, sentido_viagem, quantidade_eixos, valor_por_eixo, valor_todos_eixos)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                str(rota_destino_replica_pp).strip(),
+                                str(rr["praca_pedagio"] or "").strip(),
+                                str(rr["rodovia"] or "").strip(),
+                                str(rr["concessionaria"] or "").strip(),
+                                str(rr["sentido_viagem"] or "").strip(),
+                                float(pd.to_numeric(rr["quantidade_eixos"], errors="coerce") or 1.0),
+                                float(pd.to_numeric(rr["valor_por_eixo"], errors="coerce") or 0.0),
+                                float(pd.to_numeric(rr["valor_todos_eixos"], errors="coerce") or 0.0),
+                            ),
+                        )
+                        novos_ids_pp.append(int(c.execute("SELECT last_insert_rowid()").fetchone()[0]))
+                if novos_ids_pp:
+                    st.session_state.praca_pedagio_editando_id = int(novos_ids_pp[0])
+                    st.session_state.praca_pedagio_excluir_id = None
+                    st.session_state.praca_pedagio_filtro_rota_pendente = str(rota_destino_replica_pp).strip()
+                    st.success(f"{len(novos_ids_pp)} registro(s) replicado(s). Abrindo edição para ajuste.")
+                    st.rerun()
+
+        mapa_praca_pedagio = {
+            (
+                f"ID: {int(r['id'])} | Rota: {r['rota']} | Praça: {r['praca_pedagio']} | "
+                f"Rodovia: {r['rodovia'] if pd.notna(r['rodovia']) and str(r['rodovia']).strip() else '-'}"
+            ): int(r["id"])
+            for _, r in df_praca_pedagio_exibir.sort_values(by="id", ascending=False).iterrows()
+        }
+        praca_pedagio_sel_label = st.selectbox(
+            "Selecione para editar ou deletar",
+            options=list(mapa_praca_pedagio.keys()),
+            index=None,
+            placeholder="Escolha um registro",
+            key="praca_pedagio_sel_alteracao",
+        )
+
+        if praca_pedagio_sel_label:
+            id_sel = mapa_praca_pedagio[praca_pedagio_sel_label]
+            ac1, ac2 = st.columns(2)
+            if ac1.button("✏️ Editar", key="btn_praca_pedagio_editar", use_container_width=True):
+                st.session_state.praca_pedagio_editando_id = id_sel
+                st.session_state.praca_pedagio_excluir_id = None
+            if ac2.button("🗑️ Deletar", key="btn_praca_pedagio_deletar", type="primary", use_container_width=True):
+                st.session_state.praca_pedagio_excluir_id = id_sel
+
+        if st.session_state.praca_pedagio_excluir_id is not None:
+            st.warning(f"Confirma a exclusão do registro ID {int(st.session_state.praca_pedagio_excluir_id)}?")
+            ex1, ex2 = st.columns(2)
+            if ex1.button("✅ Confirmar exclusão", key="btn_praca_pedagio_confirmar_exclusao", type="primary", use_container_width=True):
+                with conn() as c:
+                    c.execute("DELETE FROM praca_pedagio WHERE id=?", (int(st.session_state.praca_pedagio_excluir_id),))
+                st.session_state.praca_pedagio_excluir_id = None
+                st.session_state.praca_pedagio_editando_id = None
+                alerta_gravado("✅ Registro excluído com sucesso!")
+                st.rerun()
+            if ex2.button("❌ Cancelar exclusão", key="btn_praca_pedagio_cancelar_exclusao", use_container_width=True):
+                st.session_state.praca_pedagio_excluir_id = None
+                st.rerun()
+
+        if st.session_state.praca_pedagio_editando_id is not None:
+            id_edit = int(st.session_state.praca_pedagio_editando_id)
+            row_edit = df_praca_pedagio[df_praca_pedagio["id"] == id_edit]
+            if row_edit.empty:
+                st.session_state.praca_pedagio_editando_id = None
+            else:
+                reg = row_edit.iloc[0]
+                opcoes_rotas_edit = list(opcoes_rotas_pp)
+                rota_atual = str(reg["rota"] or "").strip()
+                if rota_atual and rota_atual not in opcoes_rotas_edit:
+                    opcoes_rotas_edit.append(rota_atual)
+                idx_rota_edit = opcoes_rotas_edit.index(rota_atual) if rota_atual in opcoes_rotas_edit else None
+                quantidade_eixos_atual = pd.to_numeric(reg["quantidade_eixos"], errors="coerce")
+                quantidade_eixos_atual = float(quantidade_eixos_atual) if pd.notna(quantidade_eixos_atual) and float(quantidade_eixos_atual) > 0 else 1.0
+                valor_pp_atual = pd.to_numeric(reg["valor_por_eixo"], errors="coerce")
+                valor_pp_atual = float(valor_pp_atual) if pd.notna(valor_pp_atual) else 0.0
+
+                with st.form("form_praca_pedagio_editar"):
+                    ep1, ep2 = st.columns(2)
+                    rota_pp_edit = ep1.selectbox(
+                        "Rota (Editar)",
+                        options=opcoes_rotas_edit,
+                        index=idx_rota_edit,
+                        placeholder="Selecione a rota",
+                        key=f"praca_pedagio_rota_edit_{id_edit}",
+                    )
+                    praca_pp_edit = ep2.text_input(
+                        "Praça de pedágio (Editar)",
+                        value=str(reg["praca_pedagio"] or ""),
+                        key=f"praca_pedagio_nome_edit_{id_edit}",
+                    )
+                    ep3, ep4 = st.columns(2)
+                    rodovia_pp_edit = ep3.text_input(
+                        "Rodovia (Editar)",
+                        value=str(reg["rodovia"] or ""),
+                        key=f"praca_pedagio_rodovia_edit_{id_edit}",
+                    )
+                    concessionaria_pp_edit = ep4.text_input(
+                        "Concessionária (Editar)",
+                        value=str(reg["concessionaria"] or ""),
+                        key=f"praca_pedagio_concessionaria_edit_{id_edit}",
+                    )
+                    sentido_viagem_pp_edit = st.text_input(
+                        "Sentido Viagem (Editar)",
+                        value=str(reg["sentido_viagem"] or ""),
+                        key=f"praca_pedagio_sentido_edit_{id_edit}",
+                    )
+                    ep5, ep6, ep7 = st.columns(3)
+                    quantidade_eixos_edit = ep5.number_input(
+                        "Quantidade Eixos (Editar)",
+                        min_value=1.0,
+                        step=1.0,
+                        format="%.0f",
+                        value=quantidade_eixos_atual,
+                        key=f"praca_pedagio_qtd_eixos_edit_{id_edit}",
+                    )
+                    valor_pp_edit = ep6.number_input(
+                        "Valor por Eixo (Editar)",
+                        min_value=0.0,
+                        step=0.000001,
+                        format="%.6f",
+                        value=valor_pp_atual,
+                        key=f"praca_pedagio_valor_edit_{id_edit}",
+                    )
+                    valor_todos_eixos_edit = float(quantidade_eixos_edit) * float(valor_pp_edit)
+                    ep7.number_input(
+                        "Valor Todos os Eixos (Editar)",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.2f",
+                        value=float(valor_todos_eixos_edit),
+                        disabled=True,
+                        key=f"praca_pedagio_valor_total_edit_{id_edit}",
+                    )
+                    eb1, eb2 = st.columns(2)
+                    gravar_edit_pp = eb1.form_submit_button("💾 Gravar", use_container_width=True, key=f"btn_praca_pedagio_gravar_edit_{id_edit}")
+                    cancelar_edit_pp = eb2.form_submit_button("❌ Cancelar", use_container_width=True, key=f"btn_praca_pedagio_cancelar_edit_{id_edit}")
+
+                    if cancelar_edit_pp:
+                        st.session_state.praca_pedagio_editando_id = None
+                        st.rerun()
+
+                    if gravar_edit_pp:
+                        if not str(rota_pp_edit or "").strip():
+                            st.warning("Selecione a rota no pré-cadastro.")
+                        elif not str(praca_pp_edit or "").strip():
+                            st.warning("Informe a praça de pedágio.")
+                        else:
+                            with conn() as c:
+                                c.execute(
+                                    """UPDATE praca_pedagio
+                                       SET rota=?, praca_pedagio=?, rodovia=?, concessionaria=?, sentido_viagem=?, quantidade_eixos=?, valor_por_eixo=?, valor_todos_eixos=?
+                                       WHERE id=?""",
+                                    (
+                                        str(rota_pp_edit).strip(),
+                                        str(praca_pp_edit).strip(),
+                                        str(rodovia_pp_edit or "").strip(),
+                                        str(concessionaria_pp_edit or "").strip(),
+                                        str(sentido_viagem_pp_edit or "").strip(),
+                                        float(quantidade_eixos_edit or 1.0),
+                                        float(valor_pp_edit or 0.0),
+                                        float(valor_todos_eixos_edit or 0.0),
+                                        id_edit,
+                                    ),
+                                )
+                            st.session_state.praca_pedagio_editando_id = None
+                            alerta_gravado()
+                            st.rerun()
+
+# =========================
 # ABA 17 - CONTAS A PAGAR
 # =========================
 with aba17:
@@ -5418,22 +6184,62 @@ with aba17:
             )
         return parcelas
 
-    def _cp_parse_parcelas_pagas(parcelas_pagas_texto):
-        pagas = set()
+    def _cp_parse_parcelas_pagas_detalhe(parcelas_pagas_texto):
+        pagas = {}
         if not parcelas_pagas_texto:
             return pagas
         for token in str(parcelas_pagas_texto).replace(",", ";").split(";"):
             t = token.strip()
-            if t.isdigit():
-                pagas.add(int(t))
+            if not t:
+                continue
+            num_txt = t
+            dt_pag = None
+            if "@" in t:
+                num_txt, dt_txt = t.split("@", 1)
+                dt_conv = pd.to_datetime(str(dt_txt).strip(), errors="coerce")
+                dt_pag = dt_conv.date() if pd.notna(dt_conv) else None
+            if str(num_txt).strip().isdigit():
+                pagas[int(str(num_txt).strip())] = dt_pag
         return pagas
+
+    def _cp_parse_parcelas_pagas(parcelas_pagas_texto):
+        return set(_cp_parse_parcelas_pagas_detalhe(parcelas_pagas_texto).keys())
+
+    def _cp_serializar_parcelas_pagas_detalhe(parcelas_pagas_dict):
+        itens = []
+        for num in sorted({int(k) for k in parcelas_pagas_dict.keys() if int(k) > 0}):
+            dt_pag = parcelas_pagas_dict.get(num)
+            if dt_pag is None:
+                itens.append(str(num))
+            else:
+                itens.append(f"{num}@{pd.to_datetime(dt_pag, errors='coerce').strftime('%Y-%m-%d')}")
+        return ";".join(itens)
 
     def _cp_serializar_parcelas_pagas(parcelas_pagas):
         try:
             nums = sorted({int(x) for x in parcelas_pagas if int(x) > 0})
         except Exception:
             nums = []
-        return ";".join(str(n) for n in nums)
+        return _cp_serializar_parcelas_pagas_detalhe({n: None for n in nums})
+
+    def _cp_status_pagamento(data_venc, data_pag):
+        venc = pd.to_datetime(data_venc, errors="coerce")
+        pag = pd.to_datetime(data_pag, errors="coerce")
+        if pd.isna(venc) or pd.isna(pag):
+            return "-"
+        vd = venc.date()
+        pdg = pag.date()
+        if pdg < vd:
+            return "Antecipado"
+        if pdg == vd:
+            return "No vencimento"
+        return "Atrasado"
+
+    def _cp_competencia_ref(data_ref):
+        dt = pd.to_datetime(data_ref, errors="coerce")
+        if pd.isna(dt):
+            return ""
+        return dt.strftime("%Y-%m")
 
     def _cp_proximo_vencimento_mensal(hoje_ref, dia_venc, data_base=None):
         data_base_dt = pd.to_datetime(data_base, errors="coerce")
@@ -5486,6 +6292,10 @@ with aba17:
                     r.get("dia_vencimento_mensal"),
                     r.get("data_vencimento_base"),
                 )
+                comp_prox = _cp_competencia_ref(prox)
+                comp_paga = str(r.get("competencia_paga_mensal") or "").strip()
+                if comp_paga == comp_prox:
+                    continue
                 dias = (prox - hoje_ref).days
                 if 0 <= dias <= dias_alerta:
                     alertas.append(
@@ -5567,172 +6377,203 @@ with aba17:
     else:
         mapa_forn = {f"{f['codigo']} - {f['nome']}": f["id"] for f in fornecedores_cp}
         mapa_obr = {o["descricao_obrigacao"]: o["id"] for o in obrigacoes_cp}
-        st.markdown("##### Dados Principais")
-        p1, p2, p3 = st.columns(3)
-        sel_forn = p1.selectbox("Código Fornecedor", list(mapa_forn.keys()), key="cp_sel_forn")
-        n_nf_cp = p2.text_input("N.NF", key="cp_nf").strip()
-        dt_ent_cp = p3.date_input("Data Entrada", format="DD/MM/YYYY", key="cp_dt_entrada")
+        with st.expander("➕ Cadastro de Contas a Pagar", expanded=False):
+            st.markdown("##### Dados Principais")
+            p1, p2, p3 = st.columns(3)
+            sel_forn = p1.selectbox("Código Fornecedor", list(mapa_forn.keys()), key="cp_sel_forn")
+            n_nf_cp = p2.text_input("N.NF", key="cp_nf").strip()
+            dt_ent_cp = p3.date_input("Data Entrada", format="DD/MM/YYYY", key="cp_dt_entrada")
 
-        p4, p5, p6 = st.columns(3)
-        valor_total_nf_cp = p4.number_input("Valor Total da NF", min_value=0.0, step=0.01, key="cp_valor_total_nf")
-        sel_obr = p5.selectbox("Obrigação", list(mapa_obr.keys()), key="cp_sel_obrigacao")
-        tipo_label_cp = p6.selectbox(
-            "Tipo de Lançamento",
-            options=["Não mensal (único/parcelado)", "Mensal fixa (todo mês)"],
-            key="cp_tipo_lancamento_sel",
-        )
-        tipo_lancamento_cp = "MENSAL_FIXO" if "Mensal fixa" in tipo_label_cp else "NAO_MENSAL"
-        dados_nf_cp = st.text_input("Dados da NF", key="cp_dados_nf").strip()
-
-        c_cfg1, c_cfg2, c_cfg3 = st.columns(3)
-        dias_alerta_cp = int(c_cfg1.number_input("Avisar com antecedência (dias)", min_value=0, max_value=90, step=1, value=7, key="cp_dias_alerta"))
-        dia_vencimento_mensal_cp = None
-        data_vencimento_base_cp = None
-        qtd_parc_cp = 1
-        if tipo_lancamento_cp == "MENSAL_FIXO":
-            data_vencimento_base_cp = c_cfg2.date_input(
-                "Data de Vencimento",
-                value=dt_ent_cp + timedelta(days=30),
-                format="DD/MM/YYYY",
-                key="cp_data_vencimento_base",
+            p4, p5, p6 = st.columns(3)
+            valor_total_nf_cp = p4.number_input("Valor Total da NF", min_value=0.0, step=0.01, key="cp_valor_total_nf")
+            sel_obr = p5.selectbox("Obrigação", list(mapa_obr.keys()), key="cp_sel_obrigacao")
+            tipo_label_cp = p6.selectbox(
+                "Tipo de Lançamento",
+                options=["Não mensal (único/parcelado)", "Mensal fixa (todo mês)"],
+                key="cp_tipo_lancamento_sel",
             )
-            dia_vencimento_mensal_cp = int(data_vencimento_base_cp.day)
-            c_cfg3.info("Informe a data de vencimento. O sistema usa essa data como referência.")
-        else:
-            qtd_parc_cp = int(c_cfg2.number_input("Quantidade Parcelas", min_value=1, step=1, value=1, key="cp_qtd_parcelas"))
-            c_cfg3.info("Para não mensal, informe as parcelas abaixo.")
+            tipo_lancamento_cp = "MENSAL_FIXO" if "Mensal fixa" in tipo_label_cp else "NAO_MENSAL"
+            dados_nf_cp = st.text_input("Dados da NF", key="cp_dados_nf").strip()
 
-        st.markdown("##### Parcelas (Vencimento e Valor)")
-        valor_parcela_base = (float(valor_total_nf_cp) / qtd_parc_cp) if qtd_parc_cp > 0 else 0.0
-        df_parcelas_edit = pd.DataFrame(columns=["Parcela", "Vencimento", "Valor", "Paga"])
-
-        if tipo_lancamento_cp == "NAO_MENSAL":
-            if "cp_parcelas_df" not in st.session_state:
-                st.session_state.cp_parcelas_df = pd.DataFrame(columns=["Parcela", "Vencimento", "Valor", "Paga"])
-
-            df_parc_state = st.session_state.cp_parcelas_df.copy()
-            if "Paga" not in df_parc_state.columns:
-                df_parc_state["Paga"] = False
-                st.session_state.cp_parcelas_df = df_parc_state
-            precisa_regerar = (
-                df_parc_state.empty
-                or len(df_parc_state) != qtd_parc_cp
-                or "cp_qtd_parcelas_prev" not in st.session_state
-                or st.session_state.get("cp_qtd_parcelas_prev") != qtd_parc_cp
-            )
-
-            if precisa_regerar:
-                linhas = []
-                for i in range(qtd_parc_cp):
-                    linhas.append(
-                        {
-                            "Parcela": i + 1,
-                            "Vencimento": dt_ent_cp + timedelta(days=30 * (i + 1)),
-                            "Valor": round(valor_parcela_base, 2),
-                            "Paga": False,
-                        }
-                    )
-                st.session_state.cp_parcelas_df = pd.DataFrame(linhas)
-                st.session_state.cp_qtd_parcelas_prev = qtd_parc_cp
-
-            cpar_a, cpar_b = st.columns([1, 1])
-            if cpar_a.button("🔄 Redistribuir Valor Igual", key="cp_btn_redistribuir"):
-                df_tmp = st.session_state.cp_parcelas_df.copy()
-                if not df_tmp.empty:
-                    df_tmp["Valor"] = round(valor_parcela_base, 2)
-                    st.session_state.cp_parcelas_df = df_tmp
-                    st.rerun()
-            cpar_b.caption(f"Valor base por parcela: {brl(valor_parcela_base)}")
-
-            df_parcelas_edit = st.data_editor(
-                st.session_state.cp_parcelas_df,
-                key="cp_editor_parcelas",
-                hide_index=True,
-                use_container_width=True,
-                num_rows="fixed",
-                disabled=["Parcela"],
-                column_config={
-                    "Parcela": st.column_config.NumberColumn("Parcela", format="%d"),
-                    "Vencimento": st.column_config.DateColumn("Data Parcela", format="DD/MM/YYYY"),
-                    "Valor": st.column_config.NumberColumn("Valor Parcela (R$)", format="R$ %.2f", min_value=0.0, step=0.01),
-                    "Paga": st.column_config.CheckboxColumn("Paga", default=False),
-                },
-            )
-            st.session_state.cp_parcelas_df = df_parcelas_edit
-            soma_parcelas = float(pd.to_numeric(df_parcelas_edit["Valor"], errors="coerce").fillna(0.0).sum()) if not df_parcelas_edit.empty else 0.0
-            diferenca = float(valor_total_nf_cp) - soma_parcelas
-        else:
-            st.info("Lançamento mensal fixo: o valor será considerado recorrente todo mês.")
-            soma_parcelas = float(valor_total_nf_cp)
-            diferenca = 0.0
-
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Total NF", brl(valor_total_nf_cp))
-        r2.metric("Soma das Parcelas", brl(soma_parcelas))
-        r3.metric("Diferença", brl(diferenca))
-
-        if st.button("💾 Gravar", type="primary", key="btn_salvar_cp"):
-            if tipo_lancamento_cp == "NAO_MENSAL" and not n_nf_cp:
-                st.warning("Informe o número da NF.")
-            elif tipo_lancamento_cp == "NAO_MENSAL" and df_parcelas_edit.empty:
-                st.warning("Informe as parcelas antes de salvar.")
-            elif tipo_lancamento_cp == "MENSAL_FIXO" and float(valor_total_nf_cp) <= 0:
-                st.warning("Informe o valor mensal para o lançamento fixo.")
+            c_cfg1, c_cfg2, c_cfg3 = st.columns(3)
+            dias_alerta_cp = int(c_cfg1.number_input("Avisar com antecedência (dias)", min_value=0, max_value=90, step=1, value=7, key="cp_dias_alerta"))
+            dia_vencimento_mensal_cp = None
+            data_vencimento_base_cp = None
+            qtd_parc_cp = 1
+            if tipo_lancamento_cp == "MENSAL_FIXO":
+                data_vencimento_base_cp = c_cfg2.date_input(
+                    "Data de Vencimento",
+                    value=dt_ent_cp + timedelta(days=30),
+                    format="DD/MM/YYYY",
+                    key="cp_data_vencimento_base",
+                )
+                dia_vencimento_mensal_cp = int(data_vencimento_base_cp.day)
+                c_cfg3.info("Informe a data de vencimento. O sistema usa essa data como referência.")
             else:
-                detalhes_parcelas = ""
-                parcelas_pagas_salvar = ""
-                valor_medio_parcela = float(valor_total_nf_cp)
-                qtd_parcelas_salvar = int(qtd_parc_cp)
-                dia_venc_salvar = int(dia_vencimento_mensal_cp) if tipo_lancamento_cp == "MENSAL_FIXO" else None
-                data_venc_base_salvar = data_vencimento_base_cp.isoformat() if (tipo_lancamento_cp == "MENSAL_FIXO" and data_vencimento_base_cp) else None
+                qtd_parc_cp = int(c_cfg2.number_input("Quantidade Parcelas", min_value=1, step=1, value=1, key="cp_qtd_parcelas"))
+                c_cfg3.info("Para não mensal, informe as parcelas abaixo.")
 
-                if tipo_lancamento_cp == "NAO_MENSAL":
-                    df_save = df_parcelas_edit.copy()
-                    df_save["Valor"] = pd.to_numeric(df_save["Valor"], errors="coerce").fillna(0.0)
-                    if "Paga" not in df_save.columns:
-                        df_save["Paga"] = False
-                    df_save["Paga"] = df_save["Paga"].fillna(False).astype(bool)
-                    if df_save["Vencimento"].isna().any():
-                        st.warning("Preencha a data de todas as parcelas.")
-                        df_save = None
-                    else:
-                        datas_parcelas = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_save["Vencimento"].tolist()]
-                        valores_parcelas = [float(v) for v in df_save["Valor"].tolist()]
-                        detalhes_parcelas = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_parcelas, valores_parcelas))])
-                        parcelas_pagas_salvar = _cp_serializar_parcelas_pagas(
-                            [idx + 1 for idx, paga in enumerate(df_save["Paga"].tolist()) if bool(paga)]
+            st.markdown("##### Parcelas (Vencimento e Valor)")
+            valor_parcela_base = (float(valor_total_nf_cp) / qtd_parc_cp) if qtd_parc_cp > 0 else 0.0
+            df_parcelas_edit = pd.DataFrame(columns=["Parcela", "Vencimento", "Valor", "Paga", "Data Pagamento"])
+
+            if tipo_lancamento_cp == "NAO_MENSAL":
+                if "cp_parcelas_df" not in st.session_state:
+                    st.session_state.cp_parcelas_df = pd.DataFrame(columns=["Parcela", "Vencimento", "Valor", "Paga", "Data Pagamento"])
+
+                df_parc_state = st.session_state.cp_parcelas_df.copy()
+                if "Paga" not in df_parc_state.columns:
+                    df_parc_state["Paga"] = False
+                    st.session_state.cp_parcelas_df = df_parc_state
+                if "Data Pagamento" not in df_parc_state.columns:
+                    df_parc_state["Data Pagamento"] = pd.NaT
+                    st.session_state.cp_parcelas_df = df_parc_state
+                precisa_regerar = (
+                    df_parc_state.empty
+                    or len(df_parc_state) != qtd_parc_cp
+                    or "cp_qtd_parcelas_prev" not in st.session_state
+                    or st.session_state.get("cp_qtd_parcelas_prev") != qtd_parc_cp
+                )
+
+                if precisa_regerar:
+                    linhas = []
+                    for i in range(qtd_parc_cp):
+                        linhas.append(
+                            {
+                                "Parcela": i + 1,
+                                "Vencimento": dt_ent_cp + timedelta(days=30 * (i + 1)),
+                                "Valor": round(valor_parcela_base, 2),
+                                "Paga": False,
+                                "Data Pagamento": None,
+                            }
                         )
-                        valor_medio_parcela = (sum(valores_parcelas) / len(valores_parcelas)) if valores_parcelas else 0.0
-                        qtd_parcelas_salvar = int(qtd_parc_cp)
+                    st.session_state.cp_parcelas_df = pd.DataFrame(linhas)
+                    st.session_state.cp_qtd_parcelas_prev = qtd_parc_cp
+
+                cpar_a, cpar_b = st.columns([1, 1])
+                if cpar_a.button("🔄 Redistribuir Valor Igual", key="cp_btn_redistribuir"):
+                    df_tmp = st.session_state.cp_parcelas_df.copy()
+                    if not df_tmp.empty:
+                        df_tmp["Valor"] = round(valor_parcela_base, 2)
+                        st.session_state.cp_parcelas_df = df_tmp
+                        st.rerun()
+                cpar_b.caption(f"Valor base por parcela: {brl(valor_parcela_base)}")
+
+                df_parcelas_edit = st.data_editor(
+                    st.session_state.cp_parcelas_df,
+                    key="cp_editor_parcelas",
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    disabled=["Parcela"],
+                    column_config={
+                        "Parcela": st.column_config.NumberColumn("Parcela", format="%d"),
+                        "Vencimento": st.column_config.DateColumn("Data Parcela", format="DD/MM/YYYY"),
+                        "Valor": st.column_config.NumberColumn("Valor Parcela (R$)", format="R$ %.2f", min_value=0.0, step=0.01),
+                        "Paga": st.column_config.CheckboxColumn("Paga", default=False),
+                        "Data Pagamento": st.column_config.DateColumn("Data Pagamento", format="DD/MM/YYYY"),
+                    },
+                )
+                st.session_state.cp_parcelas_df = df_parcelas_edit
+                soma_parcelas = float(pd.to_numeric(df_parcelas_edit["Valor"], errors="coerce").fillna(0.0).sum()) if not df_parcelas_edit.empty else 0.0
+                diferenca = float(valor_total_nf_cp) - soma_parcelas
+                if not df_parcelas_edit.empty:
+                    df_pag_view = df_parcelas_edit.copy()
+                    df_pag_view["Vencimento"] = pd.to_datetime(df_pag_view["Vencimento"], errors="coerce").dt.date
+                    df_pag_view["Data Pagamento"] = pd.to_datetime(df_pag_view.get("Data Pagamento"), errors="coerce").dt.date
+                    df_pag_view = df_pag_view[df_pag_view["Paga"] == True].copy()
+                    if not df_pag_view.empty:
+                        df_pag_view["Status Pagamento"] = df_pag_view.apply(
+                            lambda rr: _cp_status_pagamento(rr.get("Vencimento"), rr.get("Data Pagamento")),
+                            axis=1,
+                        )
+                        st.dataframe(
+                            df_pag_view[["Parcela", "Vencimento", "Data Pagamento", "Status Pagamento"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+            else:
+                st.info("Lançamento mensal fixo: o valor será considerado recorrente todo mês.")
+                soma_parcelas = float(valor_total_nf_cp)
+                diferenca = 0.0
+
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Total NF", brl(valor_total_nf_cp))
+            r2.metric("Soma das Parcelas", brl(soma_parcelas))
+            r3.metric("Diferença", brl(diferenca))
+
+            if st.button("💾 Gravar", type="primary", key="btn_salvar_cp"):
+                if tipo_lancamento_cp == "NAO_MENSAL" and not n_nf_cp:
+                    st.warning("Informe o número da NF.")
+                elif tipo_lancamento_cp == "NAO_MENSAL" and df_parcelas_edit.empty:
+                    st.warning("Informe as parcelas antes de salvar.")
+                elif tipo_lancamento_cp == "MENSAL_FIXO" and float(valor_total_nf_cp) <= 0:
+                    st.warning("Informe o valor mensal para o lançamento fixo.")
                 else:
-                    df_save = pd.DataFrame([{"ok": 1}])
+                    detalhes_parcelas = ""
+                    parcelas_pagas_salvar = ""
+                    valor_medio_parcela = float(valor_total_nf_cp)
+                    qtd_parcelas_salvar = int(qtd_parc_cp)
+                    dia_venc_salvar = int(dia_vencimento_mensal_cp) if tipo_lancamento_cp == "MENSAL_FIXO" else None
+                    data_venc_base_salvar = data_vencimento_base_cp.isoformat() if (tipo_lancamento_cp == "MENSAL_FIXO" and data_vencimento_base_cp) else None
 
-                if df_save is not None:
-                    nf_salvar = n_nf_cp if n_nf_cp else "RECORRENTE"
-                    with conn() as c:
-                        c.execute(
-                            """INSERT INTO contas_pagar
-                               (fornecedor_id, n_nf, data_entrada, valor_total_nf, obrigacao_id, dados_nf, quantidade_parcelas, vencimentos_parcelas, valor_parcela, tipo_lancamento, dia_vencimento_mensal, data_vencimento_base, parcelas_pagas, dias_alerta)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                mapa_forn[sel_forn],
-                                nf_salvar,
-                                dt_ent_cp.isoformat(),
-                                float(valor_total_nf_cp),
-                                mapa_obr[sel_obr],
-                                dados_nf_cp,
-                                int(qtd_parcelas_salvar),
-                                detalhes_parcelas,
-                                float(valor_medio_parcela),
-                                tipo_lancamento_cp,
-                                dia_venc_salvar,
-                                data_venc_base_salvar,
-                                parcelas_pagas_salvar if tipo_lancamento_cp == "NAO_MENSAL" else None,
-                                int(dias_alerta_cp),
-                            ),
-                        )
-                    alerta_gravado()
-                    st.rerun()
+                    if tipo_lancamento_cp == "NAO_MENSAL":
+                        df_save = df_parcelas_edit.copy()
+                        df_save["Valor"] = pd.to_numeric(df_save["Valor"], errors="coerce").fillna(0.0)
+                        if "Paga" not in df_save.columns:
+                            df_save["Paga"] = False
+                        df_save["Paga"] = df_save["Paga"].fillna(False).astype(bool)
+                        if "Data Pagamento" not in df_save.columns:
+                            df_save["Data Pagamento"] = pd.NaT
+                        df_save["Data Pagamento"] = pd.to_datetime(df_save["Data Pagamento"], errors="coerce").dt.date
+                        hoje_pag = date.today()
+                        mask_paga_sem_data = df_save["Paga"] & df_save["Data Pagamento"].isna()
+                        if mask_paga_sem_data.any():
+                            df_save.loc[mask_paga_sem_data, "Data Pagamento"] = hoje_pag
+                        if df_save["Vencimento"].isna().any():
+                            st.warning("Preencha a data de todas as parcelas.")
+                            df_save = None
+                        else:
+                            datas_parcelas = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_save["Vencimento"].tolist()]
+                            valores_parcelas = [float(v) for v in df_save["Valor"].tolist()]
+                            detalhes_parcelas = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_parcelas, valores_parcelas))])
+                            mapa_pagamentos_salvar = {}
+                            for idx_row, row in df_save.reset_index(drop=True).iterrows():
+                                if bool(row.get("Paga")):
+                                    mapa_pagamentos_salvar[idx_row + 1] = row.get("Data Pagamento")
+                            parcelas_pagas_salvar = _cp_serializar_parcelas_pagas_detalhe(mapa_pagamentos_salvar)
+                            valor_medio_parcela = (sum(valores_parcelas) / len(valores_parcelas)) if valores_parcelas else 0.0
+                            qtd_parcelas_salvar = int(qtd_parc_cp)
+                    else:
+                        df_save = pd.DataFrame([{"ok": 1}])
+
+                    if df_save is not None:
+                        nf_salvar = n_nf_cp if n_nf_cp else "RECORRENTE"
+                        with conn() as c:
+                            c.execute(
+                                """INSERT INTO contas_pagar
+                                   (fornecedor_id, n_nf, data_entrada, valor_total_nf, obrigacao_id, dados_nf, quantidade_parcelas, vencimentos_parcelas, valor_parcela, tipo_lancamento, dia_vencimento_mensal, data_vencimento_base, competencia_paga_mensal, parcelas_pagas, dias_alerta)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    mapa_forn[sel_forn],
+                                    nf_salvar,
+                                    dt_ent_cp.isoformat(),
+                                    float(valor_total_nf_cp),
+                                    mapa_obr[sel_obr],
+                                    dados_nf_cp,
+                                    int(qtd_parcelas_salvar),
+                                    detalhes_parcelas,
+                                    float(valor_medio_parcela),
+                                    tipo_lancamento_cp,
+                                    dia_venc_salvar,
+                                    data_venc_base_salvar,
+                                    None,
+                                    parcelas_pagas_salvar if tipo_lancamento_cp == "NAO_MENSAL" else None,
+                                    int(dias_alerta_cp),
+                                ),
+                            )
+                        alerta_gravado()
+                        st.rerun()
 
     with conn() as c:
         df_cp = pd.read_sql(
@@ -5750,6 +6591,7 @@ with aba17:
                       cp.tipo_lancamento,
                       cp.dia_vencimento_mensal,
                       cp.data_vencimento_base,
+                      cp.competencia_paga_mensal,
                       cp.parcelas_pagas,
                       cp.dias_alerta
                FROM contas_pagar cp
@@ -5785,6 +6627,87 @@ with aba17:
                     "Dias": st.column_config.NumberColumn("Dias", format="%d"),
                 },
             )
+            df_alertas_baixa = df_alertas_cp[
+                (df_alertas_cp["Tipo"] == "Não mensal")
+                & (df_alertas_cp["Parcela"].astype(str) != "-")
+            ].copy()
+            if not df_alertas_baixa.empty:
+                df_alertas_baixa["Parcela"] = pd.to_numeric(df_alertas_baixa["Parcela"], errors="coerce").fillna(0).astype(int)
+                opcoes_baixa_alerta = []
+                mapa_baixa_alerta = {}
+                for _, rb in df_alertas_baixa.iterrows():
+                    label_baixa = (
+                        f"ID {int(rb['ID'])} | Parcela {int(rb['Parcela'])} | "
+                        f"{str(rb['Fornecedor'])} | Venc {rb['Vencimento'].strftime('%d/%m/%Y') if pd.notna(rb['Vencimento']) else '-'} | "
+                        f"{brl(float(rb['Valor (R$)'] or 0.0))}"
+                    )
+                    opcoes_baixa_alerta.append(label_baixa)
+                    mapa_baixa_alerta[label_baixa] = (int(rb["ID"]), int(rb["Parcela"]))
+
+                selecionadas_baixa = st.multiselect(
+                    "Marcar como pagas (baixa rápida)",
+                    options=opcoes_baixa_alerta,
+                    key="cp_alerta_baixa_multiselect",
+                    help="Selecione parcelas em alerta que já foram pagas antecipadamente para removê-las do alerta.",
+                )
+                if st.button("✅ Baixar parcelas selecionadas", key="cp_alerta_baixar_btn", use_container_width=True):
+                    if not selecionadas_baixa:
+                        st.warning("Selecione ao menos uma parcela para baixar.")
+                    else:
+                        mapa_ids_parcelas = {}
+                        for sel in selecionadas_baixa:
+                            id_cp, parcela_cp = mapa_baixa_alerta[sel]
+                            if id_cp not in mapa_ids_parcelas:
+                                mapa_ids_parcelas[id_cp] = set()
+                            mapa_ids_parcelas[id_cp].add(parcela_cp)
+                        with conn() as c:
+                            for id_cp, novas_parcelas in mapa_ids_parcelas.items():
+                                row_cp = c.execute(
+                                    "SELECT parcelas_pagas FROM contas_pagar WHERE id=?",
+                                    (int(id_cp),),
+                                ).fetchone()
+                                atuais = _cp_parse_parcelas_pagas(row_cp["parcelas_pagas"] if row_cp else "")
+                                atualizadas = atuais.union(novas_parcelas)
+                                c.execute(
+                                    "UPDATE contas_pagar SET parcelas_pagas=? WHERE id=?",
+                                    (_cp_serializar_parcelas_pagas(sorted(atualizadas)), int(id_cp)),
+                                )
+                        alerta_gravado("✅ Parcelas baixadas e alertas atualizados.")
+                        st.rerun()
+            df_alertas_mensal = df_alertas_cp[df_alertas_cp["Tipo"] == "Mensal Fixa"].copy()
+            if not df_alertas_mensal.empty:
+                opcoes_baixa_mensal = []
+                mapa_baixa_mensal = {}
+                for _, rm in df_alertas_mensal.iterrows():
+                    comp_mensal = _cp_competencia_ref(rm["Vencimento"])
+                    comp_mensal_label = pd.to_datetime(rm["Vencimento"], errors="coerce")
+                    comp_mensal_label = comp_mensal_label.strftime("%m/%Y") if pd.notna(comp_mensal_label) else comp_mensal
+                    label_mensal = (
+                        f"ID {int(rm['ID'])} | {str(rm['Fornecedor'])} | "
+                        f"Competência {comp_mensal_label} | Venc {rm['Vencimento'].strftime('%d/%m/%Y') if pd.notna(rm['Vencimento']) else '-'}"
+                    )
+                    opcoes_baixa_mensal.append(label_mensal)
+                    mapa_baixa_mensal[label_mensal] = (int(rm["ID"]), comp_mensal)
+
+                selecionadas_mensal = st.multiselect(
+                    "Marcar mensal fixa como paga (competência)",
+                    options=opcoes_baixa_mensal,
+                    key="cp_alerta_baixa_mensal_multiselect",
+                    help="Baixa apenas a competência selecionada (mês/ano). No próximo mês, o alerta volta normalmente.",
+                )
+                if st.button("✅ Baixar mensal selecionada", key="cp_alerta_baixar_mensal_btn", use_container_width=True):
+                    if not selecionadas_mensal:
+                        st.warning("Selecione ao menos um lançamento mensal para baixar.")
+                    else:
+                        with conn() as c:
+                            for sel in selecionadas_mensal:
+                                id_cp, competencia = mapa_baixa_mensal[sel]
+                                c.execute(
+                                    "UPDATE contas_pagar SET competencia_paga_mensal=? WHERE id=?",
+                                    (str(competencia or "").strip(), int(id_cp)),
+                                )
+                        alerta_gravado("✅ Mensal fixa baixada para a competência selecionada.")
+                        st.rerun()
         else:
             st.success("Sem vencimentos próximos dentro da antecedência configurada.")
 
@@ -5797,24 +6720,88 @@ with aba17:
         df_cp_grid["data_vencimento_base"] = pd.to_datetime(df_cp_grid["data_vencimento_base"], errors="coerce").dt.date
         df_cp_grid["quantidade_parcelas"] = pd.to_numeric(df_cp_grid["quantidade_parcelas"], errors="coerce").fillna(1).astype(int)
         df_cp_grid["proximo_vencimento"] = df_cp_grid.apply(_cp_proximo_vencimento_grade, axis=1)
+        hoje_grid_cp = date.today()
+        df_cp_grid["dias_para_vencer"] = df_cp_grid["proximo_vencimento"].apply(
+            lambda d: (d - hoje_grid_cp).days if pd.notna(d) else None
+        )
         df_cp_grid["Tipo"] = df_cp_grid["tipo_lancamento"].map(
             {"MENSAL_FIXO": "Mensal fixa", "NAO_MENSAL": "Não mensal"}
         ).fillna("Não mensal")
+        def _cp_resumo_pagamento_grade(row):
+            tipo = str(row.get("tipo_lancamento") or "NAO_MENSAL")
+            if tipo == "MENSAL_FIXO":
+                comp = str(row.get("competencia_paga_mensal") or "").strip()
+                prox = row.get("proximo_vencimento")
+                comp_prox = _cp_competencia_ref(prox)
+                if comp and comp == comp_prox:
+                    return pd.Series({"Pagas": 1, "Pendentes": 0, "Ultimo Pgto": "Competência paga"})
+                return pd.Series({"Pagas": 0, "Pendentes": 1, "Ultimo Pgto": "Pendente"})
+            parcelas = _cp_extrair_parcelas(row.get("vencimentos_parcelas"))
+            total = len(parcelas)
+            pagas_det = _cp_parse_parcelas_pagas_detalhe(row.get("parcelas_pagas"))
+            qtd_pagas = len(pagas_det)
+            qtd_pend = max(0, total - qtd_pagas)
+            ultimo_status = "Pendente"
+            if pagas_det and parcelas:
+                mapa_venc = {int(p["parcela"]): p.get("data") for p in parcelas if p.get("parcela") is not None}
+                ultimo_num = max(pagas_det.keys())
+                dt_pag = pagas_det.get(ultimo_num)
+                dt_venc = mapa_venc.get(ultimo_num)
+                st_pg = _cp_status_pagamento(dt_venc, dt_pag)
+                ultimo_status = f"Parc {ultimo_num}: {st_pg}" if st_pg != "-" else f"Parc {ultimo_num}: paga"
+            return pd.Series({"Pagas": int(qtd_pagas), "Pendentes": int(qtd_pend), "Ultimo Pgto": ultimo_status})
+
+        resumo_pg_grid = df_cp_grid.apply(_cp_resumo_pagamento_grade, axis=1)
+        df_cp_grid["Pagas"] = pd.to_numeric(resumo_pg_grid["Pagas"], errors="coerce").fillna(0).astype(int)
+        df_cp_grid["Pendentes"] = pd.to_numeric(resumo_pg_grid["Pendentes"], errors="coerce").fillna(0).astype(int)
+        df_cp_grid["Ultimo Pgto"] = resumo_pg_grid["Ultimo Pgto"].fillna("-").astype(str)
+        df_cp_grid["Ultimo Pgto"] = df_cp_grid["Ultimo Pgto"].apply(
+            lambda v: "OK - Competência paga" if str(v).strip() == "Competência paga" else v
+        )
+        df_cp_grid["Comp. Paga"] = df_cp_grid["Ultimo Pgto"].astype(str).str.contains("Competência paga", na=False)
+        modo_exibicao_cp = st.radio(
+            "Exibição do grid",
+            options=["Todos os dados", "Somente os que vão vencer"],
+            horizontal=True,
+            key="cp_grid_modo_exibicao",
+        )
+        if modo_exibicao_cp == "Somente os que vão vencer":
+            total_futuras_abertas = int(
+                (
+                    df_cp_grid["dias_para_vencer"].notna()
+                    & (pd.to_numeric(df_cp_grid["dias_para_vencer"], errors="coerce") > 0)
+                ).sum()
+            )
+            mask_vencer = (
+                df_cp_grid["dias_para_vencer"].notna()
+                & (pd.to_numeric(df_cp_grid["dias_para_vencer"], errors="coerce") >= 0)
+                & (pd.to_numeric(df_cp_grid["dias_para_vencer"], errors="coerce") <= pd.to_numeric(df_cp_grid["dias_alerta"], errors="coerce").fillna(7))
+            )
+            total_no_alerta = int(mask_vencer.sum())
+            total_fora_alerta = max(0, total_futuras_abertas - total_no_alerta)
+            df_cp_grid = df_cp_grid[mask_vencer].copy()
+            if total_fora_alerta > 0:
+                st.caption(f"Existem {total_fora_alerta} parcela(s) com mais de 7 dias que vão vencer.")
         df_cp_grid["Alterar"] = False
         df_cp_grid["Excluir"] = False
         df_cp_grid = df_cp_grid[
             [
                 "id",
                 "Alterar",
+                "dados_nf",
                 "Excluir",
                 "data_entrada",
                 "fornecedor",
                 "descricao_obrigacao",
                 "n_nf",
+                "valor_total_nf",
                 "Tipo",
                 "quantidade_parcelas",
+                "Pagas",
+                "Pendentes",
+                "Comp. Paga",
+                "Ultimo Pgto",
                 "proximo_vencimento",
-                "valor_total_nf",
                 "dias_alerta",
             ]
         ]
@@ -5826,19 +6813,25 @@ with aba17:
                 hide_index=True,
                 key="editor_contas_pagar",
                 column_config={
-                    "id": None,
+                    "id": st.column_config.NumberColumn("ID", format="%d"),
                     "Alterar": st.column_config.CheckboxColumn("✏️ Alterar", default=False),
                     "Excluir": st.column_config.CheckboxColumn("🗑️ Excluir", default=False),
                     "data_entrada": st.column_config.DateColumn("Entrada", format="DD/MM/YYYY"),
                     "fornecedor": st.column_config.TextColumn("Fornecedor"),
                     "descricao_obrigacao": st.column_config.TextColumn("Obrigação"),
                     "n_nf": st.column_config.TextColumn("NF"),
+                    "dados_nf": st.column_config.TextColumn("Dados da NF"),
                     "Tipo": st.column_config.TextColumn("Tipo"),
                     "quantidade_parcelas": st.column_config.NumberColumn("Parcelas", format="%d"),
+                    "Pagas": st.column_config.NumberColumn("Pagas", format="%d"),
+                    "Pendentes": st.column_config.NumberColumn("Pendentes", format="%d"),
+                    "Comp. Paga": st.column_config.CheckboxColumn("Comp. Paga"),
+                    "Ultimo Pgto": st.column_config.TextColumn("Último Pgto"),
                     "proximo_vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
                     "valor_total_nf": st.column_config.NumberColumn("Valor Total", format="R$ %.2f"),
                     "dias_alerta": st.column_config.NumberColumn("Alerta (dias)", format="%d"),
                 },
+                disabled=["Comp. Paga"],
             )
 
             bcp1, bcp2 = st.columns(2)
@@ -5866,36 +6859,36 @@ with aba17:
                 st.warning("Marque pelo menos um registro para excluir.")
 
         if st.session_state.cp_editando_id is not None:
-            row_edit_cp = df_cp[df_cp["id"] == st.session_state.cp_editando_id]
-            if row_edit_cp.empty:
-                st.session_state.cp_editando_id = None
-            else:
-                reg_cp = row_edit_cp.iloc[0]
+            with st.expander("📝 Formulário de Alteração (mesmo padrão do cadastro)", expanded=True):
+                row_edit_cp = df_cp[df_cp["id"] == st.session_state.cp_editando_id]
+                if row_edit_cp.empty:
+                    st.session_state.cp_editando_id = None
+                else:
+                    reg_cp = row_edit_cp.iloc[0]
 
-                with conn() as c:
-                    fornecedores_edit_cp = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
-                    obrigacoes_edit_cp = c.execute("SELECT id, descricao_obrigacao FROM obrigacoes ORDER BY descricao_obrigacao ASC").fetchall()
+                    with conn() as c:
+                        fornecedores_edit_cp = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
+                        obrigacoes_edit_cp = c.execute("SELECT id, descricao_obrigacao FROM obrigacoes ORDER BY descricao_obrigacao ASC").fetchall()
 
-                mapa_forn_edit = {f"{f['codigo']} - {f['nome']}": int(f["id"]) for f in fornecedores_edit_cp}
-                mapa_obr_edit = {o["descricao_obrigacao"]: int(o["id"]) for o in obrigacoes_edit_cp}
-                opcoes_forn_edit = list(mapa_forn_edit.keys())
-                opcoes_obr_edit = list(mapa_obr_edit.keys())
+                    mapa_forn_edit = {f"{f['codigo']} - {f['nome']}": int(f["id"]) for f in fornecedores_edit_cp}
+                    mapa_obr_edit = {o["descricao_obrigacao"]: int(o["id"]) for o in obrigacoes_edit_cp}
+                    opcoes_forn_edit = list(mapa_forn_edit.keys())
+                    opcoes_obr_edit = list(mapa_obr_edit.keys())
 
-                fornecedor_label_atual = f"{reg_cp['codigo_fornecedor']} - {reg_cp['fornecedor']}"
-                idx_forn_edit = opcoes_forn_edit.index(fornecedor_label_atual) if fornecedor_label_atual in opcoes_forn_edit else 0
-                obr_atual = reg_cp["descricao_obrigacao"]
-                idx_obr_edit = opcoes_obr_edit.index(obr_atual) if obr_atual in opcoes_obr_edit else 0
+                    fornecedor_label_atual = f"{reg_cp['codigo_fornecedor']} - {reg_cp['fornecedor']}"
+                    idx_forn_edit = opcoes_forn_edit.index(fornecedor_label_atual) if fornecedor_label_atual in opcoes_forn_edit else 0
+                    obr_atual = reg_cp["descricao_obrigacao"]
+                    idx_obr_edit = opcoes_obr_edit.index(obr_atual) if obr_atual in opcoes_obr_edit else 0
 
-                data_entrada_edit = pd.to_datetime(reg_cp["data_entrada"], errors="coerce")
-                data_entrada_edit = data_entrada_edit.date() if pd.notna(data_entrada_edit) else date.today()
-                tipo_edit_atual = str(reg_cp.get("tipo_lancamento") or "NAO_MENSAL")
-                dias_alerta_edit_atual = int(reg_cp.get("dias_alerta") or 7)
-                dia_venc_mensal_atual = int(reg_cp.get("dia_vencimento_mensal") or 10)
-                data_venc_base_edit_atual = pd.to_datetime(reg_cp.get("data_vencimento_base"), errors="coerce")
-                data_venc_base_edit_atual = data_venc_base_edit_atual.date() if pd.notna(data_venc_base_edit_atual) else (data_entrada_edit + timedelta(days=30))
+                    data_entrada_edit = pd.to_datetime(reg_cp["data_entrada"], errors="coerce")
+                    data_entrada_edit = data_entrada_edit.date() if pd.notna(data_entrada_edit) else date.today()
+                    tipo_edit_atual = str(reg_cp.get("tipo_lancamento") or "NAO_MENSAL")
+                    dias_alerta_edit_atual = int(reg_cp.get("dias_alerta") or 7)
+                    dia_venc_mensal_atual = int(reg_cp.get("dia_vencimento_mensal") or 10)
+                    data_venc_base_edit_atual = pd.to_datetime(reg_cp.get("data_vencimento_base"), errors="coerce")
+                    data_venc_base_edit_atual = data_venc_base_edit_atual.date() if pd.notna(data_venc_base_edit_atual) else (data_entrada_edit + timedelta(days=30))
 
-                st.markdown("##### ✏️ Alterar Conta a Pagar")
-                with st.form("form_alterar_conta_pagar"):
+                    st.markdown("##### ✏️ Alterar Conta a Pagar")
                     e1, e2, e3 = st.columns(3)
                     forn_edit = e1.selectbox(
                         "Código Fornecedor",
@@ -5973,6 +6966,7 @@ with aba17:
                         if key_df not in st.session_state:
                             parcelas_existentes = _cp_extrair_parcelas(reg_cp.get("vencimentos_parcelas"))
                             parcelas_pagas_existentes = _cp_parse_parcelas_pagas(reg_cp.get("parcelas_pagas"))
+                            parcelas_pagas_detalhe_existentes = _cp_parse_parcelas_pagas_detalhe(reg_cp.get("parcelas_pagas"))
                             valores_ini = _cp_distribuir_valor(float(valor_total_edit), int(qtd_parcelas_edit))
                             linhas_ini = []
                             for i in range(int(qtd_parcelas_edit)):
@@ -5984,6 +6978,7 @@ with aba17:
                                         "Vencimento": data_parcela,
                                         "Valor": valores_ini[i],
                                         "Paga": (i + 1) in parcelas_pagas_existentes,
+                                        "Data Pagamento": parcelas_pagas_detalhe_existentes.get(i + 1),
                                     }
                                 )
                             st.session_state[key_df] = pd.DataFrame(linhas_ini)
@@ -5995,6 +6990,9 @@ with aba17:
                         df_prev = st.session_state[key_df].copy()
                         if "Paga" not in df_prev.columns:
                             df_prev["Paga"] = False
+                            st.session_state[key_df] = df_prev
+                        if "Data Pagamento" not in df_prev.columns:
+                            df_prev["Data Pagamento"] = pd.NaT
                             st.session_state[key_df] = df_prev
                         qtd_atual = int(qtd_parcelas_edit)
                         total_atual = float(valor_total_edit)
@@ -6016,6 +7014,7 @@ with aba17:
                                         "Vencimento": novas_datas[i],
                                         "Valor": novos_valores[i],
                                         "Paga": bool(df_prev.iloc[i]["Paga"]) if (i < len(df_prev) and "Paga" in df_prev.columns) else False,
+                                        "Data Pagamento": df_prev.iloc[i]["Data Pagamento"] if (i < len(df_prev) and "Data Pagamento" in df_prev.columns) else None,
                                     }
                                     for i in range(qtd_atual)
                                 ]
@@ -6043,6 +7042,8 @@ with aba17:
                                 key=f"cp_venc_unico_edit_{id_edit_cp}",
                             )
                             paga_unico_default = bool(linha_unica.get("Paga")) if linha_unica is not None else False
+                            data_pag_unico_default = pd.to_datetime(linha_unica.get("Data Pagamento"), errors="coerce")
+                            data_pag_unico_default = data_pag_unico_default.date() if pd.notna(data_pag_unico_default) else None
                             valor_unico_edit = u2.number_input(
                                 "Valor Parcela (R$)",
                                 min_value=0.0,
@@ -6051,12 +7052,25 @@ with aba17:
                                 key=f"cp_valor_unico_edit_{id_edit_cp}",
                             )
                             paga_unico_edit = st.checkbox("Parcela paga", value=paga_unico_default, key=f"cp_paga_unico_edit_{id_edit_cp}")
+                            data_pag_unico_edit = st.date_input(
+                                "Data Pagamento",
+                                value=data_pag_unico_default if data_pag_unico_default is not None else date.today(),
+                                format="DD/MM/YYYY",
+                                key=f"cp_data_pag_unico_edit_{id_edit_cp}",
+                                disabled=not bool(paga_unico_edit),
+                            )
                             df_parcelas_edit = pd.DataFrame(
-                                [{"Parcela": 1, "Vencimento": venc_unico_edit, "Valor": float(valor_unico_edit), "Paga": bool(paga_unico_edit)}]
+                                [{
+                                    "Parcela": 1,
+                                    "Vencimento": venc_unico_edit,
+                                    "Valor": float(valor_unico_edit),
+                                    "Paga": bool(paga_unico_edit),
+                                    "Data Pagamento": (data_pag_unico_edit if bool(paga_unico_edit) else None),
+                                }]
                             )
                         else:
                             c_ed_p1, c_ed_p2 = st.columns([1, 1])
-                            if c_ed_p1.form_submit_button("🔄 Recalcular Parcelas Iguais", use_container_width=True):
+                            if c_ed_p1.button("🔄 Recalcular Parcelas Iguais", use_container_width=True):
                                 df_tmp = st.session_state[key_df].copy()
                                 novos_valores = _cp_distribuir_valor(float(valor_total_edit), len(df_tmp))
                                 df_tmp["Valor"] = novos_valores
@@ -6076,6 +7090,7 @@ with aba17:
                                     "Vencimento": st.column_config.DateColumn("Data Parcela", format="DD/MM/YYYY"),
                                     "Valor": st.column_config.NumberColumn("Valor Parcela (R$)", format="R$ %.2f", min_value=0.0, step=0.01),
                                     "Paga": st.column_config.CheckboxColumn("Paga", default=False),
+                                    "Data Pagamento": st.column_config.DateColumn("Data Pagamento", format="DD/MM/YYYY"),
                                 },
                             )
                         df_parcelas_edit_atual = df_parcelas_edit.copy()
@@ -6087,6 +7102,21 @@ with aba17:
                         se1.metric("Total NF", brl(valor_total_edit))
                         se2.metric("Soma Parcelas", brl(soma_edit))
                         se3.metric("Diferença", brl(diff_edit))
+                        if not df_parcelas_edit.empty:
+                            df_pag_view_ed = df_parcelas_edit.copy()
+                            df_pag_view_ed["Vencimento"] = pd.to_datetime(df_pag_view_ed["Vencimento"], errors="coerce").dt.date
+                            df_pag_view_ed["Data Pagamento"] = pd.to_datetime(df_pag_view_ed.get("Data Pagamento"), errors="coerce").dt.date
+                            df_pag_view_ed = df_pag_view_ed[df_pag_view_ed["Paga"] == True].copy()
+                            if not df_pag_view_ed.empty:
+                                df_pag_view_ed["Status Pagamento"] = df_pag_view_ed.apply(
+                                    lambda rr: _cp_status_pagamento(rr.get("Vencimento"), rr.get("Data Pagamento")),
+                                    axis=1,
+                                )
+                                st.dataframe(
+                                    df_pag_view_ed[["Parcela", "Vencimento", "Data Pagamento", "Status Pagamento"]],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
 
                         if not df_parcelas_edit.empty and not df_parcelas_edit["Vencimento"].isna().any():
                             datas_edit = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_parcelas_edit["Vencimento"].tolist()]
@@ -6105,8 +7135,8 @@ with aba17:
                         )
 
                     ac1, ac2 = st.columns(2)
-                    salvar_edit_cp = ac1.form_submit_button("💾 Gravar Alterações", type="primary", use_container_width=True)
-                    cancelar_edit_cp = ac2.form_submit_button("❌ Cancelar", use_container_width=True)
+                    salvar_edit_cp = ac1.button("💾 Gravar Alterações", type="primary", use_container_width=True)
+                    cancelar_edit_cp = ac2.button("❌ Cancelar", use_container_width=True)
 
                     if cancelar_edit_cp:
                         id_clear = int(st.session_state.cp_editando_id)
@@ -6187,6 +7217,13 @@ with aba17:
                                 if "Paga" not in df_parcelas_salvar.columns:
                                     df_parcelas_salvar["Paga"] = False
                                 df_parcelas_salvar["Paga"] = df_parcelas_salvar["Paga"].fillna(False).astype(bool)
+                                if "Data Pagamento" not in df_parcelas_salvar.columns:
+                                    df_parcelas_salvar["Data Pagamento"] = pd.NaT
+                                df_parcelas_salvar["Data Pagamento"] = pd.to_datetime(df_parcelas_salvar["Data Pagamento"], errors="coerce").dt.date
+                                hoje_pag_edit = date.today()
+                                mask_paga_sem_data_edit = df_parcelas_salvar["Paga"] & df_parcelas_salvar["Data Pagamento"].isna()
+                                if mask_paga_sem_data_edit.any():
+                                    df_parcelas_salvar.loc[mask_paga_sem_data_edit, "Data Pagamento"] = hoje_pag_edit
                                 df_parcelas_salvar["Vencimento"] = pd.to_datetime(df_parcelas_salvar["Vencimento"], errors="coerce").dt.date
                                 if df_parcelas_salvar["Vencimento"].isna().any():
                                     st.warning("Preencha a data de vencimento de todas as parcelas.")
@@ -6194,9 +7231,11 @@ with aba17:
                                 datas_edit = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_parcelas_salvar["Vencimento"].tolist()]
                                 valores_edit = [float(v) for v in df_parcelas_salvar["Valor"].tolist()]
                                 vencimentos_edit = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_edit, valores_edit))])
-                                parcelas_pagas_edit = _cp_serializar_parcelas_pagas(
-                                    [idx + 1 for idx, paga in enumerate(df_parcelas_salvar["Paga"].tolist()) if bool(paga)]
-                                )
+                                mapa_pagamentos_edit = {}
+                                for idx_row, row in df_parcelas_salvar.reset_index(drop=True).iterrows():
+                                    if bool(row.get("Paga")):
+                                        mapa_pagamentos_edit[idx_row + 1] = row.get("Data Pagamento")
+                                parcelas_pagas_edit = _cp_serializar_parcelas_pagas_detalhe(mapa_pagamentos_edit)
                                 valor_parcela_edit = (sum(valores_edit) / len(valores_edit)) if valores_edit else 0.0
 
                             with conn() as c:
