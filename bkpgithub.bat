@@ -7,7 +7,7 @@ git push
 git status
 
 
-rem checar se aparecer nothing to commit, 
+#checar se aparecer nothing to commit, 
 working # tree clean ok fez o backup 
 correto
 
