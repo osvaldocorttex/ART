@@ -2688,8 +2688,102 @@ with aba2:
                         st.session_state.viagens_exec_id_editando = None
                         st.rerun()
 
-            c_h3 = st.columns(1)[0]
-            if c_h3.button("🖨️ Imprimir", use_container_width=True, key="btn_print_historico_data"):
+            c_h3, c_h4 = st.columns(2)
+            if c_h3.button("🖨️ Imprimir Estadias", use_container_width=True, key="btn_print_viagens_estadias"):
+                with conn() as c:
+                    df_rotas_print = pd.read_sql(
+                        "SELECT origem, destino, nome_empresa_origem, nome_empresa_destino FROM rotas",
+                        c,
+                    )
+                if "nome_empresa_origem" not in df_rotas_print.columns:
+                    df_rotas_print["nome_empresa_origem"] = ""
+                if "nome_empresa_destino" not in df_rotas_print.columns:
+                    df_rotas_print["nome_empresa_destino"] = ""
+                df_rotas_print["origem"] = df_rotas_print["origem"].fillna("").astype(str).str.strip().str.upper()
+                df_rotas_print["destino"] = df_rotas_print["destino"].fillna("").astype(str).str.strip().str.upper()
+                df_rotas_print["nome_empresa_origem"] = df_rotas_print["nome_empresa_origem"].fillna("").astype(str).str.strip()
+                df_rotas_print["nome_empresa_destino"] = df_rotas_print["nome_empresa_destino"].fillna("").astype(str).str.strip()
+                mapa_empresas_rota = {
+                    (str(r["origem"]), str(r["destino"])): (
+                        str(r["nome_empresa_origem"] or ""),
+                        str(r["nome_empresa_destino"] or ""),
+                    )
+                    for _, r in df_rotas_print.iterrows()
+                }
+
+                html_estadias = f"""
+                <html>
+                <head>
+                    <style>
+                        body {{ font-family: sans-serif; margin: 24px; color: #333; }}
+                        header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+                        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
+                        th, td {{ border: 1px solid #999; padding: 8px; text-align: left; }}
+                        th {{ background-color: #f2f2f2; }}
+                        .btn-print {{ background: #007bff; color: white; padding: 12px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 14px; border-radius: 5px; }}
+                        @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
+                    </style>
+                </head>
+                <body>
+                    <button class="btn-print" onclick="window.print()">🖨️ IMPRIMIR ESTADIAS</button>
+                    <header>
+                        <h2 style="margin:0;">Relatório de Estadias</h2>
+                        <p style="margin:6px 0;">Período: <b>{filtro_ini.strftime('%d/%m/%Y')}</b> até <b>{filtro_fim.strftime('%d/%m/%Y')}</b></p>
+                    </header>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Nome Empresa Origem</th>
+                                <th>Nome Empresa Destino</th>
+                                <th>Origem</th>
+                                <th>Destino</th>
+                                <th>Data Chegada</th>
+                                <th>Hora Chegada</th>
+                                <th>Data Descarregamento</th>
+                                <th>Hora Descarregamento</th>
+                                <th>Qtde Estadia</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                """
+                for _, r in df_ed.iterrows():
+                    origem_key = str(r.get("origem", "") or "").strip().upper()
+                    destino_key = str(r.get("destino", "") or "").strip().upper()
+                    nome_empresa_origem, nome_empresa_destino = mapa_empresas_rota.get((origem_key, destino_key), ("", ""))
+                    dt_chegada = pd.to_datetime(r.get("data_chegada"), errors="coerce")
+                    dt_descarreg = pd.to_datetime(r.get("data_descarregamento"), errors="coerce")
+                    data_chegada_br = dt_chegada.strftime("%d/%m/%Y") if pd.notna(dt_chegada) else "-"
+                    data_descarreg_br = dt_descarreg.strftime("%d/%m/%Y") if pd.notna(dt_descarreg) else "-"
+                    hora_chegada = str(r.get("hora_chegada", "") or "").strip() or "-"
+                    hora_descarreg = str(r.get("hora_descarregamento", "") or "").strip() or "-"
+                    qtd_estadia = int(pd.to_numeric(r.get("qtd_estadia_calc"), errors="coerce") or 0)
+                    origem_txt = str(r.get("origem", "") or "").strip() or "-"
+                    destino_txt = str(r.get("destino", "") or "").strip() or "-"
+                    html_estadias += f"""
+                        <tr>
+                            <td>{nome_empresa_origem or "-"}</td>
+                            <td>{nome_empresa_destino or "-"}</td>
+                            <td>{origem_txt}</td>
+                            <td>{destino_txt}</td>
+                            <td>{data_chegada_br}</td>
+                            <td>{hora_chegada}</td>
+                            <td>{data_descarreg_br}</td>
+                            <td>{hora_descarreg}</td>
+                            <td>{qtd_estadia}</td>
+                        </tr>
+                    """
+                html_estadias += """
+                        </tbody>
+                    </table>
+                    <script>
+                        setTimeout(function(){{ window.print(); }}, 600);
+                    </script>
+                </body>
+                </html>
+                """
+                components.html(html_estadias, height=900, scrolling=True)
+
+            if c_h4.button("🖨️ Imprimir", use_container_width=True, key="btn_print_historico_data"):
                 total_frete_periodo = float(pd.to_numeric(df_ed["Total Frete Valor"], errors="coerce").fillna(0.0).sum())
                 total_frete_periodo += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
                 if "qtd_viagens" in df_ed.columns:
