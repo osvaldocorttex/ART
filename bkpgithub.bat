@@ -9,6 +9,8 @@ git push
 git status
 pause
 
-echo checar se aparecer nothing to commit
-echo working  tree clean ok fez o backup correto
-
+echo
+echo
+echo checar se aparecer nothing to
+echo commit working tree clean ok fez o backup correto
+echo
