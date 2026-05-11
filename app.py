@@ -6014,6 +6014,154 @@ with aba21:
             "valor_todos_eixos": st.column_config.NumberColumn("Valor Todos os Eixos", format="R$ %.2f"),
         },
     )
+
+    if not df_praca_pedagio_exibir.empty:
+        # Create report dataframe
+        df_report = df_praca_pedagio_exibir[['rota', 'praca_pedagio', 'rodovia', 'concessionaria', 'sentido_viagem', 'quantidade_eixos', 'valor_por_eixo', 'valor_todos_eixos']].copy()
+        df_report.columns = ['Rota', 'Praça Pedagio', 'Rodovia', 'Concessionaria', 'Sentido Viagem', 'Qtde Eixos', 'Valor Por Eixo', 'Valor Todos os Eixos']
+        
+        # Calculate totals
+        total_ida = float(df_sentido_metricas.loc[df_sentido_metricas["sentido_norm"] == "IDA", "valor_todos_eixos"].sum())
+        total_volta = float(df_sentido_metricas.loc[df_sentido_metricas["sentido_norm"] == "VOLTA", "valor_todos_eixos"].sum())
+        qtd_total = int(len(df_sentido_metricas))
+        
+        # Add summary rows
+        summary_data = {
+            'Rota': '',
+            'Praça Pedagio': '',
+            'Rodovia': '',
+            'Concessionaria': '',
+            'Sentido Viagem': '',
+            'Qtde Eixos': '',
+            'Valor Por Eixo': '',
+            'Valor Todos os Eixos': ''
+        }
+        df_summary_ida = pd.DataFrame([summary_data])
+        df_summary_ida.loc[0, 'Rota'] = 'TOTAL PEDAGIO IDA'
+        df_summary_ida.loc[0, 'Valor Todos os Eixos'] = total_ida
+        
+        df_summary_volta = pd.DataFrame([summary_data])
+        df_summary_volta.loc[0, 'Rota'] = 'TOTAL PEDAGIO RETORNO'
+        df_summary_volta.loc[0, 'Valor Todos os Eixos'] = total_volta
+        
+        df_summary_qtd = pd.DataFrame([summary_data])
+        df_summary_qtd.loc[0, 'Rota'] = 'QTDE PEDAGIO NO PERIODO'
+        df_summary_qtd.loc[0, 'Qtde Eixos'] = qtd_total
+        
+        df_report = pd.concat([df_report, df_summary_ida, df_summary_volta, df_summary_qtd], ignore_index=True)
+        
+        csv_data = df_report.to_csv(index=False, sep=';', decimal=',')
+        
+        st.download_button(
+            label="📊 Relatórios Pedágio",
+            data=csv_data,
+            file_name="relatorio_pedagio.csv",
+            mime="text/csv",
+            key="btn_relatorio_pedagio"
+        )
+
+        # Visualização do Relatório na Tela
+        with st.expander("📋 Visualizar Relatório Pedágio", expanded=False):
+            if st.button("🔍 PREPARAR IMPRESSÃO", use_container_width=True, key="btn_print_pedagio"):
+                # Geração do HTML para impressão
+                html_impressao = f"""
+                <html>
+                <head>
+                    <style>
+                        body {{ font-family: sans-serif; margin: 30px; color: #333; }}
+                        header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+                        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
+                        th, td {{ border: 1px solid #999; padding: 8px; text-align: left; }}
+                        th {{ background-color: #f2f2f2; }}
+                        .container-resumo {{ margin-top: 30px; display: flex; justify-content: flex-end; }}
+                        .tot {{ width: 350px; border: 1px solid #ccc; padding: 15px; background: #fafafa; }}
+                        .ln {{ display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }}
+                        .fin {{ font-weight: bold; font-size: 18px; border-top: 2px solid #2e7d32; color: #2e7d32; padding-top: 10px; margin-top: 10px; }}
+                        .assinatura-box {{ margin-top: 80px; text-align: center; width: 400px; }}
+                        .linha-assinatura {{ border-top: 1px solid #000; margin-bottom: 5px; }}
+                        .btn-print {{ background: #007bff; color: white; padding: 15px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 5px; }}
+                        @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
+                    </style>
+                </head>
+                <body>
+                    <button class="btn-print" onclick="window.print()">🖨️ CLIQUE AQUI PARA IMPRIMIR ESTE RELATÓRIO</button>
+                    
+                    <header>
+                        <h1 style="margin:0;">ART TRANSPORTES</h1>
+                        <p style="margin:5px 0;">RELATÓRIO DE PEDÁGIOS</p>
+                        <p>Período: <b>{filtro_ini.strftime('%d/%m/%Y')}</b> até <b>{filtro_fim.strftime('%d/%m/%Y')}</b></p>
+                        <p style="margin:5px 0;">
+                            Total Pedágio Ida: <b>{brl(total_ida)}</b>
+                            | Total Pedágio Retorno: <b>{brl(total_volta)}</b>
+                            | Quantidade: <b>{qtd_total}</b>
+                        </p>
+                    </header>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Rota</th>
+                                <th>Praça Pedágio</th>
+                                <th>Rodovia</th>
+                                <th>Concessionária</th>
+                                <th>Sentido Viagem</th>
+                                <th>Qtde Eixos</th>
+                                <th>Valor por Eixo</th>
+                                <th>Valor Todos os Eixos</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                """
+                
+                for _, r in df_praca_pedagio_exibir.iterrows():
+                    html_impressao += f"""
+                    <tr>
+                        <td>{r['rota'] or '-'}</td>
+                        <td>{r['praca_pedagio'] or '-'}</td>
+                        <td>{r['rodovia'] or '-'}</td>
+                        <td>{r['concessionaria'] or '-'}</td>
+                        <td>{r['sentido_viagem'] or '-'}</td>
+                        <td>{r['quantidade_eixos'] or 0}</td>
+                        <td>{brl(r['valor_por_eixo'] or 0)}</td>
+                        <td>{brl(r['valor_todos_eixos'] or 0)}</td>
+                    </tr>
+                    """
+                
+                html_impressao += f"""
+                        </tbody>
+                    </table>
+
+                    <div class="container-resumo">
+                        <div class="tot">
+                            <div class="ln"><span>Quantidade de Pedágios:</span> <span>{qtd_total}</span></div>
+                            <div class="ln"><span>Total Pedágio Ida:</span> <span>{brl(total_ida)}</span></div>
+                            <div class="ln"><span>Total Pedágio Retorno:</span> <span>{brl(total_volta)}</span></div>
+                            <div class="ln fin"><span>TOTAL GERAL:</span> <span>{brl(total_ida + total_volta)}</span></div>
+                        </div>
+                    </div>
+
+                    <div class="assinatura-box">
+                        <div class="linha-assinatura"></div>
+                        <p><b>Assinatura do Responsável</b></p>
+                        <p style="font-size: 10px; color: #666;">Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+                    </div>
+
+                    <script>
+                        // Pequeno atraso para garantir que o layout carregue antes de abrir o print
+                        setTimeout(function(){{ window.print(); }}, 700);
+                    </script>
+                </body>
+                </html>
+                """
+                components.html(html_impressao, height=1000, scrolling=True)
+            else:
+                # Métricas do relatório
+                rm1, rm2, rm3, rm4 = st.columns(4)
+                rm1.metric("Quantidade de Pedágios", qtd_total)
+                rm2.metric("Total Pedágio Ida", brl(total_ida))
+                rm3.metric("Total Pedágio Retorno", brl(total_volta))
+                rm4.metric("Total Geral", brl(total_ida + total_volta))
+
     if "praca_pedagio_editando_id" not in st.session_state:
         st.session_state.praca_pedagio_editando_id = None
     if "praca_pedagio_excluir_id" not in st.session_state:
