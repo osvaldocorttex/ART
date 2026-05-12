@@ -1427,6 +1427,15 @@ with aba_home:
         st.info("Sem dados de viagens no período selecionado. Cadastre viagens para visualizar os indicadores.")
     else:
         df_dash = df_db.copy()
+        origem_norm_dash_kpi = df_dash["origem"].fillna("").astype(str).str.strip().str.upper()
+        destino_norm_dash_kpi = df_dash["destino"].fillna("").astype(str).str.strip().str.upper()
+        mask_od_diferente_dash = origem_norm_dash_kpi != destino_norm_dash_kpi
+        qtd_ignoradas_dash = int((~mask_od_diferente_dash).sum())
+        df_dash = df_dash.loc[mask_od_diferente_dash].copy()
+        if qtd_ignoradas_dash > 0:
+            st.info(
+                f"{qtd_ignoradas_dash} viagem(ns) com origem = destino foram desconsideradas na Dashboard para manter o mesmo cálculo da Análise."
+            )
         if "qtd_viagens" not in df_dash.columns:
             df_dash["qtd_viagens"] = 1
         if "tipo_cobranca" not in df_dash.columns:
@@ -1482,11 +1491,99 @@ with aba_home:
         df_dash["custo_diesel"] = (df_dash["litros_diesel"] * df_dash["diesel"]).fillna(0.0)
         df_dash["litros_arla"] = (df_dash["km_total"] / df_dash["consumo_arla"].where(df_dash["consumo_arla"] > 0)).fillna(0.0)
         df_dash["custo_arla"] = (df_dash["litros_arla"] * df_dash["arla"]).fillna(0.0)
+        with conn() as c:
+            df_abs_dash = pd.read_sql(
+                """SELECT tipo_combustivel, total_gasto
+                   FROM abastecimentos
+                   WHERE date(data) BETWEEN ? AND ?""",
+                c,
+                params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
+            )
+        if not df_abs_dash.empty:
+            df_abs_dash["tipo_combustivel"] = df_abs_dash["tipo_combustivel"].apply(normalizar_tipo_combustivel)
+            df_abs_dash["total_gasto"] = pd.to_numeric(df_abs_dash["total_gasto"], errors="coerce").fillna(0.0)
+            custo_arla_real_dash = float(
+                df_abs_dash[df_abs_dash["tipo_combustivel"].str.contains("ARLA", na=False)]["total_gasto"].sum()
+            )
+            total_km_rateio_arla_dash = float(df_dash["km_total"].sum())
+            if total_km_rateio_arla_dash > 0:
+                df_dash["custo_arla"] = (custo_arla_real_dash * (df_dash["km_total"] / total_km_rateio_arla_dash)).fillna(0.0)
+            else:
+                df_dash["custo_arla"] = 0.0
+        else:
+            df_dash["custo_arla"] = 0.0
         df_dash["custo_pedagio"] = (df_dash["pedagio"] * df_dash["qtd_viagens"]).fillna(0.0)
         df_dash["custo_extra"] = (df_dash["gasto_extra"] * df_dash["qtd_viagens"]).fillna(0.0)
         df_dash = aplicar_parametros_por_data(df_dash, col_data="data")
         imposto_pct_dash_series = (pd.to_numeric(df_dash["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)
         df_dash["custo_imposto"] = (df_dash["receita_total"] * imposto_pct_dash_series).fillna(0.0)
+        
+        # Adicionar receita de frete fixo rateada PRIMEIRO
+        total_receita_bruta = df_dash["receita_total"].sum()
+        if total_receita_bruta > 0:
+            proporcao_receita_inicial = df_dash["receita_total"] / total_receita_bruta
+            df_dash["frete_fixo_rateado"] = valor_frete_fixo_periodo * proporcao_receita_inicial
+            df_dash["receita_total"] = df_dash["receita_total"] + df_dash["frete_fixo_rateado"]
+        else:
+            df_dash["frete_fixo_rateado"] = 0.0
+        
+        # RECALCULAR proporção de receita DEPOIS de adicionar frete fixo
+        total_receita_final = df_dash["receita_total"].sum()
+        if total_receita_final > 0:
+            proporcao_receita = df_dash["receita_total"] / total_receita_final
+        else:
+            proporcao_receita = pd.Series([0.0] * len(df_dash), index=df_dash.index)
+        
+        # Adicionar custos baseados em KM (consistente com Análise)
+        df_dash["custo_pneu"] = df_dash["km_total"] * pd.to_numeric(df_dash["param_pneu"], errors="coerce").fillna(0.0)
+        df_dash["custo_manut"] = df_dash["km_total"] * pd.to_numeric(df_dash["param_manut"], errors="coerce").fillna(0.0)
+        df_dash["custo_depre"] = df_dash["km_total"] * pd.to_numeric(df_dash["param_depre"], errors="coerce").fillna(0.0)
+        
+        # Comissão motorista baseada em percentual
+        df_dash["custo_comissao"] = (
+            (df_dash["receita_comissionavel_unit"] * df_dash["qtd_viagens"])
+            * (pd.to_numeric(df_dash["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)
+        )
+        
+        # Custos fixos rateados proporcionalmente ao receita_total FINAL (com frete fixo)
+        if total_receita_final > 0:
+            df_dash["custo_mot_fixo_rateado"] = (
+                valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim) * proporcao_receita
+            )
+            df_dash["custo_seguro_rateado"] = (
+                valor_mensal_rateado_periodo("seguro", filtro_ini, filtro_fim) * proporcao_receita
+            )
+            df_dash["custo_fin_rateado"] = (
+                valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim) * proporcao_receita
+            )
+            df_dash["custo_ipva_rateado"] = (
+                valor_anual_rateado_periodo("pagto_ipva", filtro_ini, filtro_fim) * proporcao_receita
+            )
+            df_dash["custo_escr_rateado"] = (
+                valor_mensal_rateado_periodo("cmp_custo_escritorio", filtro_ini, filtro_fim) * proporcao_receita
+            )
+            
+            # Custos de frete fixo rateados proporcionalmente (obtidos via parametros)
+            custo_comissao_frete_fixo_total_periodo = float(
+                (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+                 * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+            )
+            custo_imposto_frete_fixo_total_periodo = float(
+                (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
+                 * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
+            )
+            
+            df_dash["custo_comissao_frete_fixo"] = custo_comissao_frete_fixo_total_periodo * proporcao_receita
+            df_dash["custo_imposto_frete_fixo"] = custo_imposto_frete_fixo_total_periodo * proporcao_receita
+        else:
+            df_dash["custo_mot_fixo_rateado"] = 0.0
+            df_dash["custo_seguro_rateado"] = 0.0
+            df_dash["custo_fin_rateado"] = 0.0
+            df_dash["custo_ipva_rateado"] = 0.0
+            df_dash["custo_escr_rateado"] = 0.0
+            df_dash["custo_comissao_frete_fixo"] = 0.0
+            df_dash["custo_imposto_frete_fixo"] = 0.0
+        
         df_dash["lucro_operacional"] = (
             df_dash["receita_total"]
             - df_dash["custo_diesel"]
@@ -1494,6 +1591,17 @@ with aba_home:
             - df_dash["custo_pedagio"]
             - df_dash["custo_extra"]
             - df_dash["custo_imposto"]
+            - df_dash["custo_pneu"]
+            - df_dash["custo_manut"]
+            - df_dash["custo_depre"]
+            - df_dash["custo_comissao"]
+            - df_dash["custo_mot_fixo_rateado"]
+            - df_dash["custo_seguro_rateado"]
+            - df_dash["custo_fin_rateado"]
+            - df_dash["custo_ipva_rateado"]
+            - df_dash["custo_escr_rateado"]
+            - df_dash["custo_comissao_frete_fixo"]
+            - df_dash["custo_imposto_frete_fixo"]
         ).fillna(0.0)
 
         total_receita_dash = float(df_dash["receita_total"].sum())
@@ -1506,18 +1614,25 @@ with aba_home:
                 + df_dash["custo_pedagio"]
                 + df_dash["custo_extra"]
                 + df_dash["custo_imposto"]
+                + df_dash["custo_pneu"]
+                + df_dash["custo_manut"]
+                + df_dash["custo_depre"]
+                + df_dash["custo_comissao"]
+                + df_dash["custo_mot_fixo_rateado"]
+                + df_dash["custo_seguro_rateado"]
+                + df_dash["custo_fin_rateado"]
+                + df_dash["custo_ipva_rateado"]
+                + df_dash["custo_escr_rateado"]
+                + df_dash["custo_comissao_frete_fixo"]
+                + df_dash["custo_imposto_frete_fixo"]
             ).sum()
         )
         total_lucro_dash = float(df_dash["lucro_operacional"].sum())
-        custo_imposto_frete_fixo_dash = float(
-            (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
-             * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
-        )
-        total_receita_dash += valor_frete_fixo_periodo
-        total_custo_dash += custo_imposto_frete_fixo_dash
-        total_lucro_dash += (valor_frete_fixo_periodo - custo_imposto_frete_fixo_dash)
-        margem_dash = (total_lucro_dash / total_receita_dash * 100.0) if total_receita_dash > 0 else 0.0
+        
+        # Calcular ticket médio antes de adicionar frete fixo (média por viagem)
         ticket_medio_dash = (total_receita_dash / total_viagens_dash) if total_viagens_dash > 0 else 0.0
+        
+        margem_dash = (total_lucro_dash / total_receita_dash * 100.0) if total_receita_dash > 0 else 0.0
 
         meta_faturamento = float(p.get("meta_faturamento", 50000.0))
         perc_meta = (total_receita_dash / meta_faturamento * 100.0) if meta_faturamento > 0 else 0.0
@@ -1628,21 +1743,14 @@ with aba_home:
             df_tend["data_dt"] = pd.to_datetime(df_tend["data"], errors="coerce")
             df_tend["mes_periodo"] = df_tend["data_dt"].dt.to_period("M")
             df_tend["mes"] = df_tend["mes_periodo"].astype(str)
-            df_tend = aplicar_parametros_por_data(df_tend, col_data="data")
-            df_tend["custo_pneu"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_pneu"], errors="coerce").fillna(0.0)
-            df_tend["custo_manut"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_manut"], errors="coerce").fillna(0.0)
-            df_tend["custo_depre"] = df_tend["km_total"] * pd.to_numeric(df_tend["param_depre"], errors="coerce").fillna(0.0)
-            df_tend["custo_comissao"] = (
-                (df_tend["receita_comissionavel_unit"] * df_tend["qtd_viagens"])
-                * (pd.to_numeric(df_tend["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)
-            )
-            df_tend["custo_imposto"] = df_tend["receita_total"] * (pd.to_numeric(df_tend["param_imposto_pct"], errors="coerce").fillna(0.0) / 100.0)
 
             df_tend_g = (
                 df_tend.groupby("mes", as_index=False)
                 .agg(
                     receita=("receita_total", "sum"),
+                    frete_fixo_rateado=("frete_fixo_rateado", "sum"),
                     custo_diesel=("custo_diesel", "sum"),
+                    custo_arla=("custo_arla", "sum"),
                     custo_pedagio=("custo_pedagio", "sum"),
                     custo_extra=("custo_extra", "sum"),
                     custo_pneu=("custo_pneu", "sum"),
@@ -1650,6 +1758,13 @@ with aba_home:
                     custo_depre=("custo_depre", "sum"),
                     custo_comissao=("custo_comissao", "sum"),
                     custo_imposto=("custo_imposto", "sum"),
+                    custo_mot_fixo_rateado=("custo_mot_fixo_rateado", "sum"),
+                    custo_seguro_rateado=("custo_seguro_rateado", "sum"),
+                    custo_fin_rateado=("custo_fin_rateado", "sum"),
+                    custo_ipva_rateado=("custo_ipva_rateado", "sum"),
+                    custo_escr_rateado=("custo_escr_rateado", "sum"),
+                    custo_comissao_frete_fixo=("custo_comissao_frete_fixo", "sum"),
+                    custo_imposto_frete_fixo=("custo_imposto_frete_fixo", "sum"),
                 )
                 .sort_values("mes")
             )
@@ -1665,82 +1780,10 @@ with aba_home:
                 return (fim_ref - ini_ref).days + 1
 
             df_tend_g["dias_no_filtro"] = df_tend_g["mes"].apply(dias_mes_no_filtro)
-            df_tend_g["fator_rateio"] = df_tend_g["dias_no_filtro"] / 30.0
-            df_tend_g["frete_fixo_rateado"] = df_tend_g["mes"].apply(
-                lambda m: valor_mensal_rateado_periodo(
-                    "valor_frete_mensal_fixo",
-                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                )
-            )
-            df_tend_g["receita"] = df_tend_g["receita"] + df_tend_g["frete_fixo_rateado"]
-            df_tend_g["custo_comissao_frete_fixo"] = df_tend_g["mes"].apply(
-                lambda m: float(
-                    (serie_parametro_diaria(
-                        "valor_frete_mensal_fixo",
-                        max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                        min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                    ) / 30.0
-                     * (serie_parametro_diaria(
-                        "motora_pct",
-                        max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                        min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                    ) / 100.0)).sum()
-                )
-            )
-            df_tend_g["custo_imposto_frete_fixo"] = df_tend_g["mes"].apply(
-                lambda m: float(
-                    (serie_parametro_diaria(
-                        "valor_frete_mensal_fixo",
-                        max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                        min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                    ) / 30.0
-                     * (serie_parametro_diaria(
-                        "imposto_pct",
-                        max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                        min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                    ) / 100.0)).sum()
-                )
-            )
-            df_tend_g["custo_mot_fixo_rateado"] = df_tend_g["mes"].apply(
-                lambda m: valor_mensal_rateado_periodo(
-                    "motora_fixo",
-                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                )
-            )
-            df_tend_g["custo_seguro_rateado"] = df_tend_g["mes"].apply(
-                lambda m: valor_mensal_rateado_periodo(
-                    "seguro",
-                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                )
-            )
-            df_tend_g["custo_fin_rateado"] = df_tend_g["mes"].apply(
-                lambda m: valor_mensal_rateado_periodo(
-                    "financiamento",
-                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                )
-            )
-            # IPVA informado como valor anual: rateio proporcional por dia.
-            df_tend_g["custo_ipva_rateado"] = df_tend_g["mes"].apply(
-                lambda m: valor_anual_rateado_periodo(
-                    "pagto_ipva",
-                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                )
-            )
-            df_tend_g["custo_escr_rateado"] = df_tend_g["mes"].apply(
-                lambda m: valor_mensal_rateado_periodo(
-                    "cmp_custo_escritorio",
-                    max(filtro_ini, pd.Period(m, freq="M").start_time.date()),
-                    min(filtro_fim, pd.Period(m, freq="M").end_time.date()),
-                )
-            )
-
+            # Calcular custos totais agregando os já rateados em viagens individuais
             df_tend_g["custos"] = (
                 df_tend_g["custo_diesel"]
+                + df_tend_g["custo_arla"]
                 + df_tend_g["custo_pedagio"]
                 + df_tend_g["custo_extra"]
                 + df_tend_g["custo_pneu"]
@@ -1764,18 +1807,6 @@ with aba_home:
             df_dash.groupby(["origem", "destino"], as_index=False)
             .agg(receita=("receita_total", "sum"), lucro=("lucro_operacional", "sum"), viagens=("qtd_viagens", "sum"), km=("km_total", "sum"))
         )
-        if not df_rotas_dash.empty and valor_frete_fixo_periodo > 0:
-                total_receita_rotas_dash = float(df_rotas_dash["receita"].sum())
-                if total_receita_rotas_dash > 0:
-                    proporcao_rotas_dash = df_rotas_dash["receita"] / total_receita_rotas_dash
-                    receita_fixa_rateada_dash = valor_frete_fixo_periodo * proporcao_rotas_dash
-                    custo_imposto_fixo_total_dash = float(
-                        (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
-                         * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
-                    )
-                    custo_imposto_fixo_rateado_dash = custo_imposto_fixo_total_dash * proporcao_rotas_dash
-                    df_rotas_dash["receita"] = df_rotas_dash["receita"] + receita_fixa_rateada_dash
-                    df_rotas_dash["lucro"] = df_rotas_dash["lucro"] + (receita_fixa_rateada_dash - custo_imposto_fixo_rateado_dash)
         if not df_rotas_dash.empty:
             df_rotas_dash["rota"] = df_rotas_dash["origem"].astype(str) + " → " + df_rotas_dash["destino"].astype(str)
             top_rotas = df_rotas_dash.sort_values("receita", ascending=False).head(8).sort_values("receita", ascending=True)
