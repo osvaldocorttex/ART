@@ -288,7 +288,8 @@ def init_db():
             km_atual REAL,
             km_proxima REAL,
             detalhes TEXT,
-            data_vencimento TEXT
+            data_vencimento TEXT,
+            dias_alerta INTEGER DEFAULT 30
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS parametros_historico (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -502,6 +503,8 @@ def init_db():
         colunas_trocas = [coluna[1] for coluna in cursor_trocas.fetchall()]
         if "descricao_veiculo" not in colunas_trocas:
             c.execute("ALTER TABLE controle_trocas ADD COLUMN descricao_veiculo TEXT")
+        if "dias_alerta" not in colunas_trocas:
+            c.execute("ALTER TABLE controle_trocas ADD COLUMN dias_alerta INTEGER DEFAULT 30")
         # Preenche descrição do veículo para registros antigos com base na placa
         c.execute(
             """UPDATE controle_trocas
@@ -682,7 +685,14 @@ if placa_filtro_calculo:
 def fator_rateio_mensal_por_periodo(data_inicio, data_fim):
     if data_inicio is None or data_fim is None or data_fim < data_inicio:
         return 0.0
-    return ((data_fim - data_inicio).days + 1) / 30.0
+    return dias_rateio_periodo(data_inicio, data_fim) / 30.0
+
+
+def dias_rateio_periodo(data_inicio, data_fim, limite_dias=30):
+    if data_inicio is None or data_fim is None or data_fim < data_inicio:
+        return 0
+    dias_periodo = (data_fim - data_inicio).days + 1
+    return min(int(dias_periodo), int(limite_dias))
 
 PARAM_CAMPOS_HIST = [
     "consumo",
@@ -748,7 +758,11 @@ def aplicar_parametros_por_data(df_origem, col_data="data"):
 def serie_parametro_diaria(campo, data_inicio, data_fim):
     if data_inicio is None or data_fim is None or data_fim < data_inicio:
         return pd.Series(dtype=float)
-    idx = pd.date_range(start=data_inicio, end=data_fim, freq="D")
+    dias_rateio = dias_rateio_periodo(data_inicio, data_fim)
+    if dias_rateio <= 0:
+        return pd.Series(dtype=float)
+    data_fim_rateio = data_inicio + timedelta(days=dias_rateio - 1)
+    idx = pd.date_range(start=data_inicio, end=data_fim_rateio, freq="D")
     base = pd.DataFrame({"data_ref": idx})
     if st.session_state.simulacao_ativa:
         return pd.Series(float(p.get(campo, 0.0) or 0.0), index=idx)
@@ -918,39 +932,65 @@ if not st.session_state.popup_trocas_exibido:
         hoje_trocas_popup = date.today()
         with conn() as c:
             df_alerta_trocas = pd.read_sql(
-                """SELECT tipo_servico, veiculo_placa, data_vencimento
-                   FROM controle_trocas
+                """SELECT
+                       ct.tipo_servico,
+                       ct.veiculo_placa,
+                       COALESCE(NULLIF(TRIM(ct.descricao_veiculo), ''), v.descricao, '') AS descricao_veiculo,
+                       ct.data_vencimento,
+                       COALESCE(ct.dias_alerta, 30) AS dias_alerta
+                   FROM controle_trocas ct
+                   LEFT JOIN veiculos v
+                     ON UPPER(TRIM(v.placa)) = UPPER(TRIM(ct.veiculo_placa))
                    WHERE data_vencimento IS NOT NULL
-                     AND date(data_vencimento) <= date('now','localtime','+30 day')
                    ORDER BY date(data_vencimento) ASC""",
                 c,
             )
 
         if not df_alerta_trocas.empty:
             df_alerta_trocas["data_vencimento"] = pd.to_datetime(df_alerta_trocas["data_vencimento"], errors="coerce").dt.date
+            df_alerta_trocas["dias_alerta"] = pd.to_numeric(df_alerta_trocas["dias_alerta"], errors="coerce").fillna(30).astype(int)
             df_alerta_trocas["dias_para_vencer"] = df_alerta_trocas["data_vencimento"].apply(
                 lambda d: (d - hoje_trocas_popup).days if pd.notna(d) else None
             )
-            df_alerta_trocas["status"] = df_alerta_trocas["dias_para_vencer"].apply(
-                lambda dias: "Já venceu os 30 dias" if dias is not None and dias < -30 else (
-                    "Vencido" if dias is not None and dias < 0 else "Vence em até 30 dias"
-                )
+            df_alerta_trocas["veiculo"] = df_alerta_trocas.apply(
+                lambda r: (
+                    f"{str(r.get('veiculo_placa') or '').strip()} - {str(r.get('descricao_veiculo') or '').strip()}"
+                    if str(r.get("descricao_veiculo") or "").strip()
+                    else str(r.get("veiculo_placa") or "").strip()
+                ),
+                axis=1,
             )
-            df_alerta_trocas["situacao_popup"] = df_alerta_trocas["dias_para_vencer"].apply(
-                lambda dias: "-" if dias is None else (
-                    "Vence hoje" if dias == 0 else (
-                        f"Faltam {dias} dia(s) para vencer" if dias > 0 else (
-                            f"Já venceu os 30 dias (há {abs(dias)} dia(s))" if abs(dias) > 30 else f"Vencido há {abs(dias)} dia(s)"
+            df_alerta_trocas = df_alerta_trocas[
+                df_alerta_trocas["dias_para_vencer"].notna()
+                & (
+                    (df_alerta_trocas["dias_para_vencer"] < 0)
+                    | (df_alerta_trocas["dias_para_vencer"] <= df_alerta_trocas["dias_alerta"])
+                )
+            ].copy()
+            df_alerta_trocas["status"] = df_alerta_trocas.apply(
+                lambda r: f"Já venceu o prazo de {int(r['dias_alerta'])} dias" if int(r["dias_para_vencer"]) < -int(r["dias_alerta"]) else (
+                    "Vencido" if int(r["dias_para_vencer"]) < 0 else f"Vence em até {int(r['dias_alerta'])} dias"
+                ),
+                axis=1,
+            )
+            df_alerta_trocas["situacao_popup"] = df_alerta_trocas.apply(
+                lambda r: (
+                    "Vence hoje" if int(r["dias_para_vencer"]) == 0 else (
+                        f"Faltam {int(r['dias_para_vencer'])} dia(s) para vencer" if int(r["dias_para_vencer"]) > 0 else (
+                            f"Já venceu o prazo de {int(r['dias_alerta'])} dias (há {abs(int(r['dias_para_vencer']))} dia(s))"
+                            if abs(int(r["dias_para_vencer"])) > int(r["dias_alerta"])
+                            else f"Vencido há {abs(int(r['dias_para_vencer']))} dia(s)"
                         )
                     )
-                )
+                ),
+                axis=1,
             )
             qtd_vencidos_trocas = int((df_alerta_trocas["dias_para_vencer"] < 0).sum())
-            qtd_venc_30_trocas = int(((df_alerta_trocas["dias_para_vencer"] >= 0) & (df_alerta_trocas["dias_para_vencer"] <= 30)).sum())
+            qtd_venc_alerta_trocas = int((df_alerta_trocas["dias_para_vencer"] >= 0).sum())
             qtd_total_alerta_trocas = len(df_alerta_trocas)
         else:
             qtd_vencidos_trocas = 0
-            qtd_venc_30_trocas = 0
+            qtd_venc_alerta_trocas = 0
             qtd_total_alerta_trocas = 0
 
         if qtd_total_alerta_trocas > 0:
@@ -962,7 +1002,7 @@ if not st.session_state.popup_trocas_exibido:
                         <div style="border:1px solid #f5c2c7;background:#fff5f5;padding:14px;border-radius:12px;margin-bottom:12px;">
                             <div style="font-size:20px;font-weight:700;color:#b42318;">⚠️ Atenção</div>
                             <div style="color:#7a271a;font-size:15px;">
-                                Existem <strong>{qtd_total_alerta_trocas}</strong> item(ns) no controle de trocas com vencimento em 30 dias ou menos.
+                                Existem <strong>{qtd_total_alerta_trocas}</strong> item(ns) no controle de trocas dentro do prazo de alerta configurado.
                             </div>
                         </div>
                         <div style="display:flex;gap:10px;flex-wrap:wrap;">
@@ -970,21 +1010,22 @@ if not st.session_state.popup_trocas_exibido:
                                 Vencidos: {qtd_vencidos_trocas}
                             </div>
                             <div style="background:#fff4ce;color:#8a5a00;padding:10px 12px;border-radius:10px;font-weight:600;">
-                                A vencer em até 30 dias: {qtd_venc_30_trocas}
+                                A vencer no prazo de alerta: {qtd_venc_alerta_trocas}
                             </div>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
-                    st.markdown("**Itens de trocas que estão vencidos ou vencem em até 30 dias:**")
+                    st.markdown("**Itens de trocas que estão vencidos ou vencem dentro do prazo de alerta:**")
                     st.dataframe(
-                        df_alerta_trocas[["tipo_servico", "veiculo_placa", "data_vencimento", "situacao_popup", "status"]],
+                        df_alerta_trocas[["tipo_servico", "veiculo", "data_vencimento", "dias_alerta", "situacao_popup", "status"]],
                         use_container_width=True,
                         hide_index=True,
                         column_config={
                             "tipo_servico": st.column_config.TextColumn("Tipo de Serviço"),
-                            "veiculo_placa": st.column_config.TextColumn("Veículo"),
+                            "veiculo": st.column_config.TextColumn("Veículo"),
                             "data_vencimento": st.column_config.DateColumn("Data Vencimento", format="DD/MM/YYYY"),
+                            "dias_alerta": st.column_config.NumberColumn("Dias Alerta", format="%d"),
                             "situacao_popup": st.column_config.TextColumn("Situação"),
                             "status": st.column_config.TextColumn("Status"),
                         },
@@ -998,12 +1039,12 @@ if not st.session_state.popup_trocas_exibido:
                 itens_trocas_txt = []
                 for _, r in df_alerta_trocas.head(10).iterrows():
                     venc = r["data_vencimento"].strftime("%d/%m/%Y") if pd.notna(r["data_vencimento"]) else "-"
-                    itens_trocas_txt.append(f"{r['tipo_servico']} - {r['veiculo_placa']} ({venc}) - {r['situacao_popup']}")
+                    itens_trocas_txt.append(f"{r['tipo_servico']} - {r['veiculo']} ({venc}) - {r['situacao_popup']}")
                 itens_trocas_popup = " | ".join(itens_trocas_txt)
                 components.html(
                     f"""
                     <script>
-                        alert("ATENÇÃO: Existem {qtd_total_alerta_trocas} item(ns) no CONTROLE DE TROCAS com vencimento em 30 dias ou menos. Vencidos: {qtd_vencidos_trocas} | A vencer em até 30 dias: {qtd_venc_30_trocas}. Itens: {itens_trocas_popup}");
+                        alert("ATENÇÃO: Existem {qtd_total_alerta_trocas} item(ns) no CONTROLE DE TROCAS dentro do prazo de alerta configurado. Vencidos: {qtd_vencidos_trocas} | A vencer no prazo de alerta: {qtd_venc_alerta_trocas}. Itens: {itens_trocas_popup}");
                     </script>
                     """,
                     height=0,
@@ -1656,9 +1697,12 @@ with aba_home:
                 SELECT COUNT(*) AS qtd
                 FROM controle_trocas
                 WHERE data_vencimento IS NOT NULL
-                  AND date(data_vencimento) <= date(?, '+30 day')
+                  AND (
+                      date(data_vencimento) < date(?)
+                      OR date(data_vencimento) <= date(?, '+' || COALESCE(dias_alerta, 30) || ' day')
+                  )
                 """,
-                (hoje_dash,),
+                (hoje_dash, hoje_dash),
             ).fetchone()
         qtd_alertas_ml = int(alertas_ml_dash["qtd"] if alertas_ml_dash else 0)
         qtd_alertas_trocas = int(alertas_trocas_dash["qtd"] if alertas_trocas_dash else 0)
@@ -1728,7 +1772,7 @@ with aba_home:
                 <div class="meta-track"><div class="meta-fill" style="width:{perc_meta_lim:.2f}%;"></div></div>
                 <div style="margin-top:8px;color:#36556f;font-weight:700;font-size:12px;">{perc_meta:.1f}% da meta atingida no período atual</div>
                 <span class="alert-chip chip-a">ME LEMBRA em 30 dias: {qtd_alertas_ml}</span>
-                <span class="alert-chip chip-b">TROCAS em 30 dias: {qtd_alertas_trocas}</span>
+                <span class="alert-chip chip-b">TROCAS no alerta: {qtd_alertas_trocas}</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -2086,16 +2130,24 @@ with aba1:
         cl_v = cc.text_input("Cliente", value="CONTATTO")
         nf_v = cd.text_input("N.NF")
         ct2, ct3, ct4, ct5 = st.columns(4)
-        data_chegada_v = ct2.date_input("Data Chegada Descarregamento", format="DD/MM/YYYY")
+        data_chegada_tmp_v = ct2.date_input("Data Chegada Descarregamento", value=None, format="DD/MM/YYYY", key="cad_data_chegada")
+        deixar_data_chegada_em_branco_v = ct2.checkbox("Salvar data chegada em branco", value=True, key="cad_data_chegada_em_branco")
+        if deixar_data_chegada_em_branco_v:
+            data_chegada_v = None
+            ct2.caption("Você pode preencher depois na edição.")
+        else:
+            data_chegada_v = data_chegada_tmp_v
         hora_chegada_v = ct3.text_input("Hora Chegada Descarregamento", placeholder="HH:MM")
-        data_descarregamento_tmp_v = ct4.date_input("Data descarregamento", format="DD/MM/YYYY", key="cad_data_descarregamento")
+        data_descarregamento_tmp_v = ct4.date_input("Data descarregamento", value=None, format="DD/MM/YYYY", key="cad_data_descarregamento")
         deixar_data_descarregamento_em_branco_v = ct4.checkbox("Salvar data descarregamento em branco", value=True, key="cad_data_descarregamento_em_branco")
         if deixar_data_descarregamento_em_branco_v:
             data_descarregamento_v = None
             ct4.caption("Você pode preencher depois na edição.")
         else:
             data_descarregamento_v = data_descarregamento_tmp_v
-        hora_descarregamento_v = ct5.text_input("Hora descarregamento", placeholder="HH:MM")
+        hora_descarregamento_tmp_v = ct5.text_input("Hora descarregamento", placeholder="HH:MM")
+        deixar_hora_descarregamento_em_branco_v = ct5.checkbox("Salvar hora descarregamento em branco", value=True, key="cad_hora_descarregamento_em_branco")
+        hora_descarregamento_v = "" if deixar_hora_descarregamento_em_branco_v else hora_descarregamento_tmp_v
         c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns(11)
         tipo_cobranca_v = c0.selectbox("Tipo Cálculo", ["TONELADA", "KM"], key="cad_tipo_calc")
         modo_ton = (tipo_cobranca_v == "TONELADA")
@@ -2550,20 +2602,29 @@ with aba2:
                         nf_ed = ce4.text_input("N.NF", value=str(r["nf"] or ""))
                         ce_data1, ce_data2, ce_data3, ce_data4 = st.columns(4)
                         data_chegada_default = pd.to_datetime(r.get("data_chegada"), errors="coerce")
-                        if pd.isna(data_chegada_default):
-                            data_chegada_default = pd.to_datetime(r["data"], errors="coerce")
-                        data_chegada_ed = ce_data1.date_input(
+                        data_chegada_value = None if pd.isna(data_chegada_default) else data_chegada_default.date()
+                        data_chegada_tmp_ed = ce_data1.date_input(
                             "Data Chegada Descarregamento",
-                            value=data_chegada_default.date(),
+                            value=data_chegada_value,
                             format="DD/MM/YYYY",
+                            key=f"edit_data_chegada_{int(r['id'])}",
                         )
+                        deixar_data_chegada_em_branco_ed = ce_data1.checkbox(
+                            "Salvar em branco",
+                            value=pd.isna(pd.to_datetime(r.get("data_chegada"), errors="coerce")),
+                            key=f"edit_data_chegada_em_branco_{int(r['id'])}",
+                        )
+                        if deixar_data_chegada_em_branco_ed:
+                            data_chegada_ed = None
+                            ce_data1.caption("Data chegada ficará em branco.")
+                        else:
+                            data_chegada_ed = data_chegada_tmp_ed
                         hora_chegada_ed = ce_data2.text_input("Hora Chegada Descarregamento", value=str(r.get("hora_chegada", "") or ""), placeholder="HH:MM")
                         data_descarregamento_default = pd.to_datetime(r.get("data_descarregamento"), errors="coerce")
-                        if pd.isna(data_descarregamento_default):
-                            data_descarregamento_default = pd.to_datetime(r["data"], errors="coerce")
+                        data_descarregamento_value = None if pd.isna(data_descarregamento_default) else data_descarregamento_default.date()
                         data_descarregamento_tmp_ed = ce_data3.date_input(
                             "Data descarregamento",
-                            value=data_descarregamento_default.date(),
+                            value=data_descarregamento_value,
                             format="DD/MM/YYYY",
                             key=f"edit_data_descarregamento_{int(r['id'])}",
                         )
@@ -2577,7 +2638,13 @@ with aba2:
                             ce_data3.caption("Data descarregamento ficará em branco.")
                         else:
                             data_descarregamento_ed = data_descarregamento_tmp_ed
-                        hora_descarregamento_ed = ce_data4.text_input("Hora descarregamento", value=str(r.get("hora_descarregamento", "") or ""), placeholder="HH:MM")
+                        hora_descarregamento_tmp_ed = ce_data4.text_input("Hora descarregamento", value=str(r.get("hora_descarregamento", "") or ""), placeholder="HH:MM")
+                        deixar_hora_descarregamento_em_branco_ed = ce_data4.checkbox(
+                            "Salvar em branco",
+                            value=not str(r.get("hora_descarregamento", "") or "").strip(),
+                            key=f"edit_hora_descarregamento_em_branco_{int(r['id'])}",
+                        )
+                        hora_descarregamento_ed = "" if deixar_hora_descarregamento_em_branco_ed else hora_descarregamento_tmp_ed
                         qtd_estadia_form_calc = calcular_qtd_estadia(
                             data_chegada_ed,
                             hora_chegada_ed,
@@ -2741,6 +2808,38 @@ with aba2:
                     )
                     for _, r in df_rotas_print.iterrows()
                 }
+                for _, r in df_rotas_print.iterrows():
+                    origem_rota = str(r["origem"])
+                    destino_rota = str(r["destino"])
+                    nome_origem_rota = str(r["nome_empresa_origem"] or "")
+                    nome_destino_rota = str(r["nome_empresa_destino"] or "")
+                    chave_rota = (origem_rota, destino_rota)
+                    chave_rota_inversa = (destino_rota, origem_rota)
+                    if nome_origem_rota or nome_destino_rota:
+                        mapa_empresas_rota[chave_rota] = (nome_origem_rota, nome_destino_rota)
+                        if chave_rota_inversa not in mapa_empresas_rota or not any(mapa_empresas_rota[chave_rota_inversa]):
+                            mapa_empresas_rota[chave_rota_inversa] = (nome_destino_rota, nome_origem_rota)
+
+                pendencias_estadia = []
+                for _, r_pend in df_ed.iterrows():
+                    origem_pend = str(r_pend.get("origem", "") or "").strip().upper()
+                    destino_pend = str(r_pend.get("destino", "") or "").strip().upper()
+                    nome_emp_origem_pend, nome_emp_destino_pend = mapa_empresas_rota.get((origem_pend, destino_pend), ("", ""))
+                    campos_pendentes = []
+                    if not nome_emp_origem_pend:
+                        campos_pendentes.append("Nome Empresa Origem")
+                    if not nome_emp_destino_pend:
+                        campos_pendentes.append("Nome Empresa Destino")
+                    if pd.isna(pd.to_datetime(r_pend.get("data_descarregamento"), errors="coerce")):
+                        campos_pendentes.append("Data Descarregamento")
+                    if not str(r_pend.get("hora_descarregamento", "") or "").strip():
+                        campos_pendentes.append("Hora Descarregamento")
+                    if campos_pendentes:
+                        pendencias_estadia.append(
+                            f"ID {int(r_pend.get('id', 0) or 0)} - {origem_pend or '-'} x {destino_pend or '-'}: {', '.join(campos_pendentes)}"
+                        )
+                if pendencias_estadia:
+                    st.warning("Campos pendentes no relatório de estadias:\n" + "\n".join(pendencias_estadia))
 
                 html_estadias = f"""
                 <html>
@@ -2751,6 +2850,8 @@ with aba2:
                         table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
                         th, td {{ border: 1px solid #999; padding: 8px; text-align: left; }}
                         th {{ background-color: #f2f2f2; }}
+                        .formula-estadia {{ margin-top: 14px; padding: 10px 12px; border: 1px solid #999; background: #fafafa; font-size: 12px; line-height: 1.45; }}
+                        .formula-estadia strong {{ display: block; margin-bottom: 4px; }}
                         .btn-print {{ background: #007bff; color: white; padding: 12px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 14px; border-radius: 5px; }}
                         @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
                     </style>
@@ -2761,6 +2862,12 @@ with aba2:
                         <h2 style="margin:0;">Relatório de Estadias</h2>
                         <p style="margin:6px 0;">Período: <b>{filtro_ini.strftime('%d/%m/%Y')}</b> até <b>{filtro_fim.strftime('%d/%m/%Y')}</b></p>
                     </header>
+                    <div class="formula-estadia">
+                        <strong>Como é feito o cálculo da Qtde Estadia</strong>
+                        Horas totais = Data/Hora Descarregamento - Data/Hora Chegada.<br>
+                        Horas excedentes = Horas totais - 5 horas de franquia.<br>
+                        Qtde Estadia = 0 quando as horas excedentes forem menores ou iguais a 0; caso contrário, Qtde Estadia = arredondar para cima(Horas excedentes / 24).
+                    </div>
                     <table>
                         <thead>
                             <tr>
@@ -3248,7 +3355,7 @@ with aba3:
         t_comis = t_comis_viagens + t_comis_frete_fixo
         t_imposto = t_imposto_viagens + t_imposto_frete_fixo
 
-        dias_periodo = max(1, (filtro_fim - filtro_ini).days + 1)
+        dias_periodo = max(1, dias_rateio_periodo(filtro_ini, filtro_fim))
         t_mot_fixo_rateado = valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim)
         t_seguro = valor_mensal_rateado_periodo("seguro", filtro_ini, filtro_fim)
         t_fin = valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim)
@@ -3369,7 +3476,7 @@ with aba3:
             ),
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"Rateio dos custos fixos considerando {dias_periodo} dia(s) no filtro com vigência histórica dos parâmetros. IPVA rateado por dia (anual/365).")
+        st.caption(f"Rateio dos custos fixos limitado a {dias_periodo} dia(s), mesmo quando o filtro passa de 30 dias. IPVA rateado por dia (anual/365).")
 
 
 
@@ -5058,14 +5165,15 @@ with aba13:
             c_t3, c_t4 = st.columns(2)
             km_prox = c_t3.number_input("Próxima KM", step=1.0)
             dt_venc_t = c_t4.date_input("Vencimento (Data)", value=dt_t + timedelta(days=180), format="DD/MM/YYYY")
+            dias_alerta_t = c_t4.number_input("Ativar popup faltando (dias)", min_value=0, max_value=365, value=30, step=1)
             
             det_t = st.text_area("Detalhes/Peças Utilizadas (Ex: Marca do pneu, DOT, etc)")
             
             if st.form_submit_button("💾 Gravar", key="btn_troca_cadastro_gravar"):
                 with conn() as c:
-                    c.execute("""INSERT INTO controle_trocas (tipo_servico, data_servico, veiculo_placa, descricao_veiculo, km_atual, km_proxima, detalhes, data_vencimento) 
-                                 VALUES (?,?,?,?,?,?,?,?)""", 
-                              (serv_t, dt_t.isoformat(), placa_t, descricao_t, km_t, km_prox, det_t, dt_venc_t.isoformat()))
+                    c.execute("""INSERT INTO controle_trocas (tipo_servico, data_servico, veiculo_placa, descricao_veiculo, km_atual, km_proxima, detalhes, data_vencimento, dias_alerta) 
+                                 VALUES (?,?,?,?,?,?,?,?,?)""", 
+                              (serv_t, dt_t.isoformat(), placa_t, descricao_t, km_t, km_prox, det_t, dt_venc_t.isoformat(), int(dias_alerta_t)))
                 alerta_gravado()
                 st.rerun()
 
@@ -5100,6 +5208,8 @@ with aba13:
 
                         c4, c5 = st.columns(2)
                         c4.write(f"**Próxima KM:**\n{r['km_proxima']:,}".replace(",", "."))
+                        dias_alerta_troca = int(r.get("dias_alerta") or 30)
+                        c5.write(f"**Popup faltando:**\n{dias_alerta_troca} dia(s)")
 
                         dt_v_calc = datetime.strptime(r['data_vencimento'], '%Y-%m-%d').date() if r['data_vencimento'] else None
                         if dt_v_calc is not None:
@@ -5108,8 +5218,8 @@ with aba13:
                                 st.caption(f"Faltam {dias_para_vencer_troca} dia(s) para vencer.")
                             elif dias_para_vencer_troca == 0:
                                 st.warning("Vence hoje.")
-                            elif abs(dias_para_vencer_troca) > 30:
-                                st.error(f"Já venceu os 30 dias (há {abs(dias_para_vencer_troca)} dia(s)).")
+                            elif abs(dias_para_vencer_troca) > dias_alerta_troca:
+                                st.error(f"Já venceu o prazo de {dias_alerta_troca} dias (há {abs(dias_para_vencer_troca)} dia(s)).")
                             else:
                                 st.warning(f"Vencido há {abs(dias_para_vencer_troca)} dia(s).")
                         
@@ -5151,10 +5261,17 @@ with aba13:
                             new_dt_s = ce1.date_input("Data do Serviço", value=d_s_v, format="DD/MM/YYYY")
                             new_km_a = ce2.number_input("KM Atual", value=float(r['km_atual'] or 0))
                             
-                            ce3, ce4 = st.columns(2)
+                            ce3, ce4, ce5 = st.columns(3)
                             new_km_p = ce3.number_input("Próxima KM", value=float(r['km_proxima'] or 0))
                             d_v_v = datetime.strptime(r['data_vencimento'], '%Y-%m-%d').date() if r['data_vencimento'] else datetime.now().date()
                             new_dt_v = ce4.date_input("Vencimento (Data)", value=d_v_v, format="DD/MM/YYYY")
+                            new_dias_alerta = ce5.number_input(
+                                "Ativar popup faltando (dias)",
+                                min_value=0,
+                                max_value=365,
+                                value=int(r.get("dias_alerta") or 30),
+                                step=1,
+                            )
                             
                             new_det = st.text_area("Detalhes", value=r['detalhes'] or "")
                             
@@ -5162,9 +5279,9 @@ with aba13:
                             if be1.form_submit_button("💾 Gravar", use_container_width=True, key=f"btn_troca_edicao_gravar_{r['id']}"):
                                 with conn() as c:
                                     c.execute("""UPDATE controle_trocas SET 
-                                                 tipo_servico=?, data_servico=?, veiculo_placa=?, descricao_veiculo=?, km_atual=?, km_proxima=?, detalhes=?, data_vencimento=? 
+                                                 tipo_servico=?, data_servico=?, veiculo_placa=?, descricao_veiculo=?, km_atual=?, km_proxima=?, detalhes=?, data_vencimento=?, dias_alerta=? 
                                                  WHERE id=?""", 
-                                              (new_serv, new_dt_s.isoformat(), new_placa, new_desc, new_km_a, new_km_p, new_det, new_dt_v.isoformat(), r['id']))
+                                              (new_serv, new_dt_s.isoformat(), new_placa, new_desc, new_km_a, new_km_p, new_det, new_dt_v.isoformat(), int(new_dias_alerta), r['id']))
                                 st.session_state[ed_key_t] = False
                                 alerta_gravado()
                                 st.rerun()
@@ -5960,11 +6077,12 @@ with aba21:
         placeholder="Selecione uma rota para filtrar",
         key="praca_pedagio_filtro_rota",
     )
-    sentido_filtro_pp = ff2.selectbox(
+    if not isinstance(st.session_state.get("praca_pedagio_filtro_sentido"), list):
+        st.session_state["praca_pedagio_filtro_sentido"] = []
+    sentido_filtro_pp = ff2.multiselect(
         "Filtrar por Sentido Viagem",
         options=opcoes_filtro_sentido_pp,
-        index=None,
-        placeholder="Selecione o sentido",
+        placeholder="Selecione um ou mais sentidos",
         key="praca_pedagio_filtro_sentido",
     )
     df_praca_pedagio_exibir = df_praca_pedagio.copy()
@@ -5973,8 +6091,9 @@ with aba21:
             df_praca_pedagio_exibir["rota"].astype(str).str.strip() == str(rota_filtro_pp).strip()
         ]
     if sentido_filtro_pp:
+        sentidos_selecionados_pp = {str(s).strip() for s in sentido_filtro_pp}
         df_praca_pedagio_exibir = df_praca_pedagio_exibir[
-            df_praca_pedagio_exibir["sentido_viagem"].astype(str).str.strip() == str(sentido_filtro_pp).strip()
+            df_praca_pedagio_exibir["sentido_viagem"].astype(str).str.strip().isin(sentidos_selecionados_pp)
         ]
 
     valores_pp = pd.to_numeric(df_praca_pedagio_exibir.get("valor_todos_eixos", 0.0), errors="coerce").fillna(0.0)
