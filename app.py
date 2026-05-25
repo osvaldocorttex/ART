@@ -24,7 +24,8 @@ def format_br(valor, prefixo="", casas_decimais=2):
 
 def brl(valor): return format_br(valor, "R$ ")
 
-def calcular_qtd_estadia(data_chegada, hora_chegada, data_descarregamento, hora_descarregamento, franquia_horas=5):
+def calcular_qtd_estadia(data_chegada, hora_chegada, data_descarregamento, hora_descarregamento):
+    """Conta estadias nos marcos de 08:00 apos as primeiras 24h da chegada."""
     try:
         dt_chegada = pd.to_datetime(data_chegada, errors="coerce")
         dt_desc = pd.to_datetime(data_descarregamento, errors="coerce")
@@ -41,15 +42,18 @@ def calcular_qtd_estadia(data_chegada, hora_chegada, data_descarregamento, hora_
         if dt_desc_full <= dt_chegada_full:
             return 0
 
-        horas_total = (dt_desc_full - dt_chegada_full).total_seconds() / 3600.0
-        horas_excedentes = horas_total - float(franquia_horas)
-        if horas_excedentes <= 0:
+        apos_24h = dt_chegada_full + timedelta(hours=24)
+        primeiro_marco = datetime.combine(apos_24h.date(), datetime.strptime("08:00", "%H:%M").time())
+        if primeiro_marco < apos_24h:
+            primeiro_marco += timedelta(days=1)
+
+        if dt_desc_full < primeiro_marco:
             return 0
 
-        qtd = int(horas_excedentes // 24.0)
-        if (horas_excedentes % 24.0) > 0:
-            qtd += 1
-        return max(0, qtd)
+        dias_passados = (dt_desc_full.date() - primeiro_marco.date()).days
+        if dt_desc_full.time() < primeiro_marco.time():
+            dias_passados -= 1
+        return max(0, dias_passados + 1)
     except Exception:
         return 0
 
@@ -141,7 +145,7 @@ def _carregar_historico_parametros_raw():
     with conn() as c:
         return pd.read_sql(
             """SELECT vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                      seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
                       qtde_pneu, vl_gasto_pneu_km
                FROM parametros_historico
                ORDER BY date(vigencia_data) ASC, id ASC""",
@@ -189,7 +193,7 @@ def init_db():
             consumo REAL DEFAULT 2.5, manut REAL DEFAULT 0.25, 
             pneu REAL DEFAULT 0.12, depre REAL DEFAULT 0.30, 
             motora_fixo REAL DEFAULT 2500.0, motora_pct REAL DEFAULT 10.0,
-            seguro REAL DEFAULT 2750.0, financiamento REAL DEFAULT 0.0, pagto_ipva REAL DEFAULT 0.0,
+            seguro REAL DEFAULT 2750.0, seguro_vida_motorista REAL DEFAULT 0.0, financiamento REAL DEFAULT 0.0, pagto_ipva REAL DEFAULT 0.0,
             meta_faturamento REAL DEFAULT 50000.0,
             valor_frete_mensal_fixo REAL DEFAULT 0.0,
             qtde_pneu REAL DEFAULT 1.0,
@@ -268,7 +272,8 @@ def init_db():
             descricao TEXT,
             descricao_veiculo TEXT,
             frota TEXT,
-            dias_alerta INTEGER DEFAULT 30
+            dias_alerta INTEGER DEFAULT 30,
+            popup_ativo INTEGER DEFAULT 1
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS me_lembra_descricoes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -301,6 +306,7 @@ def init_db():
             motora_fixo REAL,
             motora_pct REAL,
             seguro REAL,
+            seguro_vida_motorista REAL,
             financiamento REAL,
             pagto_ipva REAL,
             cmp_custo_escritorio REAL,
@@ -473,6 +479,8 @@ def init_db():
             c.execute("ALTER TABLE me_lembra ADD COLUMN data_alerta TEXT")
         if "dias_alerta" not in colunas_ml:
             c.execute("ALTER TABLE me_lembra ADD COLUMN dias_alerta INTEGER DEFAULT 30")
+        if "popup_ativo" not in colunas_ml:
+            c.execute("ALTER TABLE me_lembra ADD COLUMN popup_ativo INTEGER DEFAULT 1")
 
         cursor_mld = c.execute("PRAGMA table_info(me_lembra_descricoes)")
         colunas_mld = [coluna[1] for coluna in cursor_mld.fetchall()]
@@ -542,6 +550,25 @@ def init_db():
             c.execute("ALTER TABLE parametros ADD COLUMN imposto_pct REAL DEFAULT 0.0")
         if "valor_frete_mensal_fixo" not in colunas_param:
             c.execute("ALTER TABLE parametros ADD COLUMN valor_frete_mensal_fixo REAL DEFAULT 0.0")
+        if "seguro_vida_motorista" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN seguro_vida_motorista REAL DEFAULT 0.0")
+
+        cursor_hist_param = c.execute("PRAGMA table_info(parametros_historico)")
+        colunas_hist_param = [coluna[1] for coluna in cursor_hist_param.fetchall()]
+        coluna_seguro_vida_hist_criada = False
+        if "seguro_vida_motorista" not in colunas_hist_param:
+            c.execute("ALTER TABLE parametros_historico ADD COLUMN seguro_vida_motorista REAL DEFAULT 0.0")
+            coluna_seguro_vida_hist_criada = True
+        if coluna_seguro_vida_hist_criada:
+            c.execute(
+                """UPDATE parametros_historico
+                   SET seguro_vida_motorista = (
+                       SELECT COALESCE(seguro_vida_motorista, 0.0)
+                       FROM parametros
+                       WHERE id=1
+                   )
+                   WHERE COALESCE(seguro_vida_motorista, 0.0) = 0.0"""
+            )
 
         # Índices para acelerar filtros e ordenação (especialmente no celular)
         c.execute("CREATE INDEX IF NOT EXISTS idx_viagens_data ON viagens(data)")
@@ -688,10 +715,12 @@ def fator_rateio_mensal_por_periodo(data_inicio, data_fim):
     return dias_rateio_periodo(data_inicio, data_fim) / 30.0
 
 
-def dias_rateio_periodo(data_inicio, data_fim, limite_dias=30):
+def dias_rateio_periodo(data_inicio, data_fim, limite_dias=None):
     if data_inicio is None or data_fim is None or data_fim < data_inicio:
         return 0
     dias_periodo = (data_fim - data_inicio).days + 1
+    if limite_dias is None:
+        return int(dias_periodo)
     return min(int(dias_periodo), int(limite_dias))
 
 PARAM_CAMPOS_HIST = [
@@ -702,6 +731,7 @@ PARAM_CAMPOS_HIST = [
     "motora_fixo",
     "motora_pct",
     "seguro",
+    "seguro_vida_motorista",
     "financiamento",
     "pagto_ipva",
     "cmp_custo_escritorio",
@@ -822,6 +852,7 @@ if not st.session_state.popup_vencido_exibido:
                 """SELECT descricao, descricao_veiculo, frota, data_vencimento, COALESCE(dias_alerta, 30) AS dias_alerta
                    FROM me_lembra
                    WHERE data_vencimento IS NOT NULL
+                     AND COALESCE(popup_ativo, 1) = 1
                    ORDER BY date(data_vencimento) ASC""",
                 c,
             )
@@ -1594,6 +1625,9 @@ with aba_home:
             df_dash["custo_seguro_rateado"] = (
                 valor_mensal_rateado_periodo("seguro", filtro_ini, filtro_fim) * proporcao_receita
             )
+            df_dash["custo_seguro_vida_motorista_rateado"] = (
+                valor_mensal_rateado_periodo("seguro_vida_motorista", filtro_ini, filtro_fim) * proporcao_receita
+            )
             df_dash["custo_fin_rateado"] = (
                 valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim) * proporcao_receita
             )
@@ -1619,6 +1653,7 @@ with aba_home:
         else:
             df_dash["custo_mot_fixo_rateado"] = 0.0
             df_dash["custo_seguro_rateado"] = 0.0
+            df_dash["custo_seguro_vida_motorista_rateado"] = 0.0
             df_dash["custo_fin_rateado"] = 0.0
             df_dash["custo_ipva_rateado"] = 0.0
             df_dash["custo_escr_rateado"] = 0.0
@@ -1638,6 +1673,7 @@ with aba_home:
             - df_dash["custo_comissao"]
             - df_dash["custo_mot_fixo_rateado"]
             - df_dash["custo_seguro_rateado"]
+            - df_dash["custo_seguro_vida_motorista_rateado"]
             - df_dash["custo_fin_rateado"]
             - df_dash["custo_ipva_rateado"]
             - df_dash["custo_escr_rateado"]
@@ -1661,6 +1697,7 @@ with aba_home:
                 + df_dash["custo_comissao"]
                 + df_dash["custo_mot_fixo_rateado"]
                 + df_dash["custo_seguro_rateado"]
+                + df_dash["custo_seguro_vida_motorista_rateado"]
                 + df_dash["custo_fin_rateado"]
                 + df_dash["custo_ipva_rateado"]
                 + df_dash["custo_escr_rateado"]
@@ -1804,6 +1841,7 @@ with aba_home:
                     custo_imposto=("custo_imposto", "sum"),
                     custo_mot_fixo_rateado=("custo_mot_fixo_rateado", "sum"),
                     custo_seguro_rateado=("custo_seguro_rateado", "sum"),
+                    custo_seguro_vida_motorista_rateado=("custo_seguro_vida_motorista_rateado", "sum"),
                     custo_fin_rateado=("custo_fin_rateado", "sum"),
                     custo_ipva_rateado=("custo_ipva_rateado", "sum"),
                     custo_escr_rateado=("custo_escr_rateado", "sum"),
@@ -1839,6 +1877,7 @@ with aba_home:
                 + df_tend_g["custo_imposto_frete_fixo"]
                 + df_tend_g["custo_mot_fixo_rateado"]
                 + df_tend_g["custo_seguro_rateado"]
+                + df_tend_g["custo_seguro_vida_motorista_rateado"]
                 + df_tend_g["custo_fin_rateado"]
                 + df_tend_g["custo_ipva_rateado"]
                 + df_tend_g["custo_escr_rateado"]
@@ -2048,13 +2087,14 @@ with aba_home:
                 )
 
         with t2:
-            custos_labels = ["Diesel", "Arla", "Pedágio", "Gasto Extra", "Imposto"]
+            custos_labels = ["Diesel", "Arla", "Pedágio", "Gasto Extra", "Imposto", "Seguro Vida Motorista"]
             custos_vals = [
                 float(df_dash["custo_diesel"].sum()),
                 float(df_dash["custo_arla"].sum()),
                 float(df_dash["custo_pedagio"].sum()),
                 float(df_dash["custo_extra"].sum()),
                 float(df_dash["custo_imposto"].sum()),
+                float(df_dash["custo_seguro_vida_motorista_rateado"].sum()),
             ]
             fig_custos = go.Figure(
                 data=[
@@ -2658,7 +2698,7 @@ with aba2:
                             step=1,
                             disabled=True,
                         )
-                        st.caption("Regra aplicada: começa a contar após 5h da chegada; depois conta 1 estadia a cada 24h (ou fração) excedente.")
+                        st.caption("Regra aplicada: as primeiras 24h da chegada não contam; depois, a estadia começa no próximo marco de 08:00 e soma 1 a cada novo dia às 08:00.")
 
                         ce4, ce5, ce6 = st.columns(3)
                         origem_atual_ed = str(r["origem"] or "").strip()
@@ -2820,8 +2860,15 @@ with aba2:
                         if chave_rota_inversa not in mapa_empresas_rota or not any(mapa_empresas_rota[chave_rota_inversa]):
                             mapa_empresas_rota[chave_rota_inversa] = (nome_destino_rota, nome_origem_rota)
 
+                df_ed_estadias = df_ed[
+                    pd.to_numeric(df_ed["qtd_estadia_calc"], errors="coerce").fillna(0).astype(int) > 0
+                ].copy()
+                tem_estadias_para_imprimir = not df_ed_estadias.empty
+                if not tem_estadias_para_imprimir:
+                    st.warning("Não há estadias com quantidade maior que zero para imprimir.")
+
                 pendencias_estadia = []
-                for _, r_pend in df_ed.iterrows():
+                for _, r_pend in df_ed_estadias.iterrows():
                     origem_pend = str(r_pend.get("origem", "") or "").strip().upper()
                     destino_pend = str(r_pend.get("destino", "") or "").strip().upper()
                     nome_emp_origem_pend, nome_emp_destino_pend = mapa_empresas_rota.get((origem_pend, destino_pend), ("", ""))
@@ -2841,17 +2888,20 @@ with aba2:
                 if pendencias_estadia:
                     st.warning("Campos pendentes no relatório de estadias:\n" + "\n".join(pendencias_estadia))
 
+                total_qtd_estadias_print = int(pd.to_numeric(df_ed_estadias["qtd_estadia_calc"], errors="coerce").fillna(0).sum())
+                total_qtd_viagens_print = int(pd.to_numeric(df_ed_estadias["qtd_viagens"], errors="coerce").fillna(1).sum())
                 html_estadias = f"""
                 <html>
                 <head>
                     <style>
                         body {{ font-family: sans-serif; margin: 24px; color: #333; }}
                         header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
-                        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
-                        th, td {{ border: 1px solid #999; padding: 8px; text-align: left; }}
+                        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 10px; }}
+                        th, td {{ border: 1px solid #999; padding: 5px; text-align: left; white-space: nowrap; }}
                         th {{ background-color: #f2f2f2; }}
                         .formula-estadia {{ margin-top: 14px; padding: 10px 12px; border: 1px solid #999; background: #fafafa; font-size: 12px; line-height: 1.45; }}
                         .formula-estadia strong {{ display: block; margin-bottom: 4px; }}
+                        .resumo {{ margin-top: 14px; text-align: right; font-size: 15px; font-weight: bold; }}
                         .btn-print {{ background: #007bff; color: white; padding: 12px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 14px; border-radius: 5px; }}
                         @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
                     </style>
@@ -2864,9 +2914,9 @@ with aba2:
                     </header>
                     <div class="formula-estadia">
                         <strong>Como é feito o cálculo da Qtde Estadia</strong>
-                        Horas totais = Data/Hora Descarregamento - Data/Hora Chegada.<br>
-                        Horas excedentes = Horas totais - 5 horas de franquia.<br>
-                        Qtde Estadia = 0 quando as horas excedentes forem menores ou iguais a 0; caso contrário, Qtde Estadia = arredondar para cima(Horas excedentes / 24).
+                        As primeiras 24 horas após a chegada não contam estadia.<br>
+                        Depois dessas 24 horas, a contagem começa no próximo horário de 08:00.<br>
+                        Qtde Estadia = 1 no primeiro marco válido de 08:00 e soma +1 a cada novo dia às 08:00.
                     </div>
                     <table>
                         <thead>
@@ -2884,7 +2934,7 @@ with aba2:
                         </thead>
                         <tbody>
                 """
-                for _, r in df_ed.iterrows():
+                for _, r in df_ed_estadias.iterrows():
                     origem_key = str(r.get("origem", "") or "").strip().upper()
                     destino_key = str(r.get("destino", "") or "").strip().upper()
                     nome_empresa_origem, nome_empresa_destino = mapa_empresas_rota.get((origem_key, destino_key), ("", ""))
@@ -2910,18 +2960,53 @@ with aba2:
                             <td>{qtd_estadia}</td>
                         </tr>
                     """
-                html_estadias += """
+                html_estadias += f"""
                         </tbody>
                     </table>
+                    <div class="resumo">TOTAL DE VIAGENS NO PERÍODO: {total_qtd_viagens_print}</div>
+                    <div class="resumo">TOTAL DE ESTADIAS NO PERÍODO: {total_qtd_estadias_print}</div>
                     <script>
                         setTimeout(function(){{ window.print(); }}, 600);
                     </script>
                 </body>
                 </html>
                 """
-                components.html(html_estadias, height=900, scrolling=True)
+                if tem_estadias_para_imprimir:
+                    components.html(html_estadias, height=900, scrolling=True)
 
             if c_h4.button("🖨️ Imprimir", use_container_width=True, key="btn_print_historico_data"):
+                with conn() as c:
+                    df_rotas_hist_print = pd.read_sql(
+                        "SELECT origem, destino, nome_empresa_origem, nome_empresa_destino FROM rotas",
+                        c,
+                    )
+                if "nome_empresa_origem" not in df_rotas_hist_print.columns:
+                    df_rotas_hist_print["nome_empresa_origem"] = ""
+                if "nome_empresa_destino" not in df_rotas_hist_print.columns:
+                    df_rotas_hist_print["nome_empresa_destino"] = ""
+                df_rotas_hist_print["origem"] = df_rotas_hist_print["origem"].fillna("").astype(str).str.strip().str.upper()
+                df_rotas_hist_print["destino"] = df_rotas_hist_print["destino"].fillna("").astype(str).str.strip().str.upper()
+                df_rotas_hist_print["nome_empresa_origem"] = df_rotas_hist_print["nome_empresa_origem"].fillna("").astype(str).str.strip()
+                df_rotas_hist_print["nome_empresa_destino"] = df_rotas_hist_print["nome_empresa_destino"].fillna("").astype(str).str.strip()
+                mapa_empresas_rota_hist = {
+                    (str(r["origem"]), str(r["destino"])): (
+                        str(r["nome_empresa_origem"] or ""),
+                        str(r["nome_empresa_destino"] or ""),
+                    )
+                    for _, r in df_rotas_hist_print.iterrows()
+                }
+                for _, r in df_rotas_hist_print.iterrows():
+                    origem_rota = str(r["origem"])
+                    destino_rota = str(r["destino"])
+                    nome_origem_rota = str(r["nome_empresa_origem"] or "")
+                    nome_destino_rota = str(r["nome_empresa_destino"] or "")
+                    chave_rota = (origem_rota, destino_rota)
+                    chave_rota_inversa = (destino_rota, origem_rota)
+                    if nome_origem_rota or nome_destino_rota:
+                        mapa_empresas_rota_hist[chave_rota] = (nome_origem_rota, nome_destino_rota)
+                        if chave_rota_inversa not in mapa_empresas_rota_hist or not any(mapa_empresas_rota_hist[chave_rota_inversa]):
+                            mapa_empresas_rota_hist[chave_rota_inversa] = (nome_destino_rota, nome_origem_rota)
+
                 total_frete_periodo = float(pd.to_numeric(df_ed["Total Frete Valor"], errors="coerce").fillna(0.0).sum())
                 total_frete_periodo += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
                 if "qtd_viagens" in df_ed.columns:
@@ -2937,8 +3022,8 @@ with aba2:
                     <style>
                         body {{ font-family: sans-serif; margin: 24px; color: #333; }}
                         header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
-                        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
-                        th, td {{ border: 1px solid #999; padding: 8px; text-align: left; }}
+                        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 10px; }}
+                        th, td {{ border: 1px solid #999; padding: 5px; text-align: left; white-space: nowrap; }}
                         th {{ background-color: #f2f2f2; }}
                         .resumo {{ margin-top: 14px; text-align: right; font-size: 15px; font-weight: bold; }}
                         .btn-print {{ background: #007bff; color: white; padding: 12px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 14px; border-radius: 5px; }}
@@ -2956,6 +3041,8 @@ with aba2:
                             <tr>
                                 <th>Data</th>
                                 <th>NF</th>
+                                <th>Nome Empresa Origem</th>
+                                <th>Nome Empresa Destino</th>
                                 <th>Origem</th>
                                 <th>Destino</th>
                                 <th>Peso (KG)</th>
@@ -2976,6 +3063,9 @@ with aba2:
                     nf = str(r["nf"]).strip() if pd.notna(r["nf"]) and str(r["nf"]).strip() else "-"
                     origem = str(r["origem"]).strip() if pd.notna(r["origem"]) else "-"
                     destino = str(r["destino"]).strip() if pd.notna(r["destino"]) else "-"
+                    origem_key = origem.strip().upper() if origem != "-" else ""
+                    destino_key = destino.strip().upper() if destino != "-" else ""
+                    nome_empresa_origem, nome_empresa_destino = mapa_empresas_rota_hist.get((origem_key, destino_key), ("", ""))
                     peso_kg = float(pd.to_numeric(r["peso_kg"], errors="coerce")) if pd.notna(pd.to_numeric(r["peso_kg"], errors="coerce")) else 0.0
                     valor_ton = float(pd.to_numeric(r["valor_ton"], errors="coerce")) if pd.notna(pd.to_numeric(r["valor_ton"], errors="coerce")) else 0.0
                     placa = str(r["veiculo_placa"]).strip() if pd.notna(r["veiculo_placa"]) else "-"
@@ -2987,6 +3077,8 @@ with aba2:
                         <tr>
                             <td>{data_br}</td>
                             <td>{nf}</td>
+                            <td>{nome_empresa_origem or "-"}</td>
+                            <td>{nome_empresa_destino or "-"}</td>
                             <td>{origem}</td>
                             <td>{destino}</td>
                             <td>{format_br(peso_kg, casas_decimais=0)}</td>
@@ -3358,6 +3450,7 @@ with aba3:
         dias_periodo = max(1, dias_rateio_periodo(filtro_ini, filtro_fim))
         t_mot_fixo_rateado = valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim)
         t_seguro = valor_mensal_rateado_periodo("seguro", filtro_ini, filtro_fim)
+        t_seguro_vida_motorista = valor_mensal_rateado_periodo("seguro_vida_motorista", filtro_ini, filtro_fim)
         t_fin = valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim)
         # IPVA informado como valor anual: rateio proporcional por dia.
         t_ipva = valor_anual_rateado_periodo("pagto_ipva", filtro_ini, filtro_fim)
@@ -3366,7 +3459,7 @@ with aba3:
 
         lucro = t_rec - (
             t_die + t_valor_arla_ana + t_pneu + t_manut + t_depre + t_mot_total +
-            t_ped + t_escritorio + t_extra + t_seguro + t_fin + t_ipva + t_imposto
+            t_ped + t_escritorio + t_extra + t_seguro + t_seguro_vida_motorista + t_fin + t_ipva + t_imposto
         )
 
         m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
@@ -3392,12 +3485,13 @@ with aba3:
                     "Escritório",
                     "Gasto Extra",
                     "Seguro (Rateado)",
+                    "Seguro Vida Motorista Mensal (Rateado)",
                     "Financiamento (Rateado)",
                     "Pagto IPVA (Rateado)",
                     "Imposto",
                     "Lucro",
                 ],
-                "Valor": [t_die, t_valor_arla_ana, t_pneu, t_manut, t_depre, t_mot_total, t_ped, t_escritorio, t_extra, t_seguro, t_fin, t_ipva, t_imposto, max(0, lucro)],
+                "Valor": [t_die, t_valor_arla_ana, t_pneu, t_manut, t_depre, t_mot_total, t_ped, t_escritorio, t_extra, t_seguro, t_seguro_vida_motorista, t_fin, t_ipva, t_imposto, max(0, lucro)],
             }
         )
         df_custos["Legenda"] = df_custos.apply(
@@ -3476,7 +3570,11 @@ with aba3:
             ),
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"Rateio dos custos fixos limitado a {dias_periodo} dia(s), mesmo quando o filtro passa de 30 dias. IPVA rateado por dia (anual/365).")
+        st.caption(
+            f"Rateio dos custos fixos calculado sobre {dias_periodo} dia(s) do filtro. "
+            "Custos mensais, como seguro de vida do motorista, são calculados por valor mensal/30*dias. "
+            "IPVA rateado por dia (anual/365)."
+        )
 
 
 
@@ -3585,6 +3683,110 @@ with aba4:
                            c, params=(filtro_ini.isoformat(), filtro_fim.isoformat()))
 
     if not df_m.empty:
+        if st.button("🖨️ Imprimir Manutenção por Período", use_container_width=True, key="btn_print_manutencao_periodo"):
+            total_mo = 0.0
+            total_pe = 0.0
+            total_ida = 0.0
+            total_ret = 0.0
+            total_servicos = 0.0
+            html = f"""
+            <html>
+            <head>
+                <style>
+                    body {{ font-family: sans-serif; margin: 30px; color: #333; }}
+                    header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+                    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }}
+                    th, td {{ border: 1px solid #999; padding: 8px; text-align: left; vertical-align: top; }}
+                    th {{ background-color: #f2f2f2; }}
+                    .btn-print {{ background: #007bff; color: white; padding: 12px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 14px; border-radius: 5px; margin-bottom: 20px; }}
+                    .resumo {{ margin-top: 20px; font-size: 14px; }}
+                    .linha-detalhe {{ margin: 0; padding: 0; }}
+                    @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
+                </style>
+            </head>
+            <body>
+                <button class="btn-print" onclick="window.print()">🖨️ IMPRIMIR MANUTENÇÃO POR PERÍODO</button>
+                <header>
+                    <h1 style="margin:0;">ART TRANSPORTES</h1>
+                    <p style="margin:5px 0;">RELATÓRIO DE MANUTENÇÃO</p>
+                    <p>Período: <b>{filtro_ini.strftime('%d/%m/%Y')}</b> até <b>{filtro_fim.strftime('%d/%m/%Y')}</b></p>
+                    <p style="margin:5px 0;">Registros: <b>{len(df_m)}</b></p>
+                </header>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Data Entrada</th>
+                            <th>Nº OS</th>
+                            <th>Veículo</th>
+                            <th>KM Entrada</th>
+                            <th>Oficina</th>
+                            <th>Defeito Relatado</th>
+                            <th>Serviço Realizado</th>
+                            <th>Mão de Obra</th>
+                            <th>Peças</th>
+                            <th>Transp Ida</th>
+                            <th>Transp Ret</th>
+                            <th>Total Serviço</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            """
+            for _, r in df_m.iterrows():
+                dt_ent_br = datetime.strptime(r['data_entrada'], '%Y-%m-%d').strftime('%d/%m/%Y') if r['data_entrada'] else ''
+                num_os_txt = r['num_os'] or ''
+                veiculo_txt = r['veiculo_placa'] or ''
+                km_txt = int(r['km_servico']) if r['km_servico'] not in (None, '') else 0
+                km_txt = f"{km_txt:,}".replace(',', '.') if km_txt else ''
+                oficina_txt = r['oficina_nome'] or ''
+                defeito_txt = str(r['defeito'] or '').replace('\n', '<br>')
+                servico_txt = str(r['servico'] or '').replace('\n', '<br>')
+                valor_mo = float(r['valor_mo'] or 0)
+                valor_pe = float(r['valor_pecas'] or 0)
+                ct_ida = float(r['custo_transporte_ida'] or 0)
+                ct_ret = float(r['custo_transporte_retorno'] or 0)
+                ct_leg = float(r['custo_transporte'] or 0) if 'custo_transporte' in r else 0
+                if ct_ida == 0.0 and ct_ret == 0.0 and ct_leg > 0.0:
+                    ct_ida = ct_leg
+                total_serv = valor_mo + valor_pe + ct_ida + ct_ret
+                total_mo += valor_mo
+                total_pe += valor_pe
+                total_ida += ct_ida
+                total_ret += ct_ret
+                total_servicos += total_serv
+                html += f"""
+                    <tr>
+                        <td>{dt_ent_br}</td>
+                        <td>{num_os_txt}</td>
+                        <td>{veiculo_txt}</td>
+                        <td>{km_txt}</td>
+                        <td>{oficina_txt}</td>
+                        <td>{defeito_txt}</td>
+                        <td>{servico_txt}</td>
+                        <td>{brl(valor_mo)}</td>
+                        <td>{brl(valor_pe)}</td>
+                        <td>{brl(ct_ida)}</td>
+                        <td>{brl(ct_ret)}</td>
+                        <td>{brl(total_serv)}</td>
+                    </tr>
+                """
+            html += f"""
+                    </tbody>
+                </table>
+                <div class="resumo">
+                    <p><strong>Total de ordens:</strong> {len(df_m)}</p>
+                    <p><strong>Gasto total Mão de Obra:</strong> {brl(total_mo)}</p>
+                    <p><strong>Gasto total Peças:</strong> {brl(total_pe)}</p>
+                    <p><strong>Total Transporte Ida:</strong> {brl(total_ida)}</p>
+                    <p><strong>Total Transporte Retorno:</strong> {brl(total_ret)}</p>
+                    <p><strong>Total serviço:</strong> {brl(total_servicos)}</p>
+                    <p><strong>Gerado em:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+                </div>
+                <script>setTimeout(function(){{ window.print(); }}, 700);</script>
+            </body>
+            </html>
+            """
+            components.html(html, height=1000, scrolling=True)
+
         for idx, r in df_m.iterrows():
             dt_ent_br = datetime.strptime(r['data_entrada'], '%Y-%m-%d').strftime('%d/%m/%Y')
             status = "✅" if r['servico'] else "⏳"
@@ -3599,7 +3801,7 @@ with aba4:
                 ct_ida = ct_leg
             valor_total_serv = (r['valor_mo'] or 0) + (r['valor_pecas'] or 0) + ct_ida + ct_ret
             
-            titulo = f"{status} | {dt_ent_br} | {r['veiculo_placa']} | Total: {brl(valor_total_serv)}"
+            titulo = f"{status} | {dt_ent_br} | {r['veiculo_placa']} | Oficina: {r['oficina_nome']} | Total: {brl(valor_total_serv)}"
             
             with st.expander(titulo):
                 ed_key = f"edit_full_{r['id']}"
@@ -4707,14 +4909,15 @@ with aba10:
     c5.number_input("Pneu (R$/km)", value=float(pne_v), step=0.01, disabled=True)
     dep_v = st.number_input("Depreciação (R$/km)", value=float(dados_para_exibir.get('depre', 0.30)), step=0.01, key=f"dep_{tipo_modo}", disabled=not st.session_state.param_editando)
     
-    c6, c7, c8, c9, c10, c11, c12 = st.columns(7)
+    c6, c7, c8, c9, c10, c11, c12, c13 = st.columns(8)
     fix_v = c6.number_input("Salário Fixo (R$)", value=float(dados_para_exibir.get('motora_fixo', 2500.0)), step=50.0, key=f"fix_{tipo_modo}", disabled=not st.session_state.param_editando)
     pct_v = c7.number_input("Comissão (%)", value=float(dados_para_exibir.get('motora_pct', 10.0)), step=0.5, key=f"pct_{tipo_modo}", disabled=not st.session_state.param_editando)
     seg_v = c8.number_input("Seguro Mensal (R$)", value=float(dados_para_exibir.get('seguro', 2750.0)), step=10.0, key=f"seg_{tipo_modo}", disabled=not st.session_state.param_editando)
-    fin_v = c9.number_input("Financiamento (R$)", value=float(dados_para_exibir.get('financiamento', 0.0)), step=100.0, key=f"fin_{tipo_modo}", disabled=not st.session_state.param_editando)
-    esc_v = c10.number_input("Escritório (R$)", value=float(dados_para_exibir.get('cmp_custo_escritorio', 0.0)), step=50.0, key=f"esc_{tipo_modo}", disabled=not st.session_state.param_editando)
-    ipva_v = c11.number_input("Pagto IPVA Anual (R$)", value=float(dados_para_exibir.get('pagto_ipva', 0.0)), step=50.0, key=f"ipva_{tipo_modo}", disabled=not st.session_state.param_editando)
-    imp_v = c12.number_input("% de Impostos", min_value=0.0, step=0.1, value=float(dados_para_exibir.get('imposto_pct', 0.0)), key=f"imposto_{tipo_modo}", disabled=not st.session_state.param_editando)
+    seg_vida_motorista_v = c9.number_input("Seguro Vida Motorista Mensal (R$)", value=float(dados_para_exibir.get('seguro_vida_motorista', 0.0)), step=10.0, key=f"seg_vida_mot_{tipo_modo}", disabled=not st.session_state.param_editando)
+    fin_v = c10.number_input("Financiamento (R$)", value=float(dados_para_exibir.get('financiamento', 0.0)), step=100.0, key=f"fin_{tipo_modo}", disabled=not st.session_state.param_editando)
+    esc_v = c11.number_input("Escritório (R$)", value=float(dados_para_exibir.get('cmp_custo_escritorio', 0.0)), step=50.0, key=f"esc_{tipo_modo}", disabled=not st.session_state.param_editando)
+    ipva_v = c12.number_input("Pagto IPVA Anual (R$)", value=float(dados_para_exibir.get('pagto_ipva', 0.0)), step=50.0, key=f"ipva_{tipo_modo}", disabled=not st.session_state.param_editando)
+    imp_v = c13.number_input("% de Impostos", min_value=0.0, step=0.1, value=float(dados_para_exibir.get('imposto_pct', 0.0)), key=f"imposto_{tipo_modo}", disabled=not st.session_state.param_editando)
 
     if not df_db.empty:
         qtd_imposto = pd.to_numeric(df_db.get("qtd_viagens", 1), errors="coerce").fillna(1.0)
@@ -4741,7 +4944,7 @@ with aba10:
         novos_dados = {
             'consumo': con_v, 'manut': man_v, 'pneu': pne_v, 'depre': dep_v,
             'qtde_pneu': qtde_pneu_v, 'vl_gasto_pneu_km': vl_gasto_pneu_km_v,
-            'motora_fixo': fix_v, 'motora_pct': pct_v, 'seguro': seg_v, 'financiamento': fin_v,
+            'motora_fixo': fix_v, 'motora_pct': pct_v, 'seguro': seg_v, 'seguro_vida_motorista': seg_vida_motorista_v, 'financiamento': fin_v,
             'cmp_custo_escritorio': esc_v, 'pagto_ipva': ipva_v, 'imposto_pct': imp_v,
             'meta_faturamento': meta_v,
             'valor_frete_mensal_fixo': frete_mensal_fixo_v,
@@ -4759,18 +4962,18 @@ with aba10:
                 c.execute("""UPDATE parametros SET 
                              consumo=?, manut=?, pneu=?, depre=?, 
                              qtde_pneu=?, vl_gasto_pneu_km=?,
-                             motora_fixo=?, motora_pct=?, seguro=?, financiamento=?,
+                             motora_fixo=?, motora_pct=?, seguro=?, seguro_vida_motorista=?, financiamento=?,
                              cmp_custo_escritorio=?, pagto_ipva=?, imposto_pct=?, meta_faturamento=?, valor_frete_mensal_fixo=?, data_filtro_ini=?, data_filtro_fim=?
                              WHERE id=1""", 
-                          (con_v, man_v, pne_v, dep_v, qtde_pneu_v, vl_gasto_pneu_km_v, fix_v, pct_v, seg_v, fin_v, esc_v, ipva_v, imp_v,
+                          (con_v, man_v, pne_v, dep_v, qtde_pneu_v, vl_gasto_pneu_km_v, fix_v, pct_v, seg_v, seg_vida_motorista_v, fin_v, esc_v, ipva_v, imp_v,
                            meta_v, frete_mensal_fixo_v, dt_ini_param.strftime('%Y-%m-%d'), dt_fim_param.strftime('%Y-%m-%d')))
                 data_vigencia_param = dt_ini_param.isoformat()
                 c.execute(
                     """INSERT INTO parametros_historico (
                            vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                           seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                           seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
                            qtde_pneu, vl_gasto_pneu_km
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(vigencia_data) DO UPDATE SET
                            consumo=excluded.consumo,
                            manut=excluded.manut,
@@ -4779,6 +4982,7 @@ with aba10:
                            motora_fixo=excluded.motora_fixo,
                            motora_pct=excluded.motora_pct,
                            seguro=excluded.seguro,
+                           seguro_vida_motorista=excluded.seguro_vida_motorista,
                            financiamento=excluded.financiamento,
                            pagto_ipva=excluded.pagto_ipva,
                            cmp_custo_escritorio=excluded.cmp_custo_escritorio,
@@ -4789,7 +4993,7 @@ with aba10:
                     (
                         data_vigencia_param,
                         con_v, man_v, pne_v, dep_v, fix_v, pct_v,
-                        seg_v, fin_v, ipva_v, esc_v, imp_v, frete_mensal_fixo_v,
+                        seg_v, seg_vida_motorista_v, fin_v, ipva_v, esc_v, imp_v, frete_mensal_fixo_v,
                         qtde_pneu_v, vl_gasto_pneu_km_v,
                     ),
                 )
@@ -4806,7 +5010,7 @@ with aba10:
     with conn() as c:
         df_hist_param = pd.read_sql(
             """SELECT id, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                      seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
                       qtde_pneu, vl_gasto_pneu_km
                FROM parametros_historico
                ORDER BY date(vigencia_data) DESC, id DESC""",
@@ -4852,6 +5056,7 @@ with aba10:
                 "motora_fixo": st.column_config.NumberColumn("Motorista Fixo", format="R$ %.2f"),
                 "motora_pct": st.column_config.NumberColumn("Comissão (%)", format="%.2f"),
                 "seguro": st.column_config.NumberColumn("Seguro", format="R$ %.2f"),
+                "seguro_vida_motorista": st.column_config.NumberColumn("Seguro Vida Motorista Mensal", format="R$ %.2f"),
                 "financiamento": st.column_config.NumberColumn("Financiamento", format="R$ %.2f"),
                 "pagto_ipva": st.column_config.NumberColumn("IPVA Anual", format="R$ %.2f"),
                 "cmp_custo_escritorio": st.column_config.NumberColumn("Escritório", format="R$ %.2f"),
@@ -4899,19 +5104,20 @@ with aba10:
             nova_depre = h5.number_input("Depreciação (R$/km)", value=float(row_hist["depre"]), step=0.01, key=f"hist_dep_{id_hist_sel}")
             novo_mot_fixo = h6.number_input("Motorista Fixo (R$)", value=float(row_hist["motora_fixo"]), step=50.0, key=f"hist_fix_{id_hist_sel}")
 
-            h7, h8, h9 = st.columns(3)
+            h7, h8, h9, h10 = st.columns(4)
             novo_mot_pct = h7.number_input("Comissão (%)", value=float(row_hist["motora_pct"]), step=0.1, key=f"hist_pct_{id_hist_sel}")
             novo_seguro = h8.number_input("Seguro (R$)", value=float(row_hist["seguro"]), step=10.0, key=f"hist_seg_{id_hist_sel}")
-            novo_fin = h9.number_input("Financiamento (R$)", value=float(row_hist["financiamento"]), step=50.0, key=f"hist_fin_{id_hist_sel}")
+            novo_seguro_vida_motorista = h9.number_input("Seguro Vida Motorista Mensal (R$)", value=float(row_hist["seguro_vida_motorista"]), step=10.0, key=f"hist_seg_vida_mot_{id_hist_sel}")
+            novo_fin = h10.number_input("Financiamento (R$)", value=float(row_hist["financiamento"]), step=50.0, key=f"hist_fin_{id_hist_sel}")
 
-            h10, h11, h12, h13 = st.columns(4)
-            novo_ipva = h10.number_input("IPVA Anual (R$)", value=float(row_hist["pagto_ipva"]), step=50.0, key=f"hist_ipva_{id_hist_sel}")
-            novo_escr = h11.number_input("Escritório (R$)", value=float(row_hist["cmp_custo_escritorio"]), step=50.0, key=f"hist_esc_{id_hist_sel}")
-            novo_imp = h12.number_input("Imposto (%)", value=float(row_hist["imposto_pct"]), step=0.1, key=f"hist_imp_{id_hist_sel}")
-            novo_frete_fixo = h13.number_input("Frete Fixo Mensal (R$)", value=float(row_hist["valor_frete_mensal_fixo"]), step=100.0, key=f"hist_ff_{id_hist_sel}")
-            h14, h15 = st.columns(2)
-            nova_qtde_pneu = h14.number_input("Qtde Pneu", value=float(row_hist["qtde_pneu"] or 0.0), min_value=0.0, step=1.0, format="%.0f", key=f"hist_qpneu_{id_hist_sel}")
-            novo_vl_pneu_km = h15.number_input("Valor Pneu Km (R$)", value=float(row_hist["vl_gasto_pneu_km"] or 0.0), min_value=0.0, step=0.0001, format="%.4f", key=f"hist_vlpkm_{id_hist_sel}")
+            h11, h12, h13, h14 = st.columns(4)
+            novo_ipva = h11.number_input("IPVA Anual (R$)", value=float(row_hist["pagto_ipva"]), step=50.0, key=f"hist_ipva_{id_hist_sel}")
+            novo_escr = h12.number_input("Escritório (R$)", value=float(row_hist["cmp_custo_escritorio"]), step=50.0, key=f"hist_esc_{id_hist_sel}")
+            novo_imp = h13.number_input("Imposto (%)", value=float(row_hist["imposto_pct"]), step=0.1, key=f"hist_imp_{id_hist_sel}")
+            novo_frete_fixo = h14.number_input("Frete Fixo Mensal (R$)", value=float(row_hist["valor_frete_mensal_fixo"]), step=100.0, key=f"hist_ff_{id_hist_sel}")
+            h15, h16 = st.columns(2)
+            nova_qtde_pneu = h15.number_input("Qtde Pneu", value=float(row_hist["qtde_pneu"] or 0.0), min_value=0.0, step=1.0, format="%.0f", key=f"hist_qpneu_{id_hist_sel}")
+            novo_vl_pneu_km = h16.number_input("Valor Pneu Km (R$)", value=float(row_hist["vl_gasto_pneu_km"] or 0.0), min_value=0.0, step=0.0001, format="%.4f", key=f"hist_vlpkm_{id_hist_sel}")
 
             st.markdown("##### 📄 Duplicar Vigência")
             d1, d2 = st.columns([2, 1])
@@ -4936,9 +5142,9 @@ with aba10:
                         c.execute(
                             """INSERT INTO parametros_historico (
                                    vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                                   seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
                                    qtde_pneu, vl_gasto_pneu_km
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
                                 data_dup_txt,
                                 float(row_hist["consumo"] or 0.0),
@@ -4948,6 +5154,7 @@ with aba10:
                                 float(row_hist["motora_fixo"] or 0.0),
                                 float(row_hist["motora_pct"] or 0.0),
                                 float(row_hist["seguro"] or 0.0),
+                                float(row_hist["seguro_vida_motorista"] or 0.0),
                                 float(row_hist["financiamento"] or 0.0),
                                 float(row_hist["pagto_ipva"] or 0.0),
                                 float(row_hist["cmp_custo_escritorio"] or 0.0),
@@ -4974,12 +5181,12 @@ with aba10:
                         c.execute(
                             """UPDATE parametros_historico
                                SET vigencia_data=?, consumo=?, manut=?, pneu=?, depre=?, motora_fixo=?, motora_pct=?,
-                                   seguro=?, financiamento=?, pagto_ipva=?, cmp_custo_escritorio=?, imposto_pct=?, valor_frete_mensal_fixo=?,
+                                   seguro=?, seguro_vida_motorista=?, financiamento=?, pagto_ipva=?, cmp_custo_escritorio=?, imposto_pct=?, valor_frete_mensal_fixo=?,
                                    qtde_pneu=?, vl_gasto_pneu_km=?
                                WHERE id=?""",
                             (
                                 nova_vig_txt, novo_consumo, nova_manut, novo_pneu, nova_depre, novo_mot_fixo, novo_mot_pct,
-                                novo_seguro, novo_fin, novo_ipva, novo_escr, novo_imp, novo_frete_fixo,
+                                novo_seguro, novo_seguro_vida_motorista, novo_fin, novo_ipva, novo_escr, novo_imp, novo_frete_fixo,
                                 nova_qtde_pneu, novo_vl_pneu_km, int(id_hist_sel),
                             ),
                         )
@@ -5494,6 +5701,7 @@ with aba14:
     valor_motorista_10 = valor_motorista_viagens + valor_motorista_frete_fixo
     valor_motorista_fixo_rateado = valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim)
     valor_seguro_rateado = valor_mensal_rateado_periodo("seguro", filtro_ini, filtro_fim)
+    valor_seguro_vida_motorista_rateado = valor_mensal_rateado_periodo("seguro_vida_motorista", filtro_ini, filtro_fim)
     valor_financiamento_rateado = valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim)
     valor_ipva_rateado = valor_anual_rateado_periodo("pagto_ipva", filtro_ini, filtro_fim)
     valor_escritorio_rateado = valor_mensal_rateado_periodo("cmp_custo_escritorio", filtro_ini, filtro_fim)
@@ -5523,6 +5731,7 @@ with aba14:
         - valor_motorista_total
         - valor_escritorio_rateado
         - valor_seguro_rateado
+        - valor_seguro_vida_motorista_rateado
         - valor_financiamento_rateado
         - valor_ipva_rateado
         - valor_imposto
@@ -5569,13 +5778,14 @@ with aba14:
     l3c5.metric("Pagto Estadia", brl(valor_total_pagto_estadia))
     l3c6.metric("Imposto", brl(valor_imposto))
 
-    l4c1, l4c2, l4c3, l4c4, l4c5, l4c6 = st.columns(6)
+    l4c1, l4c2, l4c3, l4c4, l4c5, l4c6, l4c7 = st.columns(7)
     l4c1.metric("Motorista Rateado", brl(valor_motorista_fixo_rateado))
     l4c2.metric("Comissão Motorista", brl(valor_motorista_10))
     l4c3.metric("Escritório Rateado", brl(valor_escritorio_rateado))
     l4c4.metric("Seguro Rateado", brl(valor_seguro_rateado))
-    l4c5.metric("Financiamento Rateado", brl(valor_financiamento_rateado))
-    l4c6.metric("IPVA Rateado", brl(valor_ipva_rateado))
+    l4c5.metric("Seguro Vida Motorista Rateado", brl(valor_seguro_vida_motorista_rateado))
+    l4c6.metric("Financiamento Rateado", brl(valor_financiamento_rateado))
+    l4c7.metric("IPVA Rateado", brl(valor_ipva_rateado))
 
     l5c1, l5c2, l5c3, l5c4 = st.columns(4)
     l5c1.metric("Manutenção Parâmetros", brl(valor_manutencao_desgaste))
@@ -5595,6 +5805,7 @@ with aba14:
                 "Motorista (Comissão + Fixo Rateado)",
                 "Escritório (Rateado)",
                 "Seguro (Rateado)",
+                "Seguro Vida Motorista Mensal (Rateado)",
                 "Financiamento (Rateado)",
                 "IPVA (Rateado)",
                 "Imposto",
@@ -5603,6 +5814,7 @@ with aba14:
             ],
             "Tipo": [
                 "Receita",
+                "Desconto",
                 "Desconto",
                 "Desconto",
                 "Desconto",
@@ -5625,6 +5837,7 @@ with aba14:
                 valor_motorista_total,
                 valor_escritorio_rateado,
                 valor_seguro_rateado,
+                valor_seguro_vida_motorista_rateado,
                 valor_financiamento_rateado,
                 valor_ipva_rateado,
                 valor_imposto,
@@ -5836,7 +6049,7 @@ with aba19:
                             (novo_valor_litro, novo_consumo_001, novo_consumo_002, novo_consumo_003, novo_custo_escritorio),
                         )
                         p_hist_base = c.execute(
-                            """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro, financiamento,
+                            """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro, seguro_vida_motorista, financiamento,
                                       pagto_ipva, imposto_pct, valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
                                FROM parametros WHERE id=1"""
                         ).fetchone()
@@ -5844,9 +6057,9 @@ with aba19:
                         c.execute(
                             """INSERT INTO parametros_historico (
                                    vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                                   seguro, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
                                    qtde_pneu, vl_gasto_pneu_km
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT(vigencia_data) DO UPDATE SET
                                    cmp_custo_escritorio=excluded.cmp_custo_escritorio""",
                             (
@@ -5858,6 +6071,7 @@ with aba19:
                                 float(p_hist_base["motora_fixo"] or 0.0),
                                 float(p_hist_base["motora_pct"] or 0.0),
                                 float(p_hist_base["seguro"] or 0.0),
+                                float(p_hist_base["seguro_vida_motorista"] or 0.0),
                                 float(p_hist_base["financiamento"] or 0.0),
                                 float(p_hist_base["pagto_ipva"] or 0.0),
                                 float(novo_custo_escritorio or 0.0),
@@ -7685,286 +7899,292 @@ with aba18:
     st.caption("Cadastro de lembretes com prazo de alerta definido por lançamento.")
     st.info("Fluxo sugerido: 1) Cadastre Frota, 2) Cadastre Descrição, 3) Cadastre o Lembrete, 4) Acompanhe e edite na lista abaixo.")
 
-    st.markdown("### 1) Cadastro de Frota")
-    with st.form("form_ml_frota", clear_on_submit=True):
-        nova_frota_ml = st.text_input("Nova Frota", key="ml_nova_frota").strip()
-        if st.form_submit_button("💾 Gravar", key="btn_ml_frota_cadastro_gravar"):
-            if not nova_frota_ml:
-                st.warning("Informe a frota para salvar.")
-            else:
-                try:
-                    with conn() as c:
-                        c.execute(
-                            "INSERT INTO me_lembra_frotas (frota) VALUES (?)",
-                            (nova_frota_ml,),
-                        )
-                    alerta_gravado()
-                    st.rerun()
-                except sqlite3.IntegrityError:
-                    st.warning("Essa frota já está cadastrada.")
-
-    with conn() as c:
-        frotas_ml_db = c.execute(
-            "SELECT id, frota FROM me_lembra_frotas ORDER BY frota ASC"
-        ).fetchall()
-    lista_frotas_ml = [r["frota"] for r in frotas_ml_db]
-    mapa_frotas_ml = {f"{r['id']} - {r['frota']}": int(r["id"]) for r in frotas_ml_db}
-
-    c_fa1, c_fa2 = st.columns([2, 1])
-    if mapa_frotas_ml:
-        frota_sel_alt = c_fa1.selectbox(
-            "Frota cadastrada",
-            options=list(mapa_frotas_ml.keys()),
-            index=None,
-            placeholder="Selecione uma frota para alterar",
-            key="ml_frota_sel_alt",
-        )
-    else:
-        c_fa1.info("Nenhuma frota cadastrada ainda.")
-        frota_sel_alt = None
-    if "ml_frota_edit_id" not in st.session_state:
-        st.session_state.ml_frota_edit_id = None
-
-    if c_fa2.button("✏️ ALTERAR FROTA", key="ml_btn_alterar_frota", use_container_width=True):
-        if frota_sel_alt:
-            st.session_state.ml_frota_edit_id = mapa_frotas_ml[frota_sel_alt]
-        else:
-            st.warning("Selecione uma frota para alterar.")
-
-    if st.session_state.ml_frota_edit_id is not None:
-        row_frota_edit = next((r for r in frotas_ml_db if int(r["id"]) == int(st.session_state.ml_frota_edit_id)), None)
-        valor_atual_frota = row_frota_edit["frota"] if row_frota_edit else ""
-
-        with st.form("form_ml_gravar_frota"):
-            nova_frota_edit = st.text_input("Frota (Editar)", value=valor_atual_frota).strip()
-            bf1, bf2 = st.columns(2)
-            gravar_frota = bf1.form_submit_button("💾 Gravar", use_container_width=True, key="btn_ml_frota_edicao_gravar")
-            cancelar_frota = bf2.form_submit_button("❌ CANCELAR", use_container_width=True)
-
-            if cancelar_frota:
-                st.session_state.ml_frota_edit_id = None
-                st.rerun()
-
-            if gravar_frota:
-                if not nova_frota_edit:
-                    st.warning("Informe a frota para gravar.")
-                else:
-                    try:
-                        with conn() as c:
-                            old_frota = c.execute(
-                                "SELECT frota FROM me_lembra_frotas WHERE id=?",
-                                (int(st.session_state.ml_frota_edit_id),),
-                            ).fetchone()
-                            old_frota_txt = old_frota["frota"] if old_frota else ""
-
-                            c.execute(
-                                "UPDATE me_lembra_frotas SET frota=? WHERE id=?",
-                                (nova_frota_edit, int(st.session_state.ml_frota_edit_id)),
-                            )
-                            if old_frota_txt:
-                                c.execute(
-                                    "UPDATE me_lembra_descricoes SET frota=? WHERE frota=?",
-                                    (nova_frota_edit, old_frota_txt),
-                                )
-                                c.execute(
-                                    "UPDATE me_lembra SET frota=? WHERE frota=?",
-                                    (nova_frota_edit, old_frota_txt),
-                                )
-                        st.session_state.ml_frota_edit_id = None
-                        alerta_gravado()
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.warning("Já existe uma frota com esse nome.")
-
-    st.divider()
-    st.markdown("### 2) Cadastro de Descrição")
-    if not lista_frotas_ml:
-        st.warning("Cadastre pelo menos uma frota antes de cadastrar a descrição.")
-    else:
-        with st.form("form_ml_descricao", clear_on_submit=True):
-            d1, d2 = st.columns(2)
-            nova_descricao_ml = d1.text_input("Nova Descrição", key="ml_nova_descricao").strip()
-            nova_frota_desc_ml = d2.selectbox(
-                "Frota",
-                options=lista_frotas_ml,
-                index=None,
-                placeholder="Selecione uma frota cadastrada",
-                key="ml_nova_frota_desc_sel",
-            )
-            if st.form_submit_button("💾 Gravar", key="btn_ml_descricao_cadastro_gravar"):
-                if not nova_descricao_ml:
-                    st.warning("Informe a descrição para salvar.")
-                elif not nova_frota_desc_ml:
+    with st.expander("➕ 1) Cadastro de Frota", expanded=False):
+        with st.form("form_ml_frota", clear_on_submit=True):
+            nova_frota_ml = st.text_input("Nova Frota", key="ml_nova_frota").strip()
+            if st.form_submit_button("💾 Gravar", key="btn_ml_frota_cadastro_gravar"):
+                if not nova_frota_ml:
                     st.warning("Informe a frota para salvar.")
                 else:
                     try:
                         with conn() as c:
                             c.execute(
-                                "INSERT INTO me_lembra_descricoes (descricao, frota) VALUES (?, ?)",
-                                (nova_descricao_ml, nova_frota_desc_ml),
+                                "INSERT INTO me_lembra_frotas (frota) VALUES (?)",
+                                (nova_frota_ml,),
                             )
                         alerta_gravado()
                         st.rerun()
                     except sqlite3.IntegrityError:
-                        st.warning("Essa descrição já está cadastrada.")
+                        st.warning("Essa frota já está cadastrada.")
 
-    with conn() as c:
-        descricoes_ml_db = c.execute(
-            "SELECT id, descricao, frota FROM me_lembra_descricoes ORDER BY descricao ASC"
-        ).fetchall()
-    lista_descricoes_ml = [r["descricao"] for r in descricoes_ml_db]
-    mapa_frota_por_descricao_ml = {r["descricao"]: ((r["frota"] or "").strip()) for r in descricoes_ml_db}
-    mapa_descricoes_ml = {
-        f"{r['id']} - {r['descricao']} | Frota: {r['frota'] or '-'}": int(r["id"])
-        for r in descricoes_ml_db
-    }
+        with conn() as c:
+            frotas_ml_db = c.execute(
+                "SELECT id, frota FROM me_lembra_frotas ORDER BY frota ASC"
+            ).fetchall()
+        lista_frotas_ml = [r["frota"] for r in frotas_ml_db]
+        mapa_frotas_ml = {f"{r['id']} - {r['frota']}": int(r["id"]) for r in frotas_ml_db}
 
-    c_alt1, c_alt2 = st.columns([2, 1])
-    descricao_sel_alt = c_alt1.selectbox(
-        "Descrição cadastrada",
-        options=list(mapa_descricoes_ml.keys()),
-        index=None,
-        placeholder="Selecione uma descrição para alterar",
-        key="ml_desc_sel_alt",
-    )
-    if "ml_desc_edit_id" not in st.session_state:
-        st.session_state.ml_desc_edit_id = None
-
-    if c_alt2.button("✏️ ALTERAR", key="ml_btn_alterar_desc", use_container_width=True):
-        if descricao_sel_alt:
-            st.session_state.ml_desc_edit_id = mapa_descricoes_ml[descricao_sel_alt]
-        else:
-            st.warning("Selecione uma descrição para alterar.")
-
-    if st.session_state.ml_desc_edit_id is not None:
-        row_desc_edit = next((r for r in descricoes_ml_db if int(r["id"]) == int(st.session_state.ml_desc_edit_id)), None)
-        valor_atual_desc = row_desc_edit["descricao"] if row_desc_edit else ""
-        valor_atual_frota_desc = (row_desc_edit["frota"] if row_desc_edit else "") or ""
-
-        with st.form("form_ml_gravar_descricao"):
-            de1, de2 = st.columns(2)
-            nova_desc_edit = de1.text_input("Descrição (Editar)", value=valor_atual_desc).strip()
-            opcoes_frota_desc = list(lista_frotas_ml)
-            if valor_atual_frota_desc and valor_atual_frota_desc not in opcoes_frota_desc:
-                opcoes_frota_desc.append(valor_atual_frota_desc)
-            idx_frota_desc = opcoes_frota_desc.index(valor_atual_frota_desc) if valor_atual_frota_desc in opcoes_frota_desc else None
-            nova_frota_desc_edit = de2.selectbox(
-                "Frota (Editar)",
-                options=opcoes_frota_desc,
-                index=idx_frota_desc,
-                placeholder="Selecione uma frota cadastrada",
+        c_fa1, c_fa2 = st.columns([2, 1])
+        if mapa_frotas_ml:
+            frota_sel_alt = c_fa1.selectbox(
+                "Frota cadastrada",
+                options=list(mapa_frotas_ml.keys()),
+                index=None,
+                placeholder="Selecione uma frota para alterar",
+                key="ml_frota_sel_alt",
             )
-            b_desc1, b_desc2 = st.columns(2)
-            gravar_desc = b_desc1.form_submit_button("💾 Gravar", use_container_width=True, key="btn_ml_descricao_edicao_gravar")
-            cancelar_desc = b_desc2.form_submit_button("❌ CANCELAR", use_container_width=True)
+        else:
+            c_fa1.info("Nenhuma frota cadastrada ainda.")
+            frota_sel_alt = None
+        if "ml_frota_edit_id" not in st.session_state:
+            st.session_state.ml_frota_edit_id = None
 
-            if cancelar_desc:
-                st.session_state.ml_desc_edit_id = None
-                st.rerun()
+        if c_fa2.button("✏️ ALTERAR FROTA", key="ml_btn_alterar_frota", use_container_width=True):
+            if frota_sel_alt:
+                st.session_state.ml_frota_edit_id = mapa_frotas_ml[frota_sel_alt]
+            else:
+                st.warning("Selecione uma frota para alterar.")
 
-            if gravar_desc:
-                if not nova_desc_edit:
-                    st.warning("Informe a descrição para gravar.")
-                elif not nova_frota_desc_edit:
-                    st.warning("Informe a frota para gravar.")
-                else:
-                    try:
-                        with conn() as c:
-                            old_desc = c.execute(
-                                "SELECT descricao, frota FROM me_lembra_descricoes WHERE id=?",
-                                (int(st.session_state.ml_desc_edit_id),),
-                            ).fetchone()
-                            old_desc_txt = old_desc["descricao"] if old_desc else ""
-                            old_frota_txt = (old_desc["frota"] if old_desc else "") or ""
+        if st.session_state.ml_frota_edit_id is not None:
+            row_frota_edit = next((r for r in frotas_ml_db if int(r["id"]) == int(st.session_state.ml_frota_edit_id)), None)
+            valor_atual_frota = row_frota_edit["frota"] if row_frota_edit else ""
 
-                            c.execute(
-                                "UPDATE me_lembra_descricoes SET descricao=?, frota=? WHERE id=?",
-                                (nova_desc_edit, nova_frota_desc_edit, int(st.session_state.ml_desc_edit_id)),
-                            )
-                            if old_desc_txt:
+            with st.form("form_ml_gravar_frota"):
+                nova_frota_edit = st.text_input("Frota (Editar)", value=valor_atual_frota).strip()
+                bf1, bf2 = st.columns(2)
+                gravar_frota = bf1.form_submit_button("💾 Gravar", use_container_width=True, key="btn_ml_frota_edicao_gravar")
+                cancelar_frota = bf2.form_submit_button("❌ CANCELAR", use_container_width=True)
+
+                if cancelar_frota:
+                    st.session_state.ml_frota_edit_id = None
+                    st.rerun()
+
+                if gravar_frota:
+                    if not nova_frota_edit:
+                        st.warning("Informe a frota para gravar.")
+                    else:
+                        try:
+                            with conn() as c:
+                                old_frota = c.execute(
+                                    "SELECT frota FROM me_lembra_frotas WHERE id=?",
+                                    (int(st.session_state.ml_frota_edit_id),),
+                                ).fetchone()
+                                old_frota_txt = old_frota["frota"] if old_frota else ""
+
                                 c.execute(
-                                    "UPDATE me_lembra SET descricao=?, frota=? WHERE descricao=? AND COALESCE(frota,'')=COALESCE(?, '')",
-                                    (nova_desc_edit, nova_frota_desc_edit, old_desc_txt, old_frota_txt),
+                                    "UPDATE me_lembra_frotas SET frota=? WHERE id=?",
+                                    (nova_frota_edit, int(st.session_state.ml_frota_edit_id)),
                                 )
-                        st.session_state.ml_desc_edit_id = None
-                        alerta_gravado()
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.warning("Já existe uma descrição com esse nome.")
+                                if old_frota_txt:
+                                    c.execute(
+                                        "UPDATE me_lembra_descricoes SET frota=? WHERE frota=?",
+                                        (nova_frota_edit, old_frota_txt),
+                                    )
+                                    c.execute(
+                                        "UPDATE me_lembra SET frota=? WHERE frota=?",
+                                        (nova_frota_edit, old_frota_txt),
+                                    )
+                            st.session_state.ml_frota_edit_id = None
+                            alerta_gravado()
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.warning("Já existe uma frota com esse nome.")
 
     st.divider()
-    st.markdown("### 3) Cadastro do Lembrete")
-    if not lista_frotas_ml:
-        st.warning("Cadastre pelo menos uma frota antes de lançar lembretes.")
-    elif not lista_descricoes_ml:
-        st.warning("Cadastre pelo menos uma descrição antes de lançar lembretes.")
-    else:
-        with st.form("form_me_lembra", clear_on_submit=True):
-            c1, c2, c3, c4, c5 = st.columns(5)
-            data_ativacao_ml = c1.date_input("Data Ativação", value=date.today(), format="DD/MM/YYYY", key="ml_data_ativacao")
-            data_vencimento_ml = c2.date_input("Data Vencimento", format="DD/MM/YYYY", key="ml_data_vencimento")
-            dias_alerta_lancamento_ml = c5.number_input(
-                "Dias para alerta",
-                min_value=1,
-                max_value=365,
-                value=30,
-                step=1,
-                key="ml_dias_alerta_lancamento",
-            )
-            descricao_veiculo_ml = c3.selectbox(
-                "Descrição Veículo",
-                options=lista_veiculos_full,
-                index=None,
-                placeholder="Selecione no cadastro de veículos",
-                key="ml_descricao_veiculo",
-            )
-            descricao_ml = st.selectbox(
-                "Descrição",
-                options=lista_descricoes_ml,
-                index=None,
-                placeholder="Selecione uma descrição cadastrada",
-                key="ml_descricao_sel",
-            )
-            idx_frota_sel = None
-            if descricao_ml:
-                frota_sugerida = mapa_frota_por_descricao_ml.get(descricao_ml, "")
-                if frota_sugerida in lista_frotas_ml:
-                    idx_frota_sel = lista_frotas_ml.index(frota_sugerida)
-            frota_ml = c4.selectbox(
-                "Frota",
-                options=lista_frotas_ml,
-                index=idx_frota_sel,
-                placeholder="Selecione uma frota cadastrada",
-                key="ml_frota_sel",
-            )
+    with st.expander("➕ 2) Cadastro de Descrição", expanded=False):
+        if not lista_frotas_ml:
+            st.warning("Cadastre pelo menos uma frota antes de cadastrar a descrição.")
+        else:
+            with st.form("form_ml_descricao", clear_on_submit=True):
+                d1, d2 = st.columns(2)
+                nova_descricao_ml = d1.text_input("Nova Descrição", key="ml_nova_descricao").strip()
+                nova_frota_desc_ml = d2.selectbox(
+                    "Frota",
+                    options=lista_frotas_ml,
+                    index=None,
+                    placeholder="Selecione uma frota cadastrada",
+                    key="ml_nova_frota_desc_sel",
+                )
+                if st.form_submit_button("💾 Gravar", key="btn_ml_descricao_cadastro_gravar"):
+                    if not nova_descricao_ml:
+                        st.warning("Informe a descrição para salvar.")
+                    elif not nova_frota_desc_ml:
+                        st.warning("Informe a frota para salvar.")
+                    else:
+                        try:
+                            with conn() as c:
+                                c.execute(
+                                    "INSERT INTO me_lembra_descricoes (descricao, frota) VALUES (?, ?)",
+                                    (nova_descricao_ml, nova_frota_desc_ml),
+                                )
+                            alerta_gravado()
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.warning("Essa descrição já está cadastrada.")
 
-            if st.form_submit_button("💾 Gravar", type="primary", key="btn_ml_lembrete_cadastro_gravar"):
-                if not descricao_ml:
-                    st.warning("Cadastre e selecione uma descrição para continuar.")
-                elif not descricao_veiculo_ml:
-                    st.warning("Selecione a Descrição Veículo para continuar.")
-                elif not frota_ml:
-                    st.warning("Selecione a frota para continuar.")
-                elif data_vencimento_ml < data_ativacao_ml:
-                    st.warning("A Data de Vencimento não pode ser menor que a Data de Ativação.")
-                else:
-                    with conn() as c:
-                        c.execute(
-                            """INSERT INTO me_lembra
-                               (data_ativacao, data_vencimento, data_alerta, descricao, descricao_veiculo, frota, dias_alerta)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                data_ativacao_ml.isoformat(),
-                                data_vencimento_ml.isoformat(),
-                                None,
-                                descricao_ml,
-                                descricao_veiculo_ml,
-                                frota_ml,
-                                int(dias_alerta_lancamento_ml),
-                            ),
-                        )
-                    alerta_gravado()
+        with conn() as c:
+            descricoes_ml_db = c.execute(
+                "SELECT id, descricao, frota FROM me_lembra_descricoes ORDER BY descricao ASC"
+            ).fetchall()
+        lista_descricoes_ml = [r["descricao"] for r in descricoes_ml_db]
+        mapa_frota_por_descricao_ml = {r["descricao"]: ((r["frota"] or "").strip()) for r in descricoes_ml_db}
+        mapa_descricoes_ml = {
+            f"{r['id']} - {r['descricao']} | Frota: {r['frota'] or '-'}": int(r["id"])
+            for r in descricoes_ml_db
+        }
+
+        c_alt1, c_alt2 = st.columns([2, 1])
+        descricao_sel_alt = c_alt1.selectbox(
+            "Descrição cadastrada",
+            options=list(mapa_descricoes_ml.keys()),
+            index=None,
+            placeholder="Selecione uma descrição para alterar",
+            key="ml_desc_sel_alt",
+        )
+        if "ml_desc_edit_id" not in st.session_state:
+            st.session_state.ml_desc_edit_id = None
+
+        if c_alt2.button("✏️ ALTERAR", key="ml_btn_alterar_desc", use_container_width=True):
+            if descricao_sel_alt:
+                st.session_state.ml_desc_edit_id = mapa_descricoes_ml[descricao_sel_alt]
+            else:
+                st.warning("Selecione uma descrição para alterar.")
+
+        if st.session_state.ml_desc_edit_id is not None:
+            row_desc_edit = next((r for r in descricoes_ml_db if int(r["id"]) == int(st.session_state.ml_desc_edit_id)), None)
+            valor_atual_desc = row_desc_edit["descricao"] if row_desc_edit else ""
+            valor_atual_frota_desc = (row_desc_edit["frota"] if row_desc_edit else "") or ""
+
+            with st.form("form_ml_gravar_descricao"):
+                de1, de2 = st.columns(2)
+                nova_desc_edit = de1.text_input("Descrição (Editar)", value=valor_atual_desc).strip()
+                opcoes_frota_desc = list(lista_frotas_ml)
+                if valor_atual_frota_desc and valor_atual_frota_desc not in opcoes_frota_desc:
+                    opcoes_frota_desc.append(valor_atual_frota_desc)
+                idx_frota_desc = opcoes_frota_desc.index(valor_atual_frota_desc) if valor_atual_frota_desc in opcoes_frota_desc else None
+                nova_frota_desc_edit = de2.selectbox(
+                    "Frota (Editar)",
+                    options=opcoes_frota_desc,
+                    index=idx_frota_desc,
+                    placeholder="Selecione uma frota cadastrada",
+                )
+                b_desc1, b_desc2 = st.columns(2)
+                gravar_desc = b_desc1.form_submit_button("💾 Gravar", use_container_width=True, key="btn_ml_descricao_edicao_gravar")
+                cancelar_desc = b_desc2.form_submit_button("❌ CANCELAR", use_container_width=True)
+
+                if cancelar_desc:
+                    st.session_state.ml_desc_edit_id = None
                     st.rerun()
+
+                if gravar_desc:
+                    if not nova_desc_edit:
+                        st.warning("Informe a descrição para gravar.")
+                    elif not nova_frota_desc_edit:
+                        st.warning("Informe a frota para gravar.")
+                    else:
+                        try:
+                            with conn() as c:
+                                old_desc = c.execute(
+                                    "SELECT descricao, frota FROM me_lembra_descricoes WHERE id=?",
+                                    (int(st.session_state.ml_desc_edit_id),),
+                                ).fetchone()
+                                old_desc_txt = old_desc["descricao"] if old_desc else ""
+                                old_frota_txt = (old_desc["frota"] if old_desc else "") or ""
+
+                                c.execute(
+                                    "UPDATE me_lembra_descricoes SET descricao=?, frota=? WHERE id=?",
+                                    (nova_desc_edit, nova_frota_desc_edit, int(st.session_state.ml_desc_edit_id)),
+                                )
+                                if old_desc_txt:
+                                    c.execute(
+                                        "UPDATE me_lembra SET descricao=?, frota=? WHERE descricao=? AND COALESCE(frota,'')=COALESCE(?, '')",
+                                        (nova_desc_edit, nova_frota_desc_edit, old_desc_txt, old_frota_txt),
+                                    )
+                            st.session_state.ml_desc_edit_id = None
+                            alerta_gravado()
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.warning("Já existe uma descrição com esse nome.")
+
+    st.divider()
+    with st.expander("➕ 3) Cadastro do Lembrete", expanded=False):
+        if not lista_frotas_ml:
+            st.warning("Cadastre pelo menos uma frota antes de lançar lembretes.")
+        elif not lista_descricoes_ml:
+            st.warning("Cadastre pelo menos uma descrição antes de lançar lembretes.")
+        else:
+            with st.form("form_me_lembra", clear_on_submit=True):
+                c1, c2, c3, c4, c5, c6 = st.columns(6)
+                data_ativacao_ml = c1.date_input("Data Ativação", value=date.today(), format="DD/MM/YYYY", key="ml_data_ativacao")
+                data_vencimento_ml = c2.date_input("Data Vencimento", format="DD/MM/YYYY", key="ml_data_vencimento")
+                dias_alerta_lancamento_ml = c5.number_input(
+                    "Dias para alerta",
+                    min_value=1,
+                    max_value=365,
+                    value=30,
+                    step=1,
+                    key="ml_dias_alerta_lancamento",
+                )
+                descricao_veiculo_ml = c3.selectbox(
+                    "Descrição Veículo",
+                    options=lista_veiculos_full,
+                    index=None,
+                    placeholder="Selecione no cadastro de veículos",
+                    key="ml_descricao_veiculo",
+                )
+                descricao_ml = st.selectbox(
+                    "Descrição",
+                    options=lista_descricoes_ml,
+                    index=None,
+                    placeholder="Selecione uma descrição cadastrada",
+                    key="ml_descricao_sel",
+                )
+                idx_frota_sel = None
+                if descricao_ml:
+                    frota_sugerida = mapa_frota_por_descricao_ml.get(descricao_ml, "")
+                    if frota_sugerida in lista_frotas_ml:
+                        idx_frota_sel = lista_frotas_ml.index(frota_sugerida)
+                frota_ml = c4.selectbox(
+                    "Frota",
+                    options=lista_frotas_ml,
+                    index=idx_frota_sel,
+                    placeholder="Selecione uma frota cadastrada",
+                    key="ml_frota_sel",
+                )
+                nao_ativar_popup_ml = c6.checkbox(
+                    "Não ativar popup",
+                    value=False,
+                    key="ml_nao_ativar_popup",
+                )
+
+                if st.form_submit_button("💾 Gravar", type="primary", key="btn_ml_lembrete_cadastro_gravar"):
+                    if not descricao_ml:
+                        st.warning("Cadastre e selecione uma descrição para continuar.")
+                    elif not descricao_veiculo_ml:
+                        st.warning("Selecione a Descrição Veículo para continuar.")
+                    elif not frota_ml:
+                        st.warning("Selecione a frota para continuar.")
+                    elif data_vencimento_ml < data_ativacao_ml:
+                        st.warning("A Data de Vencimento não pode ser menor que a Data de Ativação.")
+                    else:
+                        with conn() as c:
+                            c.execute(
+                                """INSERT INTO me_lembra
+                                   (data_ativacao, data_vencimento, data_alerta, descricao, descricao_veiculo, frota, dias_alerta, popup_ativo)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    data_ativacao_ml.isoformat(),
+                                    data_vencimento_ml.isoformat(),
+                                    None,
+                                    descricao_ml,
+                                    descricao_veiculo_ml,
+                                    frota_ml,
+                                    int(dias_alerta_lancamento_ml),
+                                    0 if nao_ativar_popup_ml else 1,
+                                ),
+                            )
+                        alerta_gravado()
+                        st.rerun()
 
     def preparar_df_me_lembra(df_base: pd.DataFrame) -> pd.DataFrame:
         df_preparado = df_base.copy()
@@ -7976,6 +8196,8 @@ with aba18:
         df_preparado["data_vencimento"] = venc_ts.dt.date
         df_preparado["dias_para_vencer"] = (venc_ts - hoje_ref).dt.days
         df_preparado["dias_alerta"] = pd.to_numeric(df_preparado.get("dias_alerta", 30), errors="coerce").fillna(30).astype(int)
+        df_preparado["popup_ativo"] = pd.to_numeric(df_preparado.get("popup_ativo", 1), errors="coerce").fillna(1).astype(int)
+        df_preparado["popup"] = df_preparado["popup_ativo"].apply(lambda v: "Ativo" if int(v) == 1 else "Desativado")
         df_preparado["alarme_ativo"] = (
             df_preparado["dias_para_vencer"].notna()
             & (df_preparado["dias_para_vencer"] >= 0)
@@ -8003,7 +8225,7 @@ with aba18:
 
     with conn() as c:
         df_ml = pd.read_sql(
-            """SELECT id, data_ativacao, data_vencimento, data_alerta, descricao, descricao_veiculo, frota, COALESCE(dias_alerta, 30) AS dias_alerta
+            """SELECT id, data_ativacao, data_vencimento, data_alerta, descricao, descricao_veiculo, frota, COALESCE(dias_alerta, 30) AS dias_alerta, COALESCE(popup_ativo, 1) AS popup_ativo
                FROM me_lembra
                ORDER BY date(data_vencimento) ASC, id DESC""",
             c,
@@ -8049,7 +8271,7 @@ with aba18:
             df_ml_exibir = df_ml_exibir[df_ml_exibir["status"].isin(filtro_status_ml)]
 
         st.dataframe(
-            df_ml_exibir[["id", "data_ativacao", "data_vencimento", "dias_alerta", "frota", "descricao_veiculo", "descricao", "dias_para_vencer", "status"]],
+            df_ml_exibir[["id", "data_ativacao", "data_vencimento", "dias_alerta", "popup", "frota", "descricao_veiculo", "descricao", "dias_para_vencer", "status"]],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -8057,6 +8279,7 @@ with aba18:
                 "data_ativacao": st.column_config.DateColumn("Data Ativação", format="DD/MM/YYYY"),
                 "data_vencimento": st.column_config.DateColumn("Data Vencimento", format="DD/MM/YYYY"),
                 "dias_alerta": st.column_config.NumberColumn("Dias Alerta", format="%d"),
+                "popup": st.column_config.TextColumn("Popup"),
                 "frota": st.column_config.TextColumn("Frota"),
                 "descricao_veiculo": st.column_config.TextColumn("Descrição Veículo"),
                 "descricao": st.column_config.TextColumn("Descrição"),
@@ -8123,6 +8346,7 @@ with aba18:
                 valor_data_venc = reg["data_vencimento"] if pd.notna(reg["data_vencimento"]) else date.today()
                 valor_frota = reg["frota"] if pd.notna(reg["frota"]) else ""
                 valor_dias_alerta = int(reg["dias_alerta"]) if pd.notna(reg["dias_alerta"]) else 30
+                valor_popup_ativo = int(reg["popup_ativo"]) if pd.notna(reg["popup_ativo"]) else 1
 
                 opcoes_desc = list(lista_descricoes_ml)
                 if reg["descricao"] and reg["descricao"] not in opcoes_desc:
@@ -8136,7 +8360,7 @@ with aba18:
                 idx_veic = opcoes_veic.index(valor_veic) if valor_veic in opcoes_veic else None
 
                 with st.form("form_ml_gravar"):
-                    e1, e2, e3, e4, e5 = st.columns(5)
+                    e1, e2, e3, e4, e5, e6 = st.columns(6)
                     nova_data_ativ = e1.date_input(
                         "Data Ativação (Editar)",
                         value=valor_data_ativ,
@@ -8174,6 +8398,11 @@ with aba18:
                         step=1,
                         key=f"ml_edit_dias_alerta_{int(id_edit)}",
                     )
+                    novo_nao_ativar_popup = e6.checkbox(
+                        "Não ativar popup (Editar)",
+                        value=(valor_popup_ativo == 0),
+                        key=f"ml_edit_nao_ativar_popup_{int(id_edit)}",
+                    )
                     nova_descricao = st.selectbox(
                         "Descrição (Editar)",
                         options=opcoes_desc,
@@ -8198,7 +8427,7 @@ with aba18:
                             with conn() as c:
                                 c.execute(
                                     """UPDATE me_lembra
-                                       SET data_ativacao=?, data_vencimento=?, data_alerta=?, descricao=?, descricao_veiculo=?, frota=?, dias_alerta=?
+                                       SET data_ativacao=?, data_vencimento=?, data_alerta=?, descricao=?, descricao_veiculo=?, frota=?, dias_alerta=?, popup_ativo=?
                                        WHERE id=?""",
                                     (
                                         nova_data_ativ.isoformat(),
@@ -8208,6 +8437,7 @@ with aba18:
                                         novo_veiculo,
                                         nova_frota,
                                         int(novo_dias_alerta),
+                                        0 if novo_nao_ativar_popup else 1,
                                         int(id_edit),
                                     ),
                                 )
