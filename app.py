@@ -296,6 +296,17 @@ def init_db():
             data_vencimento TEXT,
             dias_alerta INTEGER DEFAULT 30
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS tipos_servico_troca (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT UNIQUE
+        )""")
+        default_servicos_troca = [
+            "Troca de Óleo Motor", "Troca de Óleo Câmbio", "Troca de Óleo Diferencial",
+            "Filtro de Ar", "Filtro de Combustível", "Revisão Geral",
+            "Troca Pneu Dianteiro", "Troca Pneu Tração", "Troca Pneu Truck", "Outros"
+        ]
+        for serv in default_servicos_troca:
+            c.execute("INSERT OR IGNORE INTO tipos_servico_troca (nome) VALUES (?)", (serv,))
         c.execute("""CREATE TABLE IF NOT EXISTS parametros_historico (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             vigencia_data TEXT UNIQUE,
@@ -3627,6 +3638,36 @@ with aba4:
             if abertas:
                 opc_ab = {f"{a['veiculo_placa']} | {a['nome']} ({datetime.strptime(a['data_entrada'], '%Y-%m-%d').strftime('%d/%m/%Y')})": a['id'] for a in abertas}
                 sel_ab = st.selectbox("Selecionar Ordem Aberta", list(opc_ab.keys()))
+                # Botão para excluir ordem aberta (com confirmação)
+                if "excluir_manut_confirm" not in st.session_state:
+                    st.session_state.excluir_manut_confirm = None
+
+                if st.button("🗑️ EXCLUIR ORDEM", key=f"btn_excluir_ordem_{sel_ab}"):
+                    st.session_state.excluir_manut_confirm = opc_ab[sel_ab]
+
+                if st.session_state.excluir_manut_confirm == opc_ab[sel_ab]:
+                    st.warning("Confirma exclusão desta ordem? Esta ação é irreversível.")
+                    c_ex1, c_ex2 = st.columns(2)
+                    if c_ex1.button("Confirmar exclusão", key=f"btn_confirm_excluir_{sel_ab}"):
+                        with conn() as c:
+                            # remover anexos associados
+                            anexos = c.execute("SELECT caminho_arquivo FROM manutencoes_anexos WHERE manutencao_id=?", (int(opc_ab[sel_ab]),)).fetchall()
+                            c.execute("DELETE FROM manutencoes_anexos WHERE manutencao_id=?", (int(opc_ab[sel_ab]),))
+                            c.execute("DELETE FROM manutencoes WHERE id=?", (int(opc_ab[sel_ab]),))
+                        # apagar arquivos do disco
+                        for a in anexos:
+                            p = str(a["caminho_arquivo"] or "").strip()
+                            if p:
+                                try:
+                                    Path(p).unlink()
+                                except Exception:
+                                    pass
+                        st.success("Ordem excluída com sucesso.")
+                        st.session_state.excluir_manut_confirm = None
+                        st.rerun()
+                    if c_ex2.button("Cancelar", key=f"btn_cancel_excluir_{sel_ab}"):
+                        st.session_state.excluir_manut_confirm = None
+                        st.rerun()
                 
                 with st.form("f_manut_concl_v10"):
                     c_s1, c_s2 = st.columns(2)
@@ -3675,12 +3716,24 @@ with aba4:
     st.markdown("---")
     st.subheader("📋 Histórico e Auditoria")
     
+    # Filtro por Oficina
+    oficinas_opcoes = ["Todas as oficinas"] + list(dict_oficinas.keys())
+    oficina_selecionada = st.selectbox("Filtrar por Oficina", oficinas_opcoes, key="filtro_oficina_manutencao")
+    
     with conn() as c:
-        df_m = pd.read_sql("""SELECT m.*, o.nome as oficina_nome FROM manutencoes m 
-                              JOIN oficinas o ON m.oficina_id = o.id 
-                              WHERE m.data_entrada BETWEEN ? AND ? 
-                              ORDER BY m.data_entrada DESC""", 
-                           c, params=(filtro_ini.isoformat(), filtro_fim.isoformat()))
+        # Construir query com filtro opcional de oficina
+        query_base = """SELECT m.*, o.nome as oficina_nome FROM manutencoes m 
+                        JOIN oficinas o ON m.oficina_id = o.id 
+                        WHERE m.data_entrada BETWEEN ? AND ?"""
+        params = [filtro_ini.isoformat(), filtro_fim.isoformat()]
+        
+        if oficina_selecionada != "Todas as oficinas":
+            oficina_id = dict_oficinas[oficina_selecionada]
+            query_base += " AND m.oficina_id = ?"
+            params.append(oficina_id)
+        
+        query_base += " ORDER BY m.data_entrada DESC"
+        df_m = pd.read_sql(query_base, c, params=params)
 
     if not df_m.empty:
         if st.button("🖨️ Imprimir Manutenção por Período", use_container_width=True, key="btn_print_manutencao_periodo"):
@@ -5345,8 +5398,9 @@ with aba12:
 with aba13:
     st.subheader("🛢️ Controle de Trocas e Revisões")
     
-    # Lista de serviços expandida
-    lista_servicos_troca = [
+    with conn() as c:
+        rows_servico = c.execute("SELECT nome FROM tipos_servico_troca ORDER BY nome").fetchall()
+    lista_servicos_troca = [r["nome"] for r in rows_servico] if rows_servico else [
         "Troca de Óleo Motor", "Troca de Óleo Câmbio", "Troca de Óleo Diferencial", 
         "Filtro de Ar", "Filtro de Combustível", "Revisão Geral", 
         "Troca Pneu Dianteiro", "Troca Pneu Tração", "Troca Pneu Truck", "Outros"
@@ -5356,6 +5410,47 @@ with aba13:
     
     with col_cad:
         st.markdown("### 📝 Registrar Troca/Revisão")
+        with st.expander("➕ Cadastrar novo Tipo de Serviço", expanded=False):
+            novo_tipo_cad, btn_tipo_cad = st.columns([3, 1])
+            novo_tipo_servico = novo_tipo_cad.text_input("Cadastrar novo Tipo de Serviço", key="novo_tipo_servico")
+            if btn_tipo_cad.button("➕ Adicionar", key="btn_add_tipo_servico"):
+                if str(novo_tipo_servico or "").strip():
+                    with conn() as c:
+                        c.execute("INSERT OR IGNORE INTO tipos_servico_troca (nome) VALUES (?)", (novo_tipo_servico.strip(),))
+                    st.success("Tipo de serviço cadastrado com sucesso.")
+                    st.rerun()
+                else:
+                    st.warning("Digite o nome do tipo de serviço antes de adicionar.")
+
+        with st.expander("➕ Alterar Tipo de Serviço", expanded=False):
+            with st.form("f_alterar_tipo_servico", clear_on_submit=True):
+                tipo_alterar, novo_nome = st.columns([3, 2])
+                tipo_servico_para_alterar = tipo_alterar.selectbox("Tipo de Serviço a Alterar", ["Selecione"] + lista_servicos_troca, key="tipo_servico_para_alterar")
+                novo_nome_servico = novo_nome.text_input("Novo nome do Tipo de Serviço", key="novo_nome_tipo_servico")
+                if st.form_submit_button("🔄 Alterar Tipo", key="btn_alterar_tipo_servico"):
+                    alterou_tipo_servico = False
+                    if tipo_servico_para_alterar == "Selecione":
+                        st.warning("Escolha um tipo de serviço para alterar.")
+                    elif not str(novo_nome_servico or "").strip():
+                        st.warning("Informe o novo nome do tipo de serviço.")
+                    else:
+                        novo_nome_clean = novo_nome_servico.strip()
+                        with conn() as c:
+                            existente = c.execute("SELECT 1 FROM tipos_servico_troca WHERE nome=?", (novo_nome_clean,)).fetchone()
+                            if existente:
+                                st.warning("Já existe um tipo de serviço com esse nome.")
+                            else:
+                                updated_tipos = c.execute("UPDATE tipos_servico_troca SET nome=? WHERE nome=?", (novo_nome_clean, tipo_servico_para_alterar)).rowcount
+                                updated_controle = c.execute("UPDATE controle_trocas SET tipo_servico=? WHERE tipo_servico=?", (novo_nome_clean, tipo_servico_para_alterar)).rowcount
+                                if updated_tipos > 0:
+                                    st.success(f"Tipo de serviço alterado com sucesso. ({updated_tipos} tipo(s), {updated_controle} movimento(s) atualizados)")
+                                    alterou_tipo_servico = True
+                                else:
+                                    st.warning("Nenhum tipo de serviço foi alterado. Verifique a seleção.")
+                        if alterou_tipo_servico:
+                            st.rerun()
+
+        st.markdown("---")
         with st.form("f_troca_v11", clear_on_submit=True):
             opcoes_veiculos_troca = lista_veiculos_full if lista_veiculos_full else apenas_placas
             veic_t = st.selectbox("Veículo (Placa - Descrição)", opcoes_veiculos_troca, key="veic_troca_new")
@@ -5455,13 +5550,13 @@ with aba13:
                             else:
                                 new_placa, new_desc = str(veic_t_edit), ""
 
-                            # Tenta encontrar o índice do serviço atual para o selectbox
-                            try:
-                                idx_serv = lista_servicos_troca.index(r['tipo_servico'])
-                            except ValueError:
-                                idx_serv = 0
+                            opcoes_servicos_edit = list(lista_servicos_troca)
+                            tipo_servico_atual = str(r["tipo_servico"] or "").strip()
+                            if tipo_servico_atual and tipo_servico_atual not in opcoes_servicos_edit:
+                                opcoes_servicos_edit.append(tipo_servico_atual)
+                            idx_serv = opcoes_servicos_edit.index(tipo_servico_atual) if tipo_servico_atual in opcoes_servicos_edit else 0
 
-                            new_serv = st.selectbox("Tipo de Serviço", lista_servicos_troca, index=idx_serv)
+                            new_serv = st.selectbox("Tipo de Serviço", opcoes_servicos_edit, index=idx_serv, key=f"troca_serv_edit_{r['id']}")
                             
                             ce1, ce2 = st.columns(2)
                             d_s_v = datetime.strptime(r['data_servico'], '%Y-%m-%d').date() if r['data_servico'] else datetime.now().date()
