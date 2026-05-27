@@ -72,6 +72,7 @@ def normalizar_tipo_combustivel(valor):
     return " ".join(txt.split())
 
 def alerta_gravado(mensagem="✅ Gravado com sucesso!"):
+    limpar_cache_app()
     st.success(mensagem)
 
 def conn():
@@ -103,6 +104,254 @@ def salvar_anexos_pedido_fornecedor(arquivos):
             }
         )
     return anexos_salvos
+
+
+def carregar_fornecedores_para_pecas():
+    with conn() as c:
+        rows = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
+    labels = [f"{r['codigo']} - {r['nome']}" for r in rows]
+    mapa = {f"{r['codigo']} - {r['nome']}": int(r["id"]) for r in rows}
+    return labels, mapa
+
+
+def carregar_pecas_manutencao(manutencao_id):
+    with conn() as c:
+        rows = c.execute(
+            """SELECT mp.id, mp.fornecedor_id, f.codigo, f.nome, mp.data_compra, mp.num_nf, mp.descricao_peca, mp.valor_peca
+               FROM manutencoes_pecas mp
+               LEFT JOIN fornecedores f ON f.id = mp.fornecedor_id
+               WHERE mp.manutencao_id=?
+               ORDER BY mp.id ASC""",
+            (int(manutencao_id),),
+        ).fetchall()
+    dados = []
+    for row in rows:
+        fornecedor_label = f"{row['codigo']} - {row['nome']}" if row["codigo"] and row["nome"] else ""
+        dados.append(
+            {
+                "Fornecedor": fornecedor_label,
+                "Data Compra": pd.to_datetime(row["data_compra"], errors="coerce") if row["data_compra"] else pd.NaT,
+                "N. NF": row["num_nf"] or "",
+                "Descricao da Peca": row["descricao_peca"] or "",
+                "Valor da Peca": float(row["valor_peca"] or 0),
+                "Excluir": False,
+            }
+        )
+    return pd.DataFrame(dados, columns=["Fornecedor", "Data Compra", "N. NF", "Descricao da Peca", "Valor da Peca", "Excluir"])
+
+
+def dataframe_pecas_vazio():
+    return pd.DataFrame(
+        {
+            "Fornecedor": pd.Series(dtype="object"),
+            "Data Compra": pd.Series(dtype="datetime64[ns]"),
+            "N. NF": pd.Series(dtype="object"),
+            "Descricao da Peca": pd.Series(dtype="object"),
+            "Valor da Peca": pd.Series(dtype="float64"),
+            "Excluir": pd.Series(dtype="bool"),
+        }
+    )
+
+
+def normalizar_data_iso(valor):
+    if valor is None or valor == "":
+        return None
+    try:
+        dt = pd.to_datetime(valor, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+
+def texto_celula_editor(valor):
+    if valor is None:
+        return ""
+    try:
+        if pd.isna(valor):
+            return ""
+    except Exception:
+        pass
+    txt = str(valor).strip()
+    return "" if txt.lower() in ("nan", "nat", "none") else txt
+
+
+def preparar_pecas_manutencao(df_pecas, mapa_fornecedores):
+    itens = []
+    if df_pecas is None or df_pecas.empty:
+        return itens, 0.0, None
+    for _, row in df_pecas.iterrows():
+        if bool(row.get("Excluir", False)):
+            continue
+        fornecedor_label = texto_celula_editor(row.get("Fornecedor"))
+        data_compra = normalizar_data_iso(row.get("Data Compra"))
+        num_nf = texto_celula_editor(row.get("N. NF"))
+        descricao = texto_celula_editor(row.get("Descricao da Peca"))
+        valor_raw = row.get("Valor da Peca")
+        try:
+            valor = 0.0 if pd.isna(valor_raw) else float(valor_raw or 0)
+        except Exception:
+            valor = 0.0
+
+        if not any([fornecedor_label, data_compra, num_nf, descricao, valor > 0]):
+            continue
+        if not fornecedor_label or fornecedor_label not in mapa_fornecedores:
+            return [], 0.0, "Selecione o fornecedor em todas as linhas de peças preenchidas."
+        itens.append(
+            {
+                "fornecedor_id": mapa_fornecedores[fornecedor_label],
+                "data_compra": data_compra,
+                "num_nf": num_nf,
+                "descricao_peca": descricao,
+                "valor_peca": valor,
+            }
+        )
+    return itens, sum(item["valor_peca"] for item in itens), None
+
+
+def salvar_pecas_manutencao(c, manutencao_id, itens):
+    c.execute("DELETE FROM manutencoes_pecas WHERE manutencao_id=?", (int(manutencao_id),))
+    for item in itens:
+        c.execute(
+            """INSERT INTO manutencoes_pecas
+               (manutencao_id, fornecedor_id, data_compra, num_nf, descricao_peca, valor_peca)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                int(manutencao_id),
+                item["fornecedor_id"],
+                item["data_compra"],
+                item["num_nf"],
+                item["descricao_peca"],
+                item["valor_peca"],
+            ),
+        )
+
+
+def excluir_peca_manutencao(peca_id):
+    with conn() as c:
+        peca = c.execute(
+            "SELECT manutencao_id FROM manutencoes_pecas WHERE id=?",
+            (int(peca_id),),
+        ).fetchone()
+        if not peca:
+            return False
+        manutencao_id = int(peca["manutencao_id"])
+        c.execute("DELETE FROM manutencoes_pecas WHERE id=?", (int(peca_id),))
+        total_pecas = c.execute(
+            "SELECT COALESCE(SUM(valor_peca), 0) FROM manutencoes_pecas WHERE manutencao_id=?",
+            (manutencao_id,),
+        ).fetchone()[0]
+        c.execute("UPDATE manutencoes SET valor_pecas=? WHERE id=?", (float(total_pecas or 0), manutencao_id))
+    return True
+
+
+def excluir_manutencao_completa(manutencao_id):
+    anexos = []
+    with conn() as c:
+        anexos = c.execute(
+            """SELECT caminho_arquivo
+               FROM manutencoes_anexos
+               WHERE manutencao_id=?""",
+            (int(manutencao_id),),
+        ).fetchall()
+        c.execute("DELETE FROM manutencoes_anexos WHERE manutencao_id=?", (int(manutencao_id),))
+        c.execute("DELETE FROM manutencoes_pecas WHERE manutencao_id=?", (int(manutencao_id),))
+        c.execute("DELETE FROM manutencoes WHERE id=?", (int(manutencao_id),))
+
+    for anexo in anexos:
+        caminho = str(anexo["caminho_arquivo"] or "").strip()
+        if not caminho:
+            continue
+        try:
+            Path(caminho).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def codigo_fornecedor_oficina(oficina_id):
+    return f"OFICINA-{int(oficina_id):04d}"
+
+
+def importar_oficinas_para_fornecedores():
+    with conn() as c:
+        oficinas = c.execute(
+            """SELECT id, nome, cnpj, endereco, numero, complemento, bairro, cidade, estado, cep,
+                      inscricao_estadual, telefone_contato, email, responsavel
+               FROM oficinas
+               ORDER BY nome ASC"""
+        ).fetchall()
+        inseridos = 0
+        atualizados = 0
+
+        for oficina in oficinas:
+            codigo = codigo_fornecedor_oficina(oficina["id"])
+            nome = str(oficina["nome"] or "").strip()
+            cnpj = str(oficina["cnpj"] or "").strip()
+            existente = c.execute(
+                """SELECT id
+                   FROM fornecedores
+                   WHERE codigo = ?
+                      OR origem_oficina_id = ?
+                      OR (? <> '' AND cnpj = ?)
+                      OR UPPER(TRIM(nome)) = UPPER(TRIM(?))
+                   ORDER BY CASE WHEN codigo = ? THEN 0 ELSE 1 END, id
+                   LIMIT 1""",
+                (codigo, int(oficina["id"]), cnpj, cnpj, nome, codigo),
+            ).fetchone()
+
+            dados = (
+                nome,
+                cnpj,
+                oficina["inscricao_estadual"] or "",
+                oficina["endereco"] or "",
+                oficina["numero"] or "",
+                oficina["complemento"] or "",
+                oficina["cidade"] or "",
+                oficina["estado"] or "",
+                oficina["bairro"] or "",
+                oficina["cep"] or "",
+                oficina["telefone_contato"] or "",
+                oficina["email"] or "",
+                oficina["responsavel"] or "",
+                int(oficina["id"]),
+            )
+
+            if existente:
+                c.execute(
+                    """UPDATE fornecedores
+                       SET nome=?, cnpj=?, insc_est=?, endereco=?, numero=?, complemento=?,
+                           cidade=?, estado=?, bairro=?, cep=?, telefone=?, email=?,
+                           responsavel=?, origem_oficina_id=?
+                       WHERE id=?""",
+                    (*dados, int(existente["id"])),
+                )
+                atualizados += 1
+            else:
+                c.execute(
+                    """INSERT INTO fornecedores
+                       (codigo, nome, cnpj, insc_est, endereco, numero, complemento, cidade,
+                        estado, bairro, cep, telefone, email, responsavel, origem_oficina_id, pix)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')""",
+                    (codigo, *dados),
+                )
+                inseridos += 1
+    return inseridos, atualizados
+
+
+def movimentos_fornecedor(c, fornecedor_id):
+    fornecedor_id = int(fornecedor_id)
+    usos = []
+    qtd_manut = c.execute("SELECT COUNT(*) FROM manutencoes WHERE oficina_id=?", (fornecedor_id,)).fetchone()[0]
+    if qtd_manut:
+        usos.append(f"Manutenção: {qtd_manut}")
+    qtd_pecas = c.execute("SELECT COUNT(*) FROM manutencoes_pecas WHERE fornecedor_id=?", (fornecedor_id,)).fetchone()[0]
+    if qtd_pecas:
+        usos.append(f"Peças de manutenção: {qtd_pecas}")
+    qtd_cp = c.execute("SELECT COUNT(*) FROM contas_pagar WHERE fornecedor_id=?", (fornecedor_id,)).fetchone()[0]
+    if qtd_cp:
+        usos.append(f"Contas a pagar: {qtd_cp}")
+    return usos
 
 
 def cache_data_compat(ttl=90, show_spinner=False):
@@ -140,6 +389,13 @@ def _carregar_bootstrap_app():
     }
 
 
+def limpar_cache_bootstrap():
+    try:
+        _carregar_bootstrap_app.clear()
+    except Exception:
+        pass
+
+
 @cache_data_compat(ttl=90, show_spinner=False)
 def _carregar_historico_parametros_raw():
     with conn() as c:
@@ -173,6 +429,33 @@ def limpar_cache_viagens():
 def _carregar_rotas_ref_exec_raw():
     with conn() as c:
         return pd.read_sql("SELECT origem, destino, valor_ton FROM rotas", c)
+
+
+def limpar_cache_app():
+    funcoes_cache = [
+        "_carregar_bootstrap_app",
+        "_carregar_historico_parametros_raw",
+        "_carregar_viagens_periodo_raw",
+        "_carregar_rotas_ref_exec_raw",
+    ]
+    for nome_func in funcoes_cache:
+        func = globals().get(nome_func)
+        clear_func = getattr(func, "clear", None)
+        if callable(clear_func):
+            try:
+                clear_func()
+            except Exception:
+                pass
+    cache_data_fn = getattr(st, "cache_data", None)
+    clear_cache_data = getattr(cache_data_fn, "clear", None)
+    if callable(clear_cache_data):
+        try:
+            clear_cache_data()
+        except Exception:
+            pass
+
+
+limpar_cache_app()
 
 # =========================
 # 2. INICIALIZAÇÃO DO BANCO
@@ -236,10 +519,16 @@ def init_db():
             cnpj TEXT,
             insc_est TEXT,
             endereco TEXT,
+            numero TEXT,
+            complemento TEXT,
             cidade TEXT,
+            estado TEXT,
             bairro TEXT,
             cep TEXT,
             telefone TEXT,
+            email TEXT,
+            responsavel TEXT,
+            origem_oficina_id INTEGER,
             pix TEXT
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS obrigacoes (
@@ -334,6 +623,22 @@ def init_db():
             oficina_id INTEGER, defeito TEXT, servico TEXT, 
             valor_mo REAL, valor_pecas REAL, garantia TEXT, 
             km_servico REAL, mecanico TEXT, obs TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS manutencoes_pecas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            manutencao_id INTEGER,
+            fornecedor_id INTEGER,
+            data_compra TEXT,
+            num_nf TEXT,
+            descricao_peca TEXT,
+            valor_peca REAL DEFAULT 0.0
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS manutencoes_anexos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            manutencao_id INTEGER,
+            nome_arquivo TEXT,
+            caminho_arquivo TEXT,
+            data_inclusao TEXT
+        )""")
         c.execute("""CREATE TABLE IF NOT EXISTS praca_pedagio (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             rota TEXT,
@@ -515,8 +820,18 @@ def init_db():
 
         cursor_forn = c.execute("PRAGMA table_info(fornecedores)")
         colunas_forn = [coluna[1] for coluna in cursor_forn.fetchall()]
-        if "pix" not in colunas_forn:
-            c.execute("ALTER TABLE fornecedores ADD COLUMN pix TEXT")
+        novas_colunas_forn = {
+            "numero": "TEXT",
+            "complemento": "TEXT",
+            "estado": "TEXT",
+            "email": "TEXT",
+            "responsavel": "TEXT",
+            "origem_oficina_id": "INTEGER",
+            "pix": "TEXT",
+        }
+        for col, tipo in novas_colunas_forn.items():
+            if col not in colunas_forn:
+                c.execute(f"ALTER TABLE fornecedores ADD COLUMN {col} {tipo}")
 
         cursor_trocas = c.execute("PRAGMA table_info(controle_trocas)")
         colunas_trocas = [coluna[1] for coluna in cursor_trocas.fetchall()]
@@ -615,6 +930,7 @@ lista_veiculos_full = [f"{v['placa']} - {v['descricao']}" for v in veiculos_db]
 oficinas_db = bootstrap["oficinas_db"]
 dict_oficinas = {o["nome"]: o["id"] for o in oficinas_db}
 fornecedores_db = bootstrap["fornecedores_db"]
+dict_fornecedores_manutencao = {f["nome"]: f["id"] for f in fornecedores_db}
 obrigacoes_db = bootstrap["obrigacoes_db"]
 
 last_v = bootstrap["last_v"]
@@ -3596,8 +3912,8 @@ with aba3:
 with aba4:
     st.subheader("🛠️ Gestão de Manutenção")
     
-    if not apenas_placas or not oficinas_db:
-        st.warning("⚠️ Cadastre veículos e oficinas primeiro.")
+    if not apenas_placas or not fornecedores_db:
+        st.warning("⚠️ Cadastre veículos e fornecedores primeiro.")
     else:
         col_ent, col_con = st.columns(2)
         
@@ -3619,25 +3935,33 @@ with aba4:
                 else:
                     v_m = str(veic_sel_manut).strip()
                 k_m = st.number_input("KM Entrada", step=1.0)
-                o_m = st.selectbox("Oficina", list(dict_oficinas.keys()))
+                o_m = st.selectbox("Fornecedor", list(dict_fornecedores_manutencao.keys()))
                 def_m = st.text_area("Relato do Defeito")
                 
                 if st.form_submit_button("💾 Gravar", key="btn_manut_entrada_gravar"):
                     with conn() as c:
                         c.execute("""INSERT INTO manutencoes (data_entrada, veiculo_placa, oficina_id, defeito, km_servico, num_os) 
-                                     VALUES (?,?,?,?,?,?)""", (d_e.isoformat(), v_m, dict_oficinas[o_m], def_m, k_m, num_os))
+                                     VALUES (?,?,?,?,?,?)""", (d_e.isoformat(), v_m, dict_fornecedores_manutencao[o_m], def_m, k_m, num_os))
                     alerta_gravado()
                     st.rerun()
 
         # --- 2. CONCLUSÃO (FINALIZAÇÃO) ---
         with col_con:
-            st.markdown("### 2️⃣ Finalizar Serviço")
             with conn() as c:
-                abertas = c.execute("SELECT m.id, m.veiculo_placa, o.nome, m.data_entrada FROM manutencoes m JOIN oficinas o ON m.oficina_id = o.id WHERE (m.servico IS NULL OR m.servico = '')").fetchall()
+                abertas = c.execute(
+                    """SELECT m.id, m.veiculo_placa, f.nome, m.data_entrada
+                       FROM manutencoes m
+                       JOIN fornecedores f ON m.oficina_id = f.id
+                       WHERE (m.data_fim IS NULL OR TRIM(m.data_fim) = '')
+                         AND (m.servico IS NULL OR TRIM(m.servico) = '')
+                       ORDER BY m.data_entrada DESC, m.id DESC"""
+                ).fetchall()
             
             if abertas:
+                st.markdown("### 2️⃣ Finalizar Serviço")
                 opc_ab = {f"{a['veiculo_placa']} | {a['nome']} ({datetime.strptime(a['data_entrada'], '%Y-%m-%d').strftime('%d/%m/%Y')})": a['id'] for a in abertas}
                 sel_ab = st.selectbox("Selecionar Ordem Aberta", list(opc_ab.keys()))
+                fornecedores_pecas, mapa_fornecedores_pecas = carregar_fornecedores_para_pecas()
                 # Botão para excluir ordem aberta (com confirmação)
                 if "excluir_manut_confirm" not in st.session_state:
                     st.session_state.excluir_manut_confirm = None
@@ -3649,19 +3973,7 @@ with aba4:
                     st.warning("Confirma exclusão desta ordem? Esta ação é irreversível.")
                     c_ex1, c_ex2 = st.columns(2)
                     if c_ex1.button("Confirmar exclusão", key=f"btn_confirm_excluir_{sel_ab}"):
-                        with conn() as c:
-                            # remover anexos associados
-                            anexos = c.execute("SELECT caminho_arquivo FROM manutencoes_anexos WHERE manutencao_id=?", (int(opc_ab[sel_ab]),)).fetchall()
-                            c.execute("DELETE FROM manutencoes_anexos WHERE manutencao_id=?", (int(opc_ab[sel_ab]),))
-                            c.execute("DELETE FROM manutencoes WHERE id=?", (int(opc_ab[sel_ab]),))
-                        # apagar arquivos do disco
-                        for a in anexos:
-                            p = str(a["caminho_arquivo"] or "").strip()
-                            if p:
-                                try:
-                                    Path(p).unlink()
-                                except Exception:
-                                    pass
+                        excluir_manutencao_completa(int(opc_ab[sel_ab]))
                         st.success("Ordem excluída com sucesso.")
                         st.session_state.excluir_manut_confirm = None
                         st.rerun()
@@ -3676,12 +3988,31 @@ with aba4:
                     
                     serv_f = st.text_area("Serviço Realizado")
                     
-                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1, c3, c4, c5 = st.columns(4)
                     v_mo = c1.number_input("Mão de Obra (R$)", min_value=0.0, step=10.0)
-                    v_pe = c2.number_input("Peças (R$)", min_value=0.0, step=10.0)
                     v_ct_ida = c3.number_input("Custo Transp Ida (R$)", min_value=0.0, step=10.0)
                     v_ct_ret = c4.number_input("Custo Transporte Retorno (R$)", min_value=0.0, step=10.0)
                     dt_gar = c5.date_input("Vencimento Garantia", format="DD/MM/YYYY")
+
+                    st.markdown("**Peças compradas de fornecedores**")
+                    if not fornecedores_pecas:
+                        st.warning("Cadastre fornecedores na aba Fornecedores para lançar peças.")
+                    df_pecas_finalizar = st.data_editor(
+                        dataframe_pecas_vazio(),
+                        key=f"editor_pecas_finalizar_{opc_ab[sel_ab]}",
+                        hide_index=True,
+                        use_container_width=True,
+                        num_rows="dynamic",
+                        column_config={
+                            "Fornecedor": st.column_config.SelectboxColumn("Nome do Fornecedor", options=fornecedores_pecas),
+                            "Data Compra": st.column_config.DateColumn("Data Compra", format="DD/MM/YYYY"),
+                            "N. NF": st.column_config.TextColumn("N. NF"),
+                            "Descricao da Peca": st.column_config.TextColumn("Descrição da Peça"),
+                            "Valor da Peca": st.column_config.NumberColumn("Valor da Peça", min_value=0.0, step=0.01, format="R$ %.2f"),
+                            "Excluir": st.column_config.CheckboxColumn("🗑️ Excluir"),
+                        },
+                    )
+                    itens_pecas_finalizar, v_pe, erro_pecas_finalizar = preparar_pecas_manutencao(df_pecas_finalizar, mapa_fornecedores_pecas)
                     
                     # Campo Visual do Total
                     st.info(f"💰 **Total do Serviço: {brl(v_mo + v_pe + v_ct_ida + v_ct_ret)}**")
@@ -3695,12 +4026,16 @@ with aba4:
                     )
                     
                     if st.form_submit_button("💾 Gravar", key="btn_manut_conclusao_gravar"):
+                        if erro_pecas_finalizar:
+                            st.warning(erro_pecas_finalizar)
+                            st.stop()
                         pedido_fornecedor_anexos = salvar_anexos_pedido_fornecedor(pedido_fornecedor_files)
                         manut_id = int(opc_ab[sel_ab])
                         with conn() as c:
                             c.execute("""UPDATE manutencoes SET data_fim=?, servico=?, valor_mo=?, valor_pecas=?, custo_transporte_ida=?, custo_transporte_retorno=?, num_nf=?, 
                                          data_vencimento_garantia=?, observacao_adicional=?, pedido_fornecedor_arquivo=? 
                                          WHERE id=?""", (d_f.isoformat(), serv_f, v_mo, v_pe, v_ct_ida, v_ct_ret, num_nf, dt_gar.isoformat(), obs_f, (pedido_fornecedor_anexos[0]["caminho_arquivo"] if pedido_fornecedor_anexos else None), manut_id))
+                            salvar_pecas_manutencao(c, manut_id, itens_pecas_finalizar)
                             for anexo in pedido_fornecedor_anexos:
                                 c.execute(
                                     """INSERT INTO manutencoes_anexos (manutencao_id, nome_arquivo, caminho_arquivo, data_inclusao)
@@ -3709,46 +4044,135 @@ with aba4:
                                 )
                         alerta_gravado()
                         st.rerun()
-            else:
-                st.info("Não há ordens pendentes de conclusão.")
 
     # --- 3. HISTÓRICO COM EDIÇÃO TOTAL ---
     st.markdown("---")
     st.subheader("📋 Histórico e Auditoria")
     
-    # Filtro por Oficina
-    oficinas_opcoes = ["Todas as oficinas"] + list(dict_oficinas.keys())
-    oficina_selecionada = st.selectbox("Filtrar por Oficina", oficinas_opcoes, key="filtro_oficina_manutencao")
+    # Filtro por fornecedor da manutenção
+    fornecedores_manut_opcoes = ["Todos os fornecedores"] + list(dict_fornecedores_manutencao.keys())
+    fornecedor_manut_selecionado = st.selectbox("Filtrar por Fornecedor", fornecedores_manut_opcoes, key="filtro_fornecedor_manutencao")
     
     with conn() as c:
-        # Construir query com filtro opcional de oficina
-        query_base = """SELECT m.*, o.nome as oficina_nome FROM manutencoes m 
-                        JOIN oficinas o ON m.oficina_id = o.id 
+        # Construir query com filtro opcional de fornecedor
+        query_base = """SELECT m.*, f.nome as fornecedor_nome FROM manutencoes m 
+                        JOIN fornecedores f ON m.oficina_id = f.id 
                         WHERE m.data_entrada BETWEEN ? AND ?"""
         params = [filtro_ini.isoformat(), filtro_fim.isoformat()]
         
-        if oficina_selecionada != "Todas as oficinas":
-            oficina_id = dict_oficinas[oficina_selecionada]
+        if fornecedor_manut_selecionado != "Todos os fornecedores":
+            fornecedor_id = dict_fornecedores_manutencao[fornecedor_manut_selecionado]
             query_base += " AND m.oficina_id = ?"
-            params.append(oficina_id)
+            params.append(fornecedor_id)
         
         query_base += " ORDER BY m.data_entrada DESC"
         df_m = pd.read_sql(query_base, c, params=params)
 
+    total_periodo_manut = 0.0
+    total_periodo_mo = 0.0
+    total_periodo_pecas = 0.0
+    total_periodo_transporte = 0.0
     if not df_m.empty:
+        total_periodo_mo = pd.to_numeric(df_m["valor_mo"], errors="coerce").fillna(0).sum()
+        total_periodo_pecas = pd.to_numeric(df_m["valor_pecas"], errors="coerce").fillna(0).sum()
+        total_periodo_ida = pd.to_numeric(df_m["custo_transporte_ida"], errors="coerce").fillna(0)
+        total_periodo_retorno = pd.to_numeric(df_m["custo_transporte_retorno"], errors="coerce").fillna(0)
+        if "custo_transporte" in df_m.columns:
+            total_periodo_legado = pd.to_numeric(df_m["custo_transporte"], errors="coerce").fillna(0)
+            sem_ida_retorno = (total_periodo_ida == 0) & (total_periodo_retorno == 0)
+            total_periodo_ida = total_periodo_ida.mask(sem_ida_retorno, total_periodo_legado)
+        total_periodo_transporte = total_periodo_ida.sum() + total_periodo_retorno.sum()
+        total_periodo_manut = total_periodo_mo + total_periodo_pecas + total_periodo_transporte
+
+    resumo_manut_cols = st.columns(4)
+    resumo_manut_cols[0].metric("Total Gasto no Período", brl(total_periodo_manut))
+    resumo_manut_cols[1].metric("Mão de Obra", brl(total_periodo_mo))
+    resumo_manut_cols[2].metric("Peças", brl(total_periodo_pecas))
+    resumo_manut_cols[3].metric("Transporte", brl(total_periodo_transporte))
+
+    if not df_m.empty:
+        if "manut_excluir_mov_id" not in st.session_state:
+            st.session_state.manut_excluir_mov_id = None
+
+        st.markdown("##### Excluir Movimento")
+        opcoes_excluir_manut = {}
+        for _, mov in df_m.iterrows():
+            data_mov = datetime.strptime(mov["data_entrada"], "%Y-%m-%d").strftime("%d/%m/%Y") if mov["data_entrada"] else "-"
+            ct_ida_mov = float(mov["custo_transporte_ida"] or 0)
+            ct_ret_mov = float(mov["custo_transporte_retorno"] or 0)
+            total_mov = float(mov["valor_mo"] or 0) + float(mov["valor_pecas"] or 0) + ct_ida_mov + ct_ret_mov
+            label_mov = (
+                f"ID {int(mov['id'])} | {data_mov} | {mov['veiculo_placa']} | "
+                f"{mov['fornecedor_nome']} | Total: {brl(total_mov)}"
+            )
+            opcoes_excluir_manut[label_mov] = int(mov["id"])
+
+        sel_excluir_manut = st.selectbox(
+            "Selecione o movimento para excluir",
+            options=list(opcoes_excluir_manut.keys()),
+            index=None,
+            placeholder="Escolha um movimento",
+            key="manut_sel_excluir_movimento",
+        )
+        ex_col1, ex_col2 = st.columns(2)
+        if ex_col1.button("🗑️ Excluir Movimento Selecionado", type="primary", use_container_width=True, key="btn_manut_excluir_movimento"):
+            if sel_excluir_manut:
+                st.session_state.manut_excluir_mov_id = opcoes_excluir_manut[sel_excluir_manut]
+                st.rerun()
+            else:
+                st.warning("Selecione um movimento para excluir.")
+
+        if st.session_state.manut_excluir_mov_id is not None:
+            st.warning(f"Confirma a exclusão do movimento ID {int(st.session_state.manut_excluir_mov_id)}?")
+            conf_col1, conf_col2 = st.columns(2)
+            if conf_col1.button("✅ Confirmar exclusão", type="primary", use_container_width=True, key="btn_manut_confirmar_excluir_movimento"):
+                excluir_manutencao_completa(int(st.session_state.manut_excluir_mov_id))
+                st.session_state.manut_excluir_mov_id = None
+                st.success("Movimento excluído com sucesso.")
+                st.rerun()
+            if conf_col2.button("❌ Cancelar", use_container_width=True, key="btn_manut_cancelar_excluir_movimento"):
+                st.session_state.manut_excluir_mov_id = None
+                st.rerun()
+
         if st.button("🖨️ Imprimir Manutenção por Período", use_container_width=True, key="btn_print_manutencao_periodo"):
             total_mo = 0.0
             total_pe = 0.0
             total_ida = 0.0
             total_ret = 0.0
             total_servicos = 0.0
+            pecas_por_manutencao = {}
+            ids_manutencao_rel = [int(x) for x in df_m["id"].tolist()]
+            if ids_manutencao_rel:
+                placeholders = ",".join(["?"] * len(ids_manutencao_rel))
+                with conn() as c:
+                    pecas_rel = c.execute(
+                        f"""SELECT mp.manutencao_id, f.codigo, f.nome, mp.data_compra, mp.num_nf, mp.descricao_peca, mp.valor_peca
+                            FROM manutencoes_pecas mp
+                            LEFT JOIN fornecedores f ON f.id = mp.fornecedor_id
+                            WHERE mp.manutencao_id IN ({placeholders})
+                            ORDER BY mp.manutencao_id, mp.id""",
+                        ids_manutencao_rel,
+                    ).fetchall()
+                for peca in pecas_rel:
+                    data_compra_txt = ""
+                    if peca["data_compra"]:
+                        data_compra_txt = datetime.strptime(peca["data_compra"], "%Y-%m-%d").strftime("%d/%m/%Y")
+                    fornecedor_txt = f"{peca['codigo']} - {peca['nome']}" if peca["codigo"] and peca["nome"] else "-"
+                    linha_peca = (
+                        f"<p class='linha-detalhe'><strong>{fornecedor_txt}</strong>"
+                        f" | Compra: {data_compra_txt or '-'}"
+                        f" | NF: {peca['num_nf'] or '-'}"
+                        f" | {str(peca['descricao_peca'] or '').replace(chr(10), '<br>')}"
+                        f" | {brl(peca['valor_peca'] or 0)}</p>"
+                    )
+                    pecas_por_manutencao.setdefault(int(peca["manutencao_id"]), []).append(linha_peca)
             html = f"""
             <html>
             <head>
                 <style>
                     body {{ font-family: sans-serif; margin: 30px; color: #333; }}
                     header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
-                    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }}
+                    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
                     th, td {{ border: 1px solid #999; padding: 8px; text-align: left; vertical-align: top; }}
                     th {{ background-color: #f2f2f2; }}
                     .btn-print {{ background: #007bff; color: white; padding: 12px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 14px; border-radius: 5px; margin-bottom: 20px; }}
@@ -3772,9 +4196,10 @@ with aba4:
                             <th>Nº OS</th>
                             <th>Veículo</th>
                             <th>KM Entrada</th>
-                            <th>Oficina</th>
+                            <th>Fornecedor</th>
                             <th>Defeito Relatado</th>
                             <th>Serviço Realizado</th>
+                            <th>Fornecedores / Peças</th>
                             <th>Mão de Obra</th>
                             <th>Peças</th>
                             <th>Transp Ida</th>
@@ -3790,9 +4215,10 @@ with aba4:
                 veiculo_txt = r['veiculo_placa'] or ''
                 km_txt = int(r['km_servico']) if r['km_servico'] not in (None, '') else 0
                 km_txt = f"{km_txt:,}".replace(',', '.') if km_txt else ''
-                oficina_txt = r['oficina_nome'] or ''
+                fornecedor_txt_manut = r['fornecedor_nome'] or ''
                 defeito_txt = str(r['defeito'] or '').replace('\n', '<br>')
                 servico_txt = str(r['servico'] or '').replace('\n', '<br>')
+                pecas_txt = "".join(pecas_por_manutencao.get(int(r["id"]), [])) or "-"
                 valor_mo = float(r['valor_mo'] or 0)
                 valor_pe = float(r['valor_pecas'] or 0)
                 ct_ida = float(r['custo_transporte_ida'] or 0)
@@ -3812,9 +4238,10 @@ with aba4:
                         <td>{num_os_txt}</td>
                         <td>{veiculo_txt}</td>
                         <td>{km_txt}</td>
-                        <td>{oficina_txt}</td>
+                        <td>{fornecedor_txt_manut}</td>
                         <td>{defeito_txt}</td>
                         <td>{servico_txt}</td>
+                        <td>{pecas_txt}</td>
                         <td>{brl(valor_mo)}</td>
                         <td>{brl(valor_pe)}</td>
                         <td>{brl(ct_ida)}</td>
@@ -3854,7 +4281,7 @@ with aba4:
                 ct_ida = ct_leg
             valor_total_serv = (r['valor_mo'] or 0) + (r['valor_pecas'] or 0) + ct_ida + ct_ret
             
-            titulo = f"{status} | {dt_ent_br} | {r['veiculo_placa']} | Oficina: {r['oficina_nome']} | Total: {brl(valor_total_serv)}"
+            titulo = f"{status} | {dt_ent_br} | {r['veiculo_placa']} | Fornecedor: {r['fornecedor_nome']} | Total: {brl(valor_total_serv)}"
             
             with st.expander(titulo):
                 ed_key = f"edit_full_{r['id']}"
@@ -3863,7 +4290,7 @@ with aba4:
                 if not st.session_state[ed_key]:
                     # --- MODO VISUALIZAÇÃO ---
                     col_v1, col_v2, col_v3 = st.columns(3)
-                    col_v1.write(f"**Oficina:** {r['oficina_nome']}")
+                    col_v1.write(f"**Fornecedor:** {r['fornecedor_nome']}")
                     col_v1.write(f"**KM Entrada:** {r['km_servico']:,}".replace(",", "."))
                     
                     col_v2.write(f"**Nº NF:** {r['num_nf'] or '-'}")
@@ -3884,6 +4311,14 @@ with aba4:
                         st.warning(f"📝 **Observação:** {r['observacao_adicional']}")
 
                     with conn() as c:
+                        pecas_manut = c.execute(
+                            """SELECT mp.id, f.codigo, f.nome, mp.data_compra, mp.num_nf, mp.descricao_peca, mp.valor_peca
+                               FROM manutencoes_pecas mp
+                               LEFT JOIN fornecedores f ON f.id = mp.fornecedor_id
+                               WHERE mp.manutencao_id=?
+                               ORDER BY mp.id ASC""",
+                            (int(r["id"]),),
+                        ).fetchall()
                         anexos_manut = c.execute(
                             """SELECT id, nome_arquivo, caminho_arquivo
                                FROM manutencoes_anexos
@@ -3933,6 +4368,65 @@ with aba4:
                                     )
                             else:
                                 st.info(f"Pedido do fornecedor registrado: {pedido_path_legacy}")
+
+                    if pecas_manut:
+                        st.markdown("**Peças compradas de fornecedores:**")
+                        dados_pecas = []
+                        for peca in pecas_manut:
+                            data_compra_br = ""
+                            if peca["data_compra"]:
+                                data_compra_br = datetime.strptime(peca["data_compra"], "%Y-%m-%d").strftime("%d/%m/%Y")
+                            dados_pecas.append(
+                                {
+                                    "Fornecedor": f"{peca['codigo']} - {peca['nome']}" if peca["codigo"] and peca["nome"] else "-",
+                                    "Data Compra": data_compra_br,
+                                    "N. NF": peca["num_nf"] or "",
+                                    "Descrição da Peça": peca["descricao_peca"] or "",
+                                    "Valor": brl(peca["valor_peca"] or 0),
+                                }
+                            )
+                        st.dataframe(pd.DataFrame(dados_pecas), hide_index=True, use_container_width=True)
+
+                        if f"manut_peca_excluir_id_{int(r['id'])}" not in st.session_state:
+                            st.session_state[f"manut_peca_excluir_id_{int(r['id'])}"] = None
+
+                        mapa_pecas_excluir = {}
+                        for peca in pecas_manut:
+                            fornecedor_peca = f"{peca['codigo']} - {peca['nome']}" if peca["codigo"] and peca["nome"] else "-"
+                            label_peca = (
+                                f"ID {int(peca['id'])} | {fornecedor_peca} | "
+                                f"NF: {peca['num_nf'] or '-'} | {peca['descricao_peca'] or '-'} | "
+                                f"{brl(peca['valor_peca'] or 0)}"
+                            )
+                            mapa_pecas_excluir[label_peca] = int(peca["id"])
+
+                        peca_sel_excluir = st.selectbox(
+                            "Excluir item de peça comprada",
+                            options=list(mapa_pecas_excluir.keys()),
+                            index=None,
+                            placeholder="Selecione a peça",
+                            key=f"sel_excluir_peca_manut_{r['id']}",
+                        )
+                        peca_col1, peca_col2 = st.columns(2)
+                        if peca_col1.button("🗑️ Excluir Peça Selecionada", type="primary", use_container_width=True, key=f"btn_excluir_peca_manut_{r['id']}"):
+                            if peca_sel_excluir:
+                                st.session_state[f"manut_peca_excluir_id_{int(r['id'])}"] = mapa_pecas_excluir[peca_sel_excluir]
+                                st.rerun()
+                            else:
+                                st.warning("Selecione uma peça para excluir.")
+
+                        peca_excluir_id = st.session_state.get(f"manut_peca_excluir_id_{int(r['id'])}")
+                        if peca_excluir_id is not None:
+                            st.warning(f"Confirma a exclusão da peça ID {int(peca_excluir_id)}?")
+                            conf_peca1, conf_peca2 = st.columns(2)
+                            if conf_peca1.button("✅ Confirmar exclusão da peça", type="primary", use_container_width=True, key=f"btn_conf_excluir_peca_manut_{r['id']}"):
+                                excluir_peca_manutencao(int(peca_excluir_id))
+                                st.session_state[f"manut_peca_excluir_id_{int(r['id'])}"] = None
+                                st.success("Peça excluída com sucesso.")
+                                st.rerun()
+                            if conf_peca2.button("❌ Cancelar", use_container_width=True, key=f"btn_cancel_excluir_peca_manut_{r['id']}"):
+                                st.session_state[f"manut_peca_excluir_id_{int(r['id'])}"] = None
+                                st.rerun()
                     
                     # Exibição Financeira Detalhada
                     st.markdown(f"""
@@ -3949,7 +4443,7 @@ with aba4:
                         st.session_state[ed_key] = True
                         st.rerun()
                     if c_b2.button("🗑️ EXCLUIR", key=f"btn_ex_f_{r['id']}", type="primary", use_container_width=True):
-                        with conn() as c: c.execute("DELETE FROM manutencoes WHERE id=?", (r['id'],))
+                        st.session_state.manut_excluir_mov_id = int(r["id"])
                         st.rerun()
                 else:
                     # --- MODO EDIÇÃO COMPLETA ---
@@ -3979,6 +4473,27 @@ with aba4:
                             accept_multiple_files=True,
                             key=f"manut_edit_pedido_upload_{r['id']}",
                         )
+
+                        fornecedores_pecas_edit, mapa_fornecedores_pecas_edit = carregar_fornecedores_para_pecas()
+                        st.markdown("**Peças compradas de fornecedores**")
+                        if not fornecedores_pecas_edit:
+                            st.warning("Cadastre fornecedores na aba Fornecedores para lançar peças.")
+                        df_pecas_edit = st.data_editor(
+                            carregar_pecas_manutencao(int(r["id"])),
+                            key=f"editor_pecas_editar_{r['id']}",
+                            hide_index=True,
+                            use_container_width=True,
+                            num_rows="dynamic",
+                            column_config={
+                                "Fornecedor": st.column_config.SelectboxColumn("Nome do Fornecedor", options=fornecedores_pecas_edit),
+                                "Data Compra": st.column_config.DateColumn("Data Compra", format="DD/MM/YYYY"),
+                                "N. NF": st.column_config.TextColumn("N. NF"),
+                                "Descricao da Peca": st.column_config.TextColumn("Descrição da Peça"),
+                                "Valor da Peca": st.column_config.NumberColumn("Valor da Peça", min_value=0.0, step=0.01, format="R$ %.2f"),
+                                "Excluir": st.column_config.CheckboxColumn("🗑️ Excluir"),
+                            },
+                        )
+                        itens_pecas_edit, ed_pe, erro_pecas_edit = preparar_pecas_manutencao(df_pecas_edit, mapa_fornecedores_pecas_edit)
                         
                         valor_ct_ida_edit = 0.0 if pd.isna(ct_ida_raw) else float(ct_ida_raw)
                         valor_ct_ret_edit = 0.0 if pd.isna(ct_ret_raw) else float(ct_ret_raw)
@@ -3987,7 +4502,7 @@ with aba4:
 
                         e_c7, e_c8, e_c9, e_c10 = st.columns(4)
                         ed_mo = e_c7.number_input("Valor Mão de Obra", value=float(r['valor_mo'] or 0))
-                        ed_pe = e_c8.number_input("Valor Peças", value=float(r['valor_pecas'] or 0))
+                        e_c8.metric("Valor Peças", brl(ed_pe))
                         ed_ct_ida = e_c9.number_input("Custo Transp Ida", value=valor_ct_ida_edit)
                         ed_ct_ret = e_c10.number_input("Custo Transporte Retorno", value=valor_ct_ret_edit)
                         
@@ -3996,6 +4511,9 @@ with aba4:
 
                         b_col1, b_col2 = st.columns(2)
                         if b_col1.form_submit_button("💾 Gravar", use_container_width=True, key=f"btn_manut_editar_gravar_{r['id']}"):
+                            if erro_pecas_edit:
+                                st.warning(erro_pecas_edit)
+                                st.stop()
                             novos_anexos = salvar_anexos_pedido_fornecedor(ed_pedido_fornecedor_files)
                             pedido_fornecedor_atual = str(r.get("pedido_fornecedor_arquivo") or "").strip() or None
                             pedido_fornecedor_final = (novos_anexos[0]["caminho_arquivo"] if novos_anexos else pedido_fornecedor_atual)
@@ -4008,6 +4526,7 @@ with aba4:
                                          (ed_dt_e.isoformat(), ed_os, ed_km, ed_def,
                                            ed_dt_f.isoformat(), ed_nf, ed_serv, ed_mo, ed_pe, ed_ct_ida, ed_ct_ret,
                                            ed_dt_g.isoformat(), ed_obs, pedido_fornecedor_final, r['id']))
+                                salvar_pecas_manutencao(c, int(r["id"]), itens_pecas_edit)
                                 for caminho in novos_anexos:
                                     c.execute(
                                         """INSERT INTO manutencoes_anexos (manutencao_id, nome_arquivo, caminho_arquivo, data_inclusao)
@@ -5980,13 +6499,22 @@ with aba15:
             c4, c5, c6 = st.columns(3)
             ie_forn = c4.text_input("Insc. Est.").strip()
             end_forn = c5.text_input("Endereço").strip()
-            cidade_forn = c6.text_input("Cidade").strip()
+            numero_forn = c6.text_input("Numero").strip()
 
-            c7, c8, c9, c10 = st.columns(4)
-            bairro_forn = c7.text_input("Bairro").strip()
-            cep_forn = c8.text_input("CEP").strip()
-            tel_forn = c9.text_input("Telefone").strip()
-            pix_forn = c10.text_input("PIX").strip()
+            c7, c8, c9 = st.columns(3)
+            complemento_forn = c7.text_input("Complemento").strip()
+            cidade_forn = c8.text_input("Cidade").strip()
+            estado_forn = c9.text_input("Estado").strip()
+
+            c10, c11, c12, c13 = st.columns(4)
+            bairro_forn = c10.text_input("Bairro").strip()
+            cep_forn = c11.text_input("CEP").strip()
+            tel_forn = c12.text_input("Telefone").strip()
+            pix_forn = c13.text_input("PIX").strip()
+
+            c14, c15 = st.columns(2)
+            email_forn = c14.text_input("E-mail").strip()
+            responsavel_forn = c15.text_input("Responsável / Contato").strip()
 
             if st.form_submit_button("💾 Gravar", type="primary", key="btn_fornecedor_gravar"):
                 if not cod_forn or not nome_forn:
@@ -5996,17 +6524,35 @@ with aba15:
                         with conn() as c:
                             c.execute(
                                 """INSERT INTO fornecedores
-                                   (codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone, pix)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (cod_forn, nome_forn, cnpj_forn, ie_forn, end_forn, cidade_forn, bairro_forn, cep_forn, tel_forn, pix_forn),
+                                   (codigo, nome, cnpj, insc_est, endereco, numero, complemento, cidade,
+                                    estado, bairro, cep, telefone, email, responsavel, pix)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    cod_forn, nome_forn, cnpj_forn, ie_forn, end_forn, numero_forn,
+                                    complemento_forn, cidade_forn, estado_forn, bairro_forn, cep_forn,
+                                    tel_forn, email_forn, responsavel_forn, pix_forn,
+                                ),
                             )
+                        limpar_cache_bootstrap()
                         alerta_gravado()
                         st.rerun()
                     except sqlite3.IntegrityError:
                         st.error("Código Fornecedor já cadastrado.")
 
+    if st.button("📥 Copiar Oficinas para Fornecedores", key="btn_importar_oficinas_fornecedores", use_container_width=True):
+        inseridos, atualizados = importar_oficinas_para_fornecedores()
+        limpar_cache_bootstrap()
+        st.success(f"Oficinas copiadas: {inseridos} novo(s) fornecedor(es) e {atualizados} atualizado(s).")
+        st.rerun()
+
     with conn() as c:
-        df_forn = pd.read_sql("SELECT codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone, pix FROM fornecedores ORDER BY nome ASC", c)
+        df_forn = pd.read_sql(
+            """SELECT codigo, nome, cnpj, insc_est, endereco, numero, complemento, cidade,
+                      estado, bairro, cep, telefone, email, responsavel, pix
+               FROM fornecedores
+               ORDER BY nome ASC""",
+            c,
+        )
     st.dataframe(df_forn, use_container_width=True, hide_index=True)
     c_fed1, c_fed2 = st.columns(2)
     if c_fed1.button("✏️ Editar", key="btn_fornecedor_editar", use_container_width=True, disabled=st.session_state.fornecedor_editando):
@@ -6017,20 +6563,83 @@ with aba15:
         st.rerun()
     if st.session_state.fornecedor_editando and not df_forn.empty:
         with conn() as c:
-            df_forn_ed = pd.read_sql("SELECT id, codigo, nome, cnpj, insc_est, endereco, cidade, bairro, cep, telefone, pix FROM fornecedores ORDER BY nome ASC", c)
-        df_forn_ed2 = st.data_editor(df_forn_ed, key="editor_fornecedores_cad", hide_index=True, use_container_width=True, column_config={"id": None})
-        if st.button("💾 Gravar", key="btn_fornecedor_gravar_edicao", type="primary", use_container_width=True):
-            with conn() as c:
-                for _, r in df_forn_ed2.iterrows():
-                    c.execute(
-                        """UPDATE fornecedores
-                           SET codigo=?, nome=?, cnpj=?, insc_est=?, endereco=?, cidade=?, bairro=?, cep=?, telefone=?, pix=?
-                           WHERE id=?""",
-                        (r["codigo"], r["nome"], r["cnpj"], r["insc_est"], r["endereco"], r["cidade"], r["bairro"], r["cep"], r["telefone"], r["pix"], int(r["id"])),
-                    )
-            alerta_gravado()
-            st.session_state.fornecedor_editando = False
-            st.rerun()
+            df_forn_ed = pd.read_sql(
+                """SELECT id, codigo, nome, cnpj, insc_est, endereco, numero, complemento, cidade,
+                          estado, bairro, cep, telefone, email, responsavel, pix, origem_oficina_id
+                   FROM fornecedores
+                   ORDER BY nome ASC""",
+                c,
+            )
+        df_forn_ed["Excluir"] = False
+        df_forn_ed2 = st.data_editor(
+            df_forn_ed,
+            key="editor_fornecedores_cad",
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "id": None,
+                "origem_oficina_id": None,
+                "Excluir": st.column_config.CheckboxColumn("🗑️ Excluir"),
+            },
+        )
+        b_forn_salvar, b_forn_excluir = st.columns(2)
+        if b_forn_salvar.button("💾 Gravar", key="btn_fornecedor_gravar_edicao", type="primary", use_container_width=True):
+            df_validar_forn = df_forn_ed2.copy()
+            df_validar_forn["codigo"] = df_validar_forn["codigo"].fillna("").astype(str).str.strip().str.upper()
+            df_validar_forn = df_validar_forn[df_validar_forn["Excluir"] != True]
+            codigos_vazios = df_validar_forn[df_validar_forn["codigo"] == ""]
+            codigos_repetidos = df_validar_forn[df_validar_forn.duplicated("codigo", keep=False) & (df_validar_forn["codigo"] != "")]
+
+            if not codigos_vazios.empty:
+                st.warning("Todos os fornecedores precisam ter Código Fornecedor.")
+            elif not codigos_repetidos.empty:
+                repetidos = ", ".join(sorted(codigos_repetidos["codigo"].unique().tolist()))
+                st.warning(f"Não foi possível gravar. Código Fornecedor repetido: {repetidos}.")
+            else:
+                try:
+                    with conn() as c:
+                        for _, r in df_validar_forn.iterrows():
+                            c.execute(
+                                """UPDATE fornecedores
+                                   SET codigo=?, nome=?, cnpj=?, insc_est=?, endereco=?, numero=?, complemento=?,
+                                       cidade=?, estado=?, bairro=?, cep=?, telefone=?, email=?, responsavel=?, pix=?
+                                   WHERE id=?""",
+                                (
+                                    r["codigo"], r["nome"], r["cnpj"], r["insc_est"], r["endereco"], r["numero"],
+                                    r["complemento"], r["cidade"], r["estado"], r["bairro"], r["cep"], r["telefone"],
+                                    r["email"], r["responsavel"], r["pix"], int(r["id"]),
+                                ),
+                            )
+                    limpar_cache_bootstrap()
+                    alerta_gravado()
+                    st.session_state.fornecedor_editando = False
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Não foi possível gravar: já existe fornecedor cadastrado com esse Código Fornecedor.")
+
+        if b_forn_excluir.button("🗑️ Deletar Selecionados", key="btn_fornecedor_deletar_selecionados", type="primary", use_container_width=True):
+            ids_excluir_forn = df_forn_ed2.loc[df_forn_ed2["Excluir"] == True, "id"].tolist()
+            if not ids_excluir_forn:
+                st.warning("Marque pelo menos um fornecedor na coluna Excluir.")
+            else:
+                bloqueados = []
+                excluidos = 0
+                with conn() as c:
+                    for _, r in df_forn_ed2[df_forn_ed2["Excluir"] == True].iterrows():
+                        fornecedor_id = int(r["id"])
+                        usos = movimentos_fornecedor(c, fornecedor_id)
+                        if usos:
+                            bloqueados.append(f"{r['codigo']} - {r['nome']} ({'; '.join(usos)})")
+                            continue
+                        c.execute("DELETE FROM fornecedores WHERE id=?", (fornecedor_id,))
+                        excluidos += 1
+
+                limpar_cache_bootstrap()
+                if excluidos:
+                    st.success(f"{excluidos} fornecedor(es) deletado(s) com sucesso.")
+                if bloqueados:
+                    st.warning("Não foi possível deletar fornecedor(es) com movimento: " + " | ".join(bloqueados))
+                st.rerun()
 
 # =========================
 # ABA 16 - OBRIGAÇÃO
