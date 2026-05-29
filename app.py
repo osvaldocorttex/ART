@@ -401,7 +401,7 @@ def _carregar_historico_parametros_raw():
     with conn() as c:
         return pd.read_sql(
             """SELECT vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                       qtde_pneu, vl_gasto_pneu_km
                FROM parametros_historico
                ORDER BY date(vigencia_data) ASC, id ASC""",
@@ -488,6 +488,7 @@ def init_db():
             cmp_consumo_002 REAL DEFAULT 2.5,
             cmp_consumo_003 REAL DEFAULT 2.5,
             cmp_custo_escritorio REAL DEFAULT 0.0,
+            vl_custo_rastreador REAL DEFAULT 0.0,
             imposto_pct REAL DEFAULT 0.0)""")
         
         c.execute("INSERT OR IGNORE INTO parametros (id) VALUES (1)")
@@ -610,6 +611,7 @@ def init_db():
             financiamento REAL,
             pagto_ipva REAL,
             cmp_custo_escritorio REAL,
+            vl_custo_rastreador REAL,
             imposto_pct REAL,
             valor_frete_mensal_fixo REAL,
             qtde_pneu REAL,
@@ -870,6 +872,8 @@ def init_db():
             c.execute("ALTER TABLE parametros ADD COLUMN cmp_consumo_003 REAL DEFAULT 2.5")
         if "cmp_custo_escritorio" not in colunas_param:
             c.execute("ALTER TABLE parametros ADD COLUMN cmp_custo_escritorio REAL DEFAULT 0.0")
+        if "vl_custo_rastreador" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN vl_custo_rastreador REAL DEFAULT 0.0")
         if "pagto_ipva" not in colunas_param:
             c.execute("ALTER TABLE parametros ADD COLUMN pagto_ipva REAL DEFAULT 0.0")
         if "imposto_pct" not in colunas_param:
@@ -885,6 +889,8 @@ def init_db():
         if "seguro_vida_motorista" not in colunas_hist_param:
             c.execute("ALTER TABLE parametros_historico ADD COLUMN seguro_vida_motorista REAL DEFAULT 0.0")
             coluna_seguro_vida_hist_criada = True
+        if "vl_custo_rastreador" not in colunas_hist_param:
+            c.execute("ALTER TABLE parametros_historico ADD COLUMN vl_custo_rastreador REAL DEFAULT 0.0")
         if coluna_seguro_vida_hist_criada:
             c.execute(
                 """UPDATE parametros_historico
@@ -1062,6 +1068,7 @@ PARAM_CAMPOS_HIST = [
     "financiamento",
     "pagto_ipva",
     "cmp_custo_escritorio",
+    "vl_custo_rastreador",
     "imposto_pct",
     "valor_frete_mensal_fixo",
     "qtde_pneu",
@@ -1964,6 +1971,9 @@ with aba_home:
             df_dash["custo_escr_rateado"] = (
                 valor_mensal_rateado_periodo("cmp_custo_escritorio", filtro_ini, filtro_fim) * proporcao_receita
             )
+            df_dash["custo_rastreador_rateado"] = (
+                valor_mensal_rateado_periodo("vl_custo_rastreador", filtro_ini, filtro_fim) * proporcao_receita
+            )
             
             # Custos de frete fixo rateados proporcionalmente (obtidos via parametros)
             custo_comissao_frete_fixo_total_periodo = float(
@@ -1984,6 +1994,7 @@ with aba_home:
             df_dash["custo_fin_rateado"] = 0.0
             df_dash["custo_ipva_rateado"] = 0.0
             df_dash["custo_escr_rateado"] = 0.0
+            df_dash["custo_rastreador_rateado"] = 0.0
             df_dash["custo_comissao_frete_fixo"] = 0.0
             df_dash["custo_imposto_frete_fixo"] = 0.0
         
@@ -2004,6 +2015,7 @@ with aba_home:
             - df_dash["custo_fin_rateado"]
             - df_dash["custo_ipva_rateado"]
             - df_dash["custo_escr_rateado"]
+            - df_dash["custo_rastreador_rateado"]
             - df_dash["custo_comissao_frete_fixo"]
             - df_dash["custo_imposto_frete_fixo"]
         ).fillna(0.0)
@@ -2028,6 +2040,7 @@ with aba_home:
                 + df_dash["custo_fin_rateado"]
                 + df_dash["custo_ipva_rateado"]
                 + df_dash["custo_escr_rateado"]
+                + df_dash["custo_rastreador_rateado"]
                 + df_dash["custo_comissao_frete_fixo"]
                 + df_dash["custo_imposto_frete_fixo"]
             ).sum()
@@ -2172,6 +2185,7 @@ with aba_home:
                     custo_fin_rateado=("custo_fin_rateado", "sum"),
                     custo_ipva_rateado=("custo_ipva_rateado", "sum"),
                     custo_escr_rateado=("custo_escr_rateado", "sum"),
+                    custo_rastreador_rateado=("custo_rastreador_rateado", "sum"),
                     custo_comissao_frete_fixo=("custo_comissao_frete_fixo", "sum"),
                     custo_imposto_frete_fixo=("custo_imposto_frete_fixo", "sum"),
                 )
@@ -2208,6 +2222,7 @@ with aba_home:
                 + df_tend_g["custo_fin_rateado"]
                 + df_tend_g["custo_ipva_rateado"]
                 + df_tend_g["custo_escr_rateado"]
+                + df_tend_g["custo_rastreador_rateado"]
             )
             df_tend_g["lucro"] = df_tend_g["receita"] - df_tend_g["custos"]
         else:
@@ -2414,7 +2429,7 @@ with aba_home:
                 )
 
         with t2:
-            custos_labels = ["Diesel", "Arla", "Pedágio", "Gasto Extra", "Imposto", "Seguro Vida Motorista"]
+            custos_labels = ["Diesel", "Arla", "Pedágio", "Gasto Extra", "Imposto", "Seguro Vida Motorista", "Rastreador"]
             custos_vals = [
                 float(df_dash["custo_diesel"].sum()),
                 float(df_dash["custo_arla"].sum()),
@@ -2422,6 +2437,7 @@ with aba_home:
                 float(df_dash["custo_extra"].sum()),
                 float(df_dash["custo_imposto"].sum()),
                 float(df_dash["custo_seguro_vida_motorista_rateado"].sum()),
+                float(df_dash["custo_rastreador_rateado"].sum()),
             ]
             fig_custos = go.Figure(
                 data=[
@@ -3519,9 +3535,10 @@ with aba2:
                 (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
                  * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
             )
+            custo_rastreador_rank = valor_mensal_rateado_periodo("vl_custo_rastreador", filtro_ini, filtro_fim)
             total_receita += frete_fixo_periodo_rank
-            total_custos += (custo_comissao_frete_fixo_rank + custo_imposto_frete_fixo_rank)
-            total_lucro += (frete_fixo_periodo_rank - custo_comissao_frete_fixo_rank - custo_imposto_frete_fixo_rank)
+            total_custos += (custo_comissao_frete_fixo_rank + custo_imposto_frete_fixo_rank + custo_rastreador_rank)
+            total_lucro += (frete_fixo_periodo_rank - custo_comissao_frete_fixo_rank - custo_imposto_frete_fixo_rank - custo_rastreador_rank)
             margem_total_pct = (total_lucro / total_receita * 100.0) if total_receita > 0 else 0.0
 
             g1, g2, g3, g4 = st.columns(4)
@@ -3529,7 +3546,7 @@ with aba2:
             g2.metric("Custo Total", brl(total_custos))
             g3.metric("Lucro Líquido", brl(total_lucro))
             g4.metric("Margem Líquida", f"{margem_total_pct:.2f}%")
-            st.caption("Cálculo atual sem manutenção, pneu, depreciação e fixos rateados.")
+            st.caption("Cálculo atual sem manutenção, pneu, depreciação e demais fixos rateados.")
 
             df_rank["origem_key"] = df_rank["origem"].fillna("").astype(str).str.strip().str.upper()
             df_rank["destino_key"] = df_rank["destino"].fillna("").astype(str).str.strip().str.upper()
@@ -3550,14 +3567,15 @@ with aba2:
                     lucro_liquido_total=("lucro_liquido_total", "sum"),
                 )
             )
-            if not df_rotas.empty and frete_fixo_periodo_rank > 0:
+            if not df_rotas.empty and (frete_fixo_periodo_rank > 0 or custo_rastreador_rank > 0):
                 total_receita_rotas_rank = float(df_rotas["frete_total"].sum())
                 if total_receita_rotas_rank > 0:
                     proporcao_rotas_rank = df_rotas["frete_total"] / total_receita_rotas_rank
                     receita_fixa_rateada_rank = frete_fixo_periodo_rank * proporcao_rotas_rank
                     custo_comissao_fixa_rateada_rank = custo_comissao_frete_fixo_rank * proporcao_rotas_rank
                     custo_imposto_fixa_rateada_rank = custo_imposto_frete_fixo_rank * proporcao_rotas_rank
-                    custo_total_fixo_rateado_rank = custo_comissao_fixa_rateada_rank + custo_imposto_fixa_rateada_rank
+                    custo_rastreador_rateado_rank = custo_rastreador_rank * proporcao_rotas_rank
+                    custo_total_fixo_rateado_rank = custo_comissao_fixa_rateada_rank + custo_imposto_fixa_rateada_rank + custo_rastreador_rateado_rank
                     df_rotas["frete_total"] = df_rotas["frete_total"] + receita_fixa_rateada_rank
                     df_rotas["custo_motorista_comissao_total"] = df_rotas["custo_motorista_comissao_total"] + custo_comissao_fixa_rateada_rank
                     df_rotas["custo_imposto_total"] = df_rotas["custo_imposto_total"] + custo_imposto_fixa_rateada_rank
@@ -3618,7 +3636,7 @@ with aba2:
                     f"{str(r2['origem'])}→{str(r2['destino'])}",
                 )
 
-            st.caption("Lucro Líquido = Receita - (Diesel + Arla + Pedágio + Extra + Comissão + Imposto).")
+            st.caption("Lucro Líquido = Receita - (Diesel + Arla + Pedágio + Extra + Comissão + Imposto + Rastreador).")
 
             col_rank = [
                 "rota",
@@ -3782,11 +3800,12 @@ with aba3:
         # IPVA informado como valor anual: rateio proporcional por dia.
         t_ipva = valor_anual_rateado_periodo("pagto_ipva", filtro_ini, filtro_fim)
         t_escritorio = valor_mensal_rateado_periodo("cmp_custo_escritorio", filtro_ini, filtro_fim)
+        t_rastreador = valor_mensal_rateado_periodo("vl_custo_rastreador", filtro_ini, filtro_fim)
         t_mot_total = t_mot_fixo_rateado + t_comis
 
         lucro = t_rec - (
             t_die + t_valor_arla_ana + t_pneu + t_manut + t_depre + t_mot_total +
-            t_ped + t_escritorio + t_extra + t_seguro + t_seguro_vida_motorista + t_fin + t_ipva + t_imposto
+            t_ped + t_escritorio + t_rastreador + t_extra + t_seguro + t_seguro_vida_motorista + t_fin + t_ipva + t_imposto
         )
 
         m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
@@ -3810,6 +3829,7 @@ with aba3:
                     "Motorista (Rateado)",
                     "Pedágio",
                     "Escritório",
+                    "Rastreador",
                     "Gasto Extra",
                     "Seguro (Rateado)",
                     "Seguro Vida Motorista Mensal (Rateado)",
@@ -3818,7 +3838,7 @@ with aba3:
                     "Imposto",
                     "Lucro",
                 ],
-                "Valor": [t_die, t_valor_arla_ana, t_pneu, t_manut, t_depre, t_mot_total, t_ped, t_escritorio, t_extra, t_seguro, t_seguro_vida_motorista, t_fin, t_ipva, t_imposto, max(0, lucro)],
+                "Valor": [t_die, t_valor_arla_ana, t_pneu, t_manut, t_depre, t_mot_total, t_ped, t_escritorio, t_rastreador, t_extra, t_seguro, t_seguro_vida_motorista, t_fin, t_ipva, t_imposto, max(0, lucro)],
             }
         )
         df_custos["Legenda"] = df_custos.apply(
@@ -5481,15 +5501,16 @@ with aba10:
     c5.number_input("Pneu (R$/km)", value=float(pne_v), step=0.01, disabled=True)
     dep_v = st.number_input("Depreciação (R$/km)", value=float(dados_para_exibir.get('depre', 0.30)), step=0.01, key=f"dep_{tipo_modo}", disabled=not st.session_state.param_editando)
     
-    c6, c7, c8, c9, c10, c11, c12, c13 = st.columns(8)
+    c6, c7, c8, c9, c10, c11, c12, c13, c14 = st.columns(9)
     fix_v = c6.number_input("Salário Fixo (R$)", value=float(dados_para_exibir.get('motora_fixo', 2500.0)), step=50.0, key=f"fix_{tipo_modo}", disabled=not st.session_state.param_editando)
     pct_v = c7.number_input("Comissão (%)", value=float(dados_para_exibir.get('motora_pct', 10.0)), step=0.5, key=f"pct_{tipo_modo}", disabled=not st.session_state.param_editando)
     seg_v = c8.number_input("Seguro Mensal (R$)", value=float(dados_para_exibir.get('seguro', 2750.0)), step=10.0, key=f"seg_{tipo_modo}", disabled=not st.session_state.param_editando)
     seg_vida_motorista_v = c9.number_input("Seguro Vida Motorista Mensal (R$)", value=float(dados_para_exibir.get('seguro_vida_motorista', 0.0)), step=10.0, key=f"seg_vida_mot_{tipo_modo}", disabled=not st.session_state.param_editando)
     fin_v = c10.number_input("Financiamento (R$)", value=float(dados_para_exibir.get('financiamento', 0.0)), step=100.0, key=f"fin_{tipo_modo}", disabled=not st.session_state.param_editando)
     esc_v = c11.number_input("Escritório (R$)", value=float(dados_para_exibir.get('cmp_custo_escritorio', 0.0)), step=50.0, key=f"esc_{tipo_modo}", disabled=not st.session_state.param_editando)
-    ipva_v = c12.number_input("Pagto IPVA Anual (R$)", value=float(dados_para_exibir.get('pagto_ipva', 0.0)), step=50.0, key=f"ipva_{tipo_modo}", disabled=not st.session_state.param_editando)
-    imp_v = c13.number_input("% de Impostos", min_value=0.0, step=0.1, value=float(dados_para_exibir.get('imposto_pct', 0.0)), key=f"imposto_{tipo_modo}", disabled=not st.session_state.param_editando)
+    rastreador_v = c12.number_input("VL Custo Rastreador (R$)", value=float(dados_para_exibir.get('vl_custo_rastreador', 0.0)), step=50.0, key=f"rastreador_{tipo_modo}", disabled=not st.session_state.param_editando)
+    ipva_v = c13.number_input("Pagto IPVA Anual (R$)", value=float(dados_para_exibir.get('pagto_ipva', 0.0)), step=50.0, key=f"ipva_{tipo_modo}", disabled=not st.session_state.param_editando)
+    imp_v = c14.number_input("% de Impostos", min_value=0.0, step=0.1, value=float(dados_para_exibir.get('imposto_pct', 0.0)), key=f"imposto_{tipo_modo}", disabled=not st.session_state.param_editando)
 
     if not df_db.empty:
         qtd_imposto = pd.to_numeric(df_db.get("qtd_viagens", 1), errors="coerce").fillna(1.0)
@@ -5517,7 +5538,7 @@ with aba10:
             'consumo': con_v, 'manut': man_v, 'pneu': pne_v, 'depre': dep_v,
             'qtde_pneu': qtde_pneu_v, 'vl_gasto_pneu_km': vl_gasto_pneu_km_v,
             'motora_fixo': fix_v, 'motora_pct': pct_v, 'seguro': seg_v, 'seguro_vida_motorista': seg_vida_motorista_v, 'financiamento': fin_v,
-            'cmp_custo_escritorio': esc_v, 'pagto_ipva': ipva_v, 'imposto_pct': imp_v,
+            'cmp_custo_escritorio': esc_v, 'vl_custo_rastreador': rastreador_v, 'pagto_ipva': ipva_v, 'imposto_pct': imp_v,
             'meta_faturamento': meta_v,
             'valor_frete_mensal_fixo': frete_mensal_fixo_v,
             'data_filtro_ini': dt_ini_param.strftime('%Y-%m-%d'),
@@ -5535,17 +5556,17 @@ with aba10:
                              consumo=?, manut=?, pneu=?, depre=?, 
                              qtde_pneu=?, vl_gasto_pneu_km=?,
                              motora_fixo=?, motora_pct=?, seguro=?, seguro_vida_motorista=?, financiamento=?,
-                             cmp_custo_escritorio=?, pagto_ipva=?, imposto_pct=?, meta_faturamento=?, valor_frete_mensal_fixo=?, data_filtro_ini=?, data_filtro_fim=?
+                             cmp_custo_escritorio=?, vl_custo_rastreador=?, pagto_ipva=?, imposto_pct=?, meta_faturamento=?, valor_frete_mensal_fixo=?, data_filtro_ini=?, data_filtro_fim=?
                              WHERE id=1""", 
-                          (con_v, man_v, pne_v, dep_v, qtde_pneu_v, vl_gasto_pneu_km_v, fix_v, pct_v, seg_v, seg_vida_motorista_v, fin_v, esc_v, ipva_v, imp_v,
+                          (con_v, man_v, pne_v, dep_v, qtde_pneu_v, vl_gasto_pneu_km_v, fix_v, pct_v, seg_v, seg_vida_motorista_v, fin_v, esc_v, rastreador_v, ipva_v, imp_v,
                            meta_v, frete_mensal_fixo_v, dt_ini_param.strftime('%Y-%m-%d'), dt_fim_param.strftime('%Y-%m-%d')))
                 data_vigencia_param = dt_ini_param.isoformat()
                 c.execute(
                     """INSERT INTO parametros_historico (
                            vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                           seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                           seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                            qtde_pneu, vl_gasto_pneu_km
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(vigencia_data) DO UPDATE SET
                            consumo=excluded.consumo,
                            manut=excluded.manut,
@@ -5558,6 +5579,7 @@ with aba10:
                            financiamento=excluded.financiamento,
                            pagto_ipva=excluded.pagto_ipva,
                            cmp_custo_escritorio=excluded.cmp_custo_escritorio,
+                           vl_custo_rastreador=excluded.vl_custo_rastreador,
                            imposto_pct=excluded.imposto_pct,
                            valor_frete_mensal_fixo=excluded.valor_frete_mensal_fixo,
                            qtde_pneu=excluded.qtde_pneu,
@@ -5565,7 +5587,7 @@ with aba10:
                     (
                         data_vigencia_param,
                         con_v, man_v, pne_v, dep_v, fix_v, pct_v,
-                        seg_v, seg_vida_motorista_v, fin_v, ipva_v, esc_v, imp_v, frete_mensal_fixo_v,
+                        seg_v, seg_vida_motorista_v, fin_v, ipva_v, esc_v, rastreador_v, imp_v, frete_mensal_fixo_v,
                         qtde_pneu_v, vl_gasto_pneu_km_v,
                     ),
                 )
@@ -5582,7 +5604,7 @@ with aba10:
     with conn() as c:
         df_hist_param = pd.read_sql(
             """SELECT id, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                       qtde_pneu, vl_gasto_pneu_km
                FROM parametros_historico
                ORDER BY date(vigencia_data) DESC, id DESC""",
@@ -5632,6 +5654,7 @@ with aba10:
                 "financiamento": st.column_config.NumberColumn("Financiamento", format="R$ %.2f"),
                 "pagto_ipva": st.column_config.NumberColumn("IPVA Anual", format="R$ %.2f"),
                 "cmp_custo_escritorio": st.column_config.NumberColumn("Escritório", format="R$ %.2f"),
+                "vl_custo_rastreador": st.column_config.NumberColumn("VL Custo Rastreador", format="R$ %.2f"),
                 "imposto_pct": st.column_config.NumberColumn("Imposto (%)", format="%.2f"),
                 "valor_frete_mensal_fixo": st.column_config.NumberColumn("Frete Fixo Mensal", format="R$ %.2f"),
                 "qtde_pneu": st.column_config.NumberColumn("Qtde Pneu", format="%.0f"),
@@ -5682,14 +5705,15 @@ with aba10:
             novo_seguro_vida_motorista = h9.number_input("Seguro Vida Motorista Mensal (R$)", value=float(row_hist["seguro_vida_motorista"]), step=10.0, key=f"hist_seg_vida_mot_{id_hist_sel}")
             novo_fin = h10.number_input("Financiamento (R$)", value=float(row_hist["financiamento"]), step=50.0, key=f"hist_fin_{id_hist_sel}")
 
-            h11, h12, h13, h14 = st.columns(4)
+            h11, h12, h13, h14, h15 = st.columns(5)
             novo_ipva = h11.number_input("IPVA Anual (R$)", value=float(row_hist["pagto_ipva"]), step=50.0, key=f"hist_ipva_{id_hist_sel}")
             novo_escr = h12.number_input("Escritório (R$)", value=float(row_hist["cmp_custo_escritorio"]), step=50.0, key=f"hist_esc_{id_hist_sel}")
-            novo_imp = h13.number_input("Imposto (%)", value=float(row_hist["imposto_pct"]), step=0.1, key=f"hist_imp_{id_hist_sel}")
-            novo_frete_fixo = h14.number_input("Frete Fixo Mensal (R$)", value=float(row_hist["valor_frete_mensal_fixo"]), step=100.0, key=f"hist_ff_{id_hist_sel}")
-            h15, h16 = st.columns(2)
-            nova_qtde_pneu = h15.number_input("Qtde Pneu", value=float(row_hist["qtde_pneu"] or 0.0), min_value=0.0, step=1.0, format="%.0f", key=f"hist_qpneu_{id_hist_sel}")
-            novo_vl_pneu_km = h16.number_input("Valor Pneu Km (R$)", value=float(row_hist["vl_gasto_pneu_km"] or 0.0), min_value=0.0, step=0.0001, format="%.4f", key=f"hist_vlpkm_{id_hist_sel}")
+            novo_rastreador = h13.number_input("VL Custo Rastreador (R$)", value=float(row_hist["vl_custo_rastreador"] or 0.0), step=50.0, key=f"hist_rastreador_{id_hist_sel}")
+            novo_imp = h14.number_input("Imposto (%)", value=float(row_hist["imposto_pct"]), step=0.1, key=f"hist_imp_{id_hist_sel}")
+            novo_frete_fixo = h15.number_input("Frete Fixo Mensal (R$)", value=float(row_hist["valor_frete_mensal_fixo"]), step=100.0, key=f"hist_ff_{id_hist_sel}")
+            h16, h17 = st.columns(2)
+            nova_qtde_pneu = h16.number_input("Qtde Pneu", value=float(row_hist["qtde_pneu"] or 0.0), min_value=0.0, step=1.0, format="%.0f", key=f"hist_qpneu_{id_hist_sel}")
+            novo_vl_pneu_km = h17.number_input("Valor Pneu Km (R$)", value=float(row_hist["vl_gasto_pneu_km"] or 0.0), min_value=0.0, step=0.0001, format="%.4f", key=f"hist_vlpkm_{id_hist_sel}")
 
             st.markdown("##### 📄 Duplicar Vigência")
             d1, d2 = st.columns([2, 1])
@@ -5714,9 +5738,9 @@ with aba10:
                         c.execute(
                             """INSERT INTO parametros_historico (
                                    vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                                    qtde_pneu, vl_gasto_pneu_km
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
                                 data_dup_txt,
                                 float(row_hist["consumo"] or 0.0),
@@ -5730,6 +5754,7 @@ with aba10:
                                 float(row_hist["financiamento"] or 0.0),
                                 float(row_hist["pagto_ipva"] or 0.0),
                                 float(row_hist["cmp_custo_escritorio"] or 0.0),
+                                float(row_hist["vl_custo_rastreador"] or 0.0),
                                 float(row_hist["imposto_pct"] or 0.0),
                                 float(row_hist["valor_frete_mensal_fixo"] or 0.0),
                                 float(row_hist["qtde_pneu"] or 0.0),
@@ -5753,12 +5778,12 @@ with aba10:
                         c.execute(
                             """UPDATE parametros_historico
                                SET vigencia_data=?, consumo=?, manut=?, pneu=?, depre=?, motora_fixo=?, motora_pct=?,
-                                   seguro=?, seguro_vida_motorista=?, financiamento=?, pagto_ipva=?, cmp_custo_escritorio=?, imposto_pct=?, valor_frete_mensal_fixo=?,
+                                   seguro=?, seguro_vida_motorista=?, financiamento=?, pagto_ipva=?, cmp_custo_escritorio=?, vl_custo_rastreador=?, imposto_pct=?, valor_frete_mensal_fixo=?,
                                    qtde_pneu=?, vl_gasto_pneu_km=?
                                WHERE id=?""",
                             (
                                 nova_vig_txt, novo_consumo, nova_manut, novo_pneu, nova_depre, novo_mot_fixo, novo_mot_pct,
-                                novo_seguro, novo_seguro_vida_motorista, novo_fin, novo_ipva, novo_escr, novo_imp, novo_frete_fixo,
+                                novo_seguro, novo_seguro_vida_motorista, novo_fin, novo_ipva, novo_escr, novo_rastreador, novo_imp, novo_frete_fixo,
                                 nova_qtde_pneu, novo_vl_pneu_km, int(id_hist_sel),
                             ),
                         )
@@ -6319,6 +6344,7 @@ with aba14:
     valor_financiamento_rateado = valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim)
     valor_ipva_rateado = valor_anual_rateado_periodo("pagto_ipva", filtro_ini, filtro_fim)
     valor_escritorio_rateado = valor_mensal_rateado_periodo("cmp_custo_escritorio", filtro_ini, filtro_fim)
+    valor_rastreador_rateado = valor_mensal_rateado_periodo("vl_custo_rastreador", filtro_ini, filtro_fim)
     valor_motorista_total = valor_motorista_10 + valor_motorista_fixo_rateado
     valor_imposto = valor_imposto_viagens + valor_imposto_frete_fixo
     if not df_viagens_liq.empty:
@@ -6344,6 +6370,7 @@ with aba14:
         - valor_total_gasto_extra
         - valor_motorista_total
         - valor_escritorio_rateado
+        - valor_rastreador_rateado
         - valor_seguro_rateado
         - valor_seguro_vida_motorista_rateado
         - valor_financiamento_rateado
@@ -6392,14 +6419,15 @@ with aba14:
     l3c5.metric("Pagto Estadia", brl(valor_total_pagto_estadia))
     l3c6.metric("Imposto", brl(valor_imposto))
 
-    l4c1, l4c2, l4c3, l4c4, l4c5, l4c6, l4c7 = st.columns(7)
+    l4c1, l4c2, l4c3, l4c4, l4c5, l4c6, l4c7, l4c8 = st.columns(8)
     l4c1.metric("Motorista Rateado", brl(valor_motorista_fixo_rateado))
     l4c2.metric("Comissão Motorista", brl(valor_motorista_10))
     l4c3.metric("Escritório Rateado", brl(valor_escritorio_rateado))
-    l4c4.metric("Seguro Rateado", brl(valor_seguro_rateado))
-    l4c5.metric("Seguro Vida Motorista Rateado", brl(valor_seguro_vida_motorista_rateado))
-    l4c6.metric("Financiamento Rateado", brl(valor_financiamento_rateado))
-    l4c7.metric("IPVA Rateado", brl(valor_ipva_rateado))
+    l4c4.metric("Rastreador Rateado", brl(valor_rastreador_rateado))
+    l4c5.metric("Seguro Rateado", brl(valor_seguro_rateado))
+    l4c6.metric("Seguro Vida Motorista Rateado", brl(valor_seguro_vida_motorista_rateado))
+    l4c7.metric("Financiamento Rateado", brl(valor_financiamento_rateado))
+    l4c8.metric("IPVA Rateado", brl(valor_ipva_rateado))
 
     l5c1, l5c2, l5c3, l5c4 = st.columns(4)
     l5c1.metric("Manutenção Parâmetros", brl(valor_manutencao_desgaste))
@@ -6418,6 +6446,7 @@ with aba14:
                 "Gasto Extra",
                 "Motorista (Comissão + Fixo Rateado)",
                 "Escritório (Rateado)",
+                "Rastreador (Rateado)",
                 "Seguro (Rateado)",
                 "Seguro Vida Motorista Mensal (Rateado)",
                 "Financiamento (Rateado)",
@@ -6440,6 +6469,7 @@ with aba14:
                 "Desconto",
                 "Desconto",
                 "Desconto",
+                "Desconto",
                 "Resultado",
             ],
             "Valor": [
@@ -6450,6 +6480,7 @@ with aba14:
                 valor_total_gasto_extra,
                 valor_motorista_total,
                 valor_escritorio_rateado,
+                valor_rastreador_rateado,
                 valor_seguro_rateado,
                 valor_seguro_vida_motorista_rateado,
                 valor_financiamento_rateado,
@@ -6754,16 +6785,16 @@ with aba19:
                         )
                         p_hist_base = c.execute(
                             """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro, seguro_vida_motorista, financiamento,
-                                      pagto_ipva, imposto_pct, valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
+                                      pagto_ipva, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
                                FROM parametros WHERE id=1"""
                         ).fetchone()
                         data_vigencia_cmp = str(p.get("data_filtro_ini", date.today().isoformat()) or date.today().isoformat())
                         c.execute(
                             """INSERT INTO parametros_historico (
                                    vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, imposto_pct, valor_frete_mensal_fixo,
+                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                                    qtde_pneu, vl_gasto_pneu_km
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT(vigencia_data) DO UPDATE SET
                                    cmp_custo_escritorio=excluded.cmp_custo_escritorio""",
                             (
@@ -6779,6 +6810,7 @@ with aba19:
                                 float(p_hist_base["financiamento"] or 0.0),
                                 float(p_hist_base["pagto_ipva"] or 0.0),
                                 float(novo_custo_escritorio or 0.0),
+                                float(p_hist_base["vl_custo_rastreador"] or 0.0),
                                 float(p_hist_base["imposto_pct"] or 0.0),
                                 float(p_hist_base["valor_frete_mensal_fixo"] or 0.0),
                                 float(p_hist_base["qtde_pneu"] or 0.0),
