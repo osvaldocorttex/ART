@@ -106,6 +106,36 @@ def salvar_anexos_pedido_fornecedor(arquivos):
     return anexos_salvos
 
 
+def salvar_documento_anotacao(arquivo):
+    if not arquivo:
+        return None
+    pasta_destino = Path("uploads") / "anotacoes"
+    pasta_destino.mkdir(parents=True, exist_ok=True)
+    nome_original = Path(str(getattr(arquivo, "name", "") or "documento")).name
+    timestamp = datetime.now().strftime("%d%m%y%H%M%S%f")
+    nome_final = f"{Path(nome_original).stem}-{timestamp}{Path(nome_original).suffix}"
+    caminho_final = pasta_destino / nome_final
+    with caminho_final.open("wb") as f_out:
+        f_out.write(arquivo.getbuffer())
+    return {
+        "nome_arquivo": nome_original,
+        "caminho_arquivo": str(caminho_final),
+    }
+
+
+def salvar_documentos_anotacao(arquivos):
+    if not arquivos:
+        return []
+    if not isinstance(arquivos, list):
+        arquivos = [arquivos]
+    documentos_salvos = []
+    for arquivo in arquivos:
+        documento_salvo = salvar_documento_anotacao(arquivo)
+        if documento_salvo:
+            documentos_salvos.append(documento_salvo)
+    return documentos_salvos
+
+
 def carregar_fornecedores_para_pecas():
     with conn() as c:
         rows = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
@@ -483,6 +513,7 @@ def init_db():
             vl_gasto_pneu_km REAL DEFAULT 0.12,
             data_filtro_ini TEXT DEFAULT '2026-01-01',
             data_filtro_fim TEXT DEFAULT '2026-12-31',
+            filtro_placa_default TEXT DEFAULT 'Todas as placas',
             cmp_valor_litro_diesel REAL DEFAULT 0.0,
             cmp_consumo_001 REAL DEFAULT 2.5,
             cmp_consumo_002 REAL DEFAULT 2.5,
@@ -496,7 +527,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS viagens (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, cliente TEXT, origem TEXT, destino TEXT, km REAL, toneladas REAL, valor_ton REAL, valor_km REAL DEFAULT 0.0, tipo_cobranca TEXT DEFAULT 'TONELADA', pedagio REAL, qtd_pedagio INTEGER DEFAULT 0, gasto_extra REAL DEFAULT 0.0, pagto_estadia REAL DEFAULT 0.0, valor_adicional_frete REAL DEFAULT 0.0, descricao_valor_adicional_frete TEXT, descricao_gasto_extra TEXT, diesel REAL, consumo REAL, arla REAL DEFAULT 0.0, consumo_arla REAL DEFAULT 0.0, hora_carregamento TEXT, data_chegada TEXT, hora_chegada TEXT, data_descarregamento TEXT, hora_descarregamento TEXT, obs TEXT, nf TEXT, veiculo_placa TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS cidades (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT UNIQUE)")
         c.execute("CREATE TABLE IF NOT EXISTS rotas (id INTEGER PRIMARY KEY AUTOINCREMENT, origem TEXT, destino TEXT, nome_empresa_origem TEXT, nome_empresa_destino TEXT, km REAL, valor_ton REAL DEFAULT 0.0, UNIQUE(origem, destino))")
-        c.execute("CREATE TABLE IF NOT EXISTS abastecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, local TEXT, doc_nf TEXT, km_inicial REAL, tipo_combustivel TEXT, qtde_litros REAL, valor_unit REAL, total_gasto REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS abastecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, local TEXT, doc_nf TEXT, km_inicial REAL, tipo_combustivel TEXT, qtde_litros REAL, valor_unit REAL, total_gasto REAL, veiculo_placa TEXT)")
         c.execute("""CREATE TABLE IF NOT EXISTS oficinas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT,
@@ -573,6 +604,20 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS me_lembra_frotas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             frota TEXT UNIQUE
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS anotacoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data TEXT,
+            descricao TEXT,
+            documento_nome TEXT,
+            documento_arquivo TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS anotacoes_anexos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            anotacao_id INTEGER,
+            nome_arquivo TEXT,
+            caminho_arquivo TEXT,
+            data_inclusao TEXT
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS controle_trocas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -670,6 +715,16 @@ def init_db():
         for col, tipo in novas_colunas.items():
             if col not in colunas_existentes:
                 c.execute(f"ALTER TABLE manutencoes ADD COLUMN {col} {tipo}")
+
+        cursor_anot = c.execute("PRAGMA table_info(anotacoes)")
+        colunas_anot = [coluna[1] for coluna in cursor_anot.fetchall()]
+        novas_colunas_anot = {
+            "documento_nome": "TEXT",
+            "documento_arquivo": "TEXT",
+        }
+        for col, tipo in novas_colunas_anot.items():
+            if col not in colunas_anot:
+                c.execute(f"ALTER TABLE anotacoes ADD COLUMN {col} {tipo}")
 
         cursor_of = c.execute("PRAGMA table_info(oficinas)")
         colunas_of = [coluna[1] for coluna in cursor_of.fetchall()]
@@ -775,6 +830,11 @@ def init_db():
         for col, tipo in novas_colunas_viagens.items():
             if col not in colunas_viagens:
                 c.execute(f"ALTER TABLE viagens ADD COLUMN {col} {tipo}")
+
+        cursor_abastecimentos = c.execute("PRAGMA table_info(abastecimentos)")
+        colunas_abastecimentos = [coluna[1] for coluna in cursor_abastecimentos.fetchall()]
+        if "veiculo_placa" not in colunas_abastecimentos:
+            c.execute("ALTER TABLE abastecimentos ADD COLUMN veiculo_placa TEXT")
 
         # --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS DE ROTAS ---
         cursor_rotas = c.execute("PRAGMA table_info(rotas)")
@@ -882,6 +942,8 @@ def init_db():
             c.execute("ALTER TABLE parametros ADD COLUMN valor_frete_mensal_fixo REAL DEFAULT 0.0")
         if "seguro_vida_motorista" not in colunas_param:
             c.execute("ALTER TABLE parametros ADD COLUMN seguro_vida_motorista REAL DEFAULT 0.0")
+        if "filtro_placa_default" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN filtro_placa_default TEXT DEFAULT 'Todas as placas'")
 
         cursor_hist_param = c.execute("PRAGMA table_info(parametros_historico)")
         colunas_hist_param = [coluna[1] for coluna in cursor_hist_param.fetchall()]
@@ -907,6 +969,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_viagens_placa_data ON viagens(veiculo_placa, data)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_viagens_origem_destino ON viagens(origem, destino)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_abastecimentos_data ON abastecimentos(data)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_abastecimentos_placa_data ON abastecimentos(veiculo_placa, data)")
 
 
 # Executa a função para garantir que o banco está atualizado
@@ -933,6 +996,18 @@ lista_cidades = bootstrap["lista_cidades"]
 veiculos_db = bootstrap["veiculos_db"]
 apenas_placas = [v["placa"] for v in veiculos_db]
 lista_veiculos_full = [f"{v['placa']} - {v['descricao']}" for v in veiculos_db]
+descricao_por_placa = {
+    str(v.get("placa") or "").strip().upper(): str(v.get("descricao") or "").strip()
+    for v in veiculos_db
+}
+
+def rotulo_placa_com_descricao(placa):
+    placa_txt = str(placa or "").strip()
+    if placa_txt == "Todas as placas":
+        return placa_txt
+    descricao = descricao_por_placa.get(placa_txt.upper(), "")
+    return f"{placa_txt} - {descricao}" if descricao else placa_txt
+
 oficinas_db = bootstrap["oficinas_db"]
 dict_oficinas = {o["nome"]: o["id"] for o in oficinas_db}
 fornecedores_db = bootstrap["fornecedores_db"]
@@ -1023,15 +1098,21 @@ if "filtro_ini_top" not in st.session_state:
     st.session_state.filtro_ini_top = data_ini_carregar
 if "filtro_fim_top" not in st.session_state:
     st.session_state.filtro_fim_top = data_fim_carregar
-if "filtro_placa_top" not in st.session_state:
-    st.session_state.filtro_placa_top = "Todas as placas"
 
 c_f1.date_input("Início", format="DD/MM/YYYY", key="filtro_ini_top")
 c_f2.date_input("Fim", format="DD/MM/YYYY", key="filtro_fim_top")
 opcoes_filtro_placa = ["Todas as placas"] + apenas_placas
+placa_default_param = str(p.get("filtro_placa_default") or "Todas as placas").strip()
+if placa_default_param not in opcoes_filtro_placa:
+    placa_default_param = "Todas as placas"
+placa_top_pendente = st.session_state.pop("filtro_placa_top_pendente", None)
+if placa_top_pendente in opcoes_filtro_placa:
+    st.session_state.filtro_placa_top = placa_top_pendente
+if "filtro_placa_top" not in st.session_state:
+    st.session_state.filtro_placa_top = placa_default_param
 if st.session_state.filtro_placa_top not in opcoes_filtro_placa:
-    st.session_state.filtro_placa_top = "Todas as placas"
-c_f3.selectbox("Placa (Cálculos)", opcoes_filtro_placa, key="filtro_placa_top")
+    st.session_state.filtro_placa_top = placa_default_param
+c_f3.selectbox("Placa (Cálculos)", opcoes_filtro_placa, key="filtro_placa_top", format_func=rotulo_placa_com_descricao)
 filtro_ini = st.session_state.filtro_ini_top
 filtro_fim = st.session_state.filtro_fim_top
 placa_filtro_calculo = (
@@ -1040,7 +1121,7 @@ placa_filtro_calculo = (
     else None
 )
 if placa_filtro_calculo:
-    st.caption(f"Filtro de cálculos por placa ativo: `{placa_filtro_calculo}`")
+    st.caption(f"Filtro de cálculos por placa ativo: `{rotulo_placa_com_descricao(placa_filtro_calculo)}`")
 
 def fator_rateio_mensal_por_periodo(data_inicio, data_fim):
     if data_inicio is None or data_fim is None or data_fim < data_inicio:
@@ -1899,12 +1980,17 @@ with aba_home:
         df_dash["custo_arla"] = (df_dash["litros_arla"] * df_dash["arla"]).fillna(0.0)
         with conn() as c:
             df_abs_dash = pd.read_sql(
-                """SELECT tipo_combustivel, total_gasto
+                """SELECT tipo_combustivel, total_gasto, veiculo_placa
                    FROM abastecimentos
                    WHERE date(data) BETWEEN ? AND ?""",
                 c,
                 params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
             )
+        if placa_filtro_calculo and not df_abs_dash.empty and "veiculo_placa" in df_abs_dash.columns:
+            placa_ref_abs_dash = str(placa_filtro_calculo).strip().upper()
+            df_abs_dash = df_abs_dash[
+                df_abs_dash["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_abs_dash
+            ].copy()
         if not df_abs_dash.empty:
             df_abs_dash["tipo_combustivel"] = df_abs_dash["tipo_combustivel"].apply(normalizar_tipo_combustivel)
             df_abs_dash["total_gasto"] = pd.to_numeric(df_abs_dash["total_gasto"], errors="coerce").fillna(0.0)
@@ -2899,6 +2985,20 @@ with aba2:
         with tab_grid_exec:
             colunas_tab = ["id", "data", "veiculo_placa", "nf", "cliente", "origem", "destino", "tipo_cobranca", "km", "peso_kg", "valor_ton", "valor_km", "diesel", "consumo", "arla", "consumo_arla", "Diesel/KM", "Gasto Arla", "Total Frete Valor", "Total Frete", "Frete Líquido", "pedagio", "qtd_pedagio", "gasto_extra", "pagto_estadia", "valor_adicional_frete", "descricao_valor_adicional_frete", "descricao_gasto_extra", "hora_carregamento", "data_chegada", "hora_chegada", "data_descarregamento", "hora_descarregamento", "qtd_estadia_calc", "qtd_viagens"]
             df_ed = df_exibir[colunas_tab].copy()
+            colunas_duas_casas_exec = [
+                "diesel",
+                "consumo",
+                "arla",
+                "consumo_arla",
+                "Diesel/KM",
+                "Gasto Arla",
+                "Total Frete Valor",
+                "Total Frete",
+                "Frete Líquido",
+            ]
+            for col_fmt in colunas_duas_casas_exec:
+                if col_fmt in df_ed.columns:
+                    df_ed[col_fmt] = df_ed[col_fmt].apply(lambda v: format_br(v, casas_decimais=2))
 
             st.dataframe(
                 df_ed.rename(
@@ -3705,12 +3805,17 @@ with aba3:
         df_ana["qtd_viagens"] = df_ana["qtd_viagens"].apply(lambda x: max(1, int(round(float(x)))))
         with conn() as c:
             df_abs_ana = pd.read_sql(
-                """SELECT tipo_combustivel, qtde_litros, total_gasto
+                """SELECT tipo_combustivel, qtde_litros, total_gasto, veiculo_placa
                    FROM abastecimentos
                    WHERE date(data) BETWEEN ? AND ?""",
                 c,
                 params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
             )
+        if placa_filtro_calculo and not df_abs_ana.empty and "veiculo_placa" in df_abs_ana.columns:
+            placa_ref_abs_ana = str(placa_filtro_calculo).strip().upper()
+            df_abs_ana = df_abs_ana[
+                df_abs_ana["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_abs_ana
+            ].copy()
         if not df_abs_ana.empty:
             df_abs_ana["tipo_combustivel"] = df_abs_ana["tipo_combustivel"].apply(normalizar_tipo_combustivel)
             df_abs_ana["qtde_litros"] = pd.to_numeric(df_abs_ana["qtde_litros"], errors="coerce").fillna(0.0)
@@ -5115,34 +5220,53 @@ with aba9:
             ).fetchall()
         ]
     tipos_combustivel_sugeridos = sorted(set(["DIESEL", "ARLA"] + [t for t in tipos_combustivel_db if t]))
+    opcoes_veiculos_abastecimento = lista_veiculos_full if lista_veiculos_full else apenas_placas
+    index_veiculo_abastecimento = 0
+    if placa_filtro_calculo and opcoes_veiculos_abastecimento:
+        for idx_opt, opt_veic in enumerate(opcoes_veiculos_abastecimento):
+            if str(opt_veic).split(" - ")[0].strip().upper() == str(placa_filtro_calculo).strip().upper():
+                index_veiculo_abastecimento = idx_opt
+                break
 
     with st.form("form_inclusao_abastecimento", clear_on_submit=True):
-        col_a, col_b, col_c = st.columns(3)
+        col_a, col_b, col_c, col_d = st.columns(4)
         data_abs = col_a.date_input("Data", value=date.today(), format="DD/MM/YYYY")
-        local_abs = col_b.text_input("Local do Abastecimento")
-        doc_nf_abs = col_c.text_input("Documento / NF")
+        if opcoes_veiculos_abastecimento:
+            veic_abs = col_b.selectbox(
+                "Veículo/Placa",
+                options=opcoes_veiculos_abastecimento,
+                index=index_veiculo_abastecimento,
+                key="abastecimento_veiculo_incluir",
+            )
+            placa_abs = str(veic_abs).split(" - ")[0].strip()
+        else:
+            placa_abs = col_b.text_input("Placa").upper().strip()
+        local_abs = col_c.text_input("Local do Abastecimento")
+        doc_nf_abs = col_d.text_input("Documento / NF")
 
-        col_d, col_e, col_f, col_g = st.columns(4)
-        km_inicial_abs = col_d.number_input("KM Inicial", min_value=0.0, value=0.0, step=1.0)
-        tipo_cadastrado_abs = col_e.selectbox(
+        col_e, col_f, col_g, col_h = st.columns(4)
+        km_inicial_abs = col_e.number_input("KM Inicial", min_value=0.0, value=0.0, step=1.0)
+        tipo_cadastrado_abs = col_f.selectbox(
             "Tipo Cadastrado (opcional)",
             options=[""] + tipos_combustivel_sugeridos,
             index=0,
             placeholder="Selecione um tipo já cadastrado",
         )
-        tipo_comb_abs = col_e.text_input(
+        tipo_comb_abs = col_f.text_input(
             "Tipo de Combustível",
             value=tipo_cadastrado_abs,
             help="Você pode escolher um tipo já cadastrado acima ou digitar um novo aqui.",
         ).strip()
-        qtde_litros_abs = col_f.number_input("Qtde Litros", min_value=0.0, value=0.0, step=1.0)
-        valor_unit_abs = col_g.number_input("Valor Unitário (R$)", min_value=0.0, value=0.0, step=0.01)
+        qtde_litros_abs = col_g.number_input("Qtde Litros", min_value=0.0, value=0.0, step=1.0)
+        valor_unit_abs = col_h.number_input("Valor Unitário (R$)", min_value=0.0, value=0.0, step=0.01)
 
         total_gasto_abs = qtde_litros_abs * valor_unit_abs
         st.caption(f"Total calculado: {brl(total_gasto_abs)}")
 
         if st.form_submit_button("💾 Gravar", use_container_width=True, type="primary", key="btn_abastecimento_incluir_gravar"):
-            if not local_abs.strip():
+            if not placa_abs.strip():
+                st.warning("Informe a placa do veículo para incluir o registro.")
+            elif not local_abs.strip():
                 st.warning("Informe o local do abastecimento para incluir o registro.")
             elif not normalizar_tipo_combustivel(tipo_comb_abs):
                 st.warning("Informe o tipo de combustível para incluir o registro.")
@@ -5152,8 +5276,8 @@ with aba9:
                 with conn() as c:
                     c.execute(
                         """INSERT INTO abastecimentos
-                           (data, local, doc_nf, km_inicial, tipo_combustivel, qtde_litros, valor_unit, total_gasto)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                           (data, local, doc_nf, km_inicial, tipo_combustivel, qtde_litros, valor_unit, total_gasto, veiculo_placa)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             data_abs.isoformat(),
                             local_abs.strip(),
@@ -5163,6 +5287,7 @@ with aba9:
                             qtde_litros_abs,
                             valor_unit_abs,
                             total_gasto_abs,
+                            placa_abs.strip().upper(),
                         ),
                     )
                 alerta_gravado()
@@ -5180,7 +5305,18 @@ with aba9:
         )
 
     if not df_abs.empty:
+        if placa_filtro_calculo and "veiculo_placa" in df_abs.columns:
+            placa_ref_abs = str(placa_filtro_calculo).strip().upper()
+            df_abs = df_abs[
+                df_abs["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_abs
+            ].copy()
+            st.caption(f"Filtro de abastecimento por placa ativo: `{rotulo_placa_com_descricao(placa_ref_abs)}`")
+
+    if not df_abs.empty:
         df_abs['data_dt'] = pd.to_datetime(df_abs['data'], errors='coerce').dt.date
+        if "veiculo_placa" not in df_abs.columns:
+            df_abs["veiculo_placa"] = ""
+        df_abs["veiculo_placa"] = df_abs["veiculo_placa"].fillna("").astype(str).str.strip().str.upper()
         df_abs["km_inicial"] = pd.to_numeric(df_abs["km_inicial"], errors="coerce")
         df_abs["qtde_litros"] = pd.to_numeric(df_abs["qtde_litros"], errors="coerce").fillna(0.0)
         df_abs["valor_unit"] = pd.to_numeric(df_abs["valor_unit"], errors="coerce").fillna(0.0)
@@ -5285,9 +5421,9 @@ with aba9:
         if not df_abs.empty:
             df_abs["Data_BR"] = pd.to_datetime(df_abs["data_dt"]).dt.strftime('%d/%m/%Y')
             df_abs["Excluir"] = False
-            df_base_abs = df_abs[["id", "data", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit"]].copy()
+            df_base_abs = df_abs[["id", "data", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit"]].copy()
             df_base_abs = df_base_abs.set_index("id")
-            df_editor_abs = df_abs[["id", "data_dt", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto", "Excluir"]].copy().reset_index(drop=True)
+            df_editor_abs = df_abs[["id", "data_dt", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto", "Excluir"]].copy().reset_index(drop=True)
 
             if "abastecimento_id_editando" not in st.session_state:
                 st.session_state.abastecimento_id_editando = None
@@ -5300,14 +5436,17 @@ with aba9:
                     + " | "
                     + d["Data_BR"].fillna("-")
                     + " | "
+                    + d["veiculo_placa"].fillna("").astype(str)
+                    + " | "
                     + d["local"].fillna("").astype(str)
                 ),
             )
 
             st.dataframe(
-                df_lista_abs[["Data_BR", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto"]].rename(
+                df_lista_abs[["Data_BR", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto"]].rename(
                     columns={
                         "Data_BR": "Data",
+                        "veiculo_placa": "Placa",
                         "local": "Local",
                         "doc_nf": "N.NF",
                         "km_inicial": "Km Inicial",
@@ -5344,26 +5483,49 @@ with aba9:
                     r = registro_sel.iloc[0]
                     st.markdown("### ✏️ Editar Abastecimento")
                     with st.form("form_edicao_abastecimento"):
-                        c1, c2, c3 = st.columns(3)
+                        c1, c2, c3, c4 = st.columns(4)
                         data_ed = c1.date_input("Data", value=r["data_dt"], format="DD/MM/YYYY")
-                        local_ed = c2.text_input("Local do Abastecimento", value=str(r["local"] or ""))
-                        doc_nf_ed = c3.text_input("Documento / NF", value=str(r["doc_nf"] or ""))
+                        placa_atual_abs = str(r.get("veiculo_placa") or "").strip().upper()
+                        if opcoes_veiculos_abastecimento:
+                            opcoes_veiculo_ed_abs = list(opcoes_veiculos_abastecimento)
+                            rotulo_placa_manual_abs = f"{placa_atual_abs} - (placa manual)" if placa_atual_abs else None
+                            if rotulo_placa_manual_abs and not any(
+                                str(opt).split(" - ")[0].strip().upper() == placa_atual_abs
+                                for opt in opcoes_veiculo_ed_abs
+                            ):
+                                opcoes_veiculo_ed_abs = [rotulo_placa_manual_abs] + opcoes_veiculo_ed_abs
+                            idx_veiculo_ed_abs = 0
+                            for idx_opt, opt_veic in enumerate(opcoes_veiculo_ed_abs):
+                                if str(opt_veic).split(" - ")[0].strip().upper() == placa_atual_abs:
+                                    idx_veiculo_ed_abs = idx_opt
+                                    break
+                            veic_abs_ed = c2.selectbox(
+                                "Veículo/Placa",
+                                options=opcoes_veiculo_ed_abs,
+                                index=idx_veiculo_ed_abs,
+                                key="abastecimento_veiculo_editar",
+                            )
+                            placa_ed_abs = str(veic_abs_ed).split(" - ")[0].strip().upper()
+                        else:
+                            placa_ed_abs = c2.text_input("Placa", value=placa_atual_abs).upper().strip()
+                        local_ed = c3.text_input("Local do Abastecimento", value=str(r["local"] or ""))
+                        doc_nf_ed = c4.text_input("Documento / NF", value=str(r["doc_nf"] or ""))
 
-                        c4, c5, c6, c7 = st.columns(4)
-                        km_inicial_ed = c4.number_input("KM Inicial", min_value=0.0, value=float(r["km_inicial"] or 0.0), step=1.0)
-                        tipo_cadastrado_ed = c5.selectbox(
+                        c5, c6, c7, c8 = st.columns(4)
+                        km_inicial_ed = c5.number_input("KM Inicial", min_value=0.0, value=float(r["km_inicial"] or 0.0), step=1.0)
+                        tipo_cadastrado_ed = c6.selectbox(
                             "Tipo Cadastrado (opcional)",
                             options=[""] + tipos_combustivel_sugeridos,
                             index=0,
                             placeholder="Selecione um tipo já cadastrado",
                         )
-                        tipo_comb_ed = c5.text_input(
+                        tipo_comb_ed = c6.text_input(
                             "Tipo de Combustível",
                             value=str(r["tipo_combustivel"] or tipo_cadastrado_ed),
                             help="Você pode escolher um tipo já cadastrado acima ou digitar um novo aqui.",
                         ).strip()
-                        qtde_litros_ed = c6.number_input("Qtde Litros", min_value=0.0, value=float(r["qtde_litros"] or 0.0), step=1.0)
-                        valor_unit_ed = c7.number_input("Valor Unitário (R$)", min_value=0.0, value=float(r["valor_unit"] or 0.0), step=0.01)
+                        qtde_litros_ed = c7.number_input("Qtde Litros", min_value=0.0, value=float(r["qtde_litros"] or 0.0), step=1.0)
+                        valor_unit_ed = c8.number_input("Valor Unitário (R$)", min_value=0.0, value=float(r["valor_unit"] or 0.0), step=0.01)
 
                         total_gasto_ed = qtde_litros_ed * valor_unit_ed
                         st.caption(f"Total calculado: {brl(total_gasto_ed)}")
@@ -5373,7 +5535,9 @@ with aba9:
                         btn_excluir = a2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
 
                     if btn_atualizar:
-                        if not local_ed.strip():
+                        if not placa_ed_abs.strip():
+                            st.warning("Informe a placa do veículo para atualizar o registro.")
+                        elif not local_ed.strip():
                             st.warning("Informe o local do abastecimento para atualizar o registro.")
                         elif not normalizar_tipo_combustivel(tipo_comb_ed):
                             st.warning("Informe o tipo de combustível para atualizar o registro.")
@@ -5383,7 +5547,7 @@ with aba9:
                             with conn() as c:
                                 c.execute(
                                     """UPDATE abastecimentos
-                                       SET data=?, local=?, doc_nf=?, km_inicial=?, tipo_combustivel=?, qtde_litros=?, valor_unit=?, total_gasto=?
+                                       SET data=?, local=?, doc_nf=?, km_inicial=?, tipo_combustivel=?, qtde_litros=?, valor_unit=?, total_gasto=?, veiculo_placa=?
                                        WHERE id=?""",
                                     (
                                         data_ed.isoformat(),
@@ -5394,6 +5558,7 @@ with aba9:
                                         qtde_litros_ed,
                                         valor_unit_ed,
                                         total_gasto_ed,
+                                        placa_ed_abs.strip().upper(),
                                         int(st.session_state.abastecimento_id_editando),
                                     ),
                                 )
@@ -5463,7 +5628,7 @@ with aba10:
     c_ctrl_p2.button("💾 Gravar", use_container_width=True, type="primary", key="btn_param_gravar_top", disabled=True)
 
     st.markdown("##### 📅 Período Global de Filtro")
-    c_data1, c_data2, c_meta, c_frete = st.columns([1, 1, 1.5, 1.5])
+    c_data1, c_data2, c_placa_default, c_meta, c_frete = st.columns([1, 1, 1.4, 1.5, 1.5])
     
     # Converte datas do banco para o seletor do Streamlit
     d_ini_val = datetime.strptime(dados_para_exibir.get('data_filtro_ini', '2026-01-01'), '%Y-%m-%d').date()
@@ -5471,6 +5636,17 @@ with aba10:
     
     dt_ini_param = c_data1.date_input("Data Início", value=d_ini_val, format="DD/MM/YYYY", key=f"dtini_{tipo_modo}", disabled=not st.session_state.param_editando)
     dt_fim_param = c_data2.date_input("Data Fim", value=d_fim_val, format="DD/MM/YYYY", key=f"dtfim_{tipo_modo}", disabled=not st.session_state.param_editando)
+    placa_default_v = str(dados_para_exibir.get("filtro_placa_default") or "Todas as placas").strip()
+    if placa_default_v not in opcoes_filtro_placa:
+        placa_default_v = "Todas as placas"
+    placa_default_v = c_placa_default.selectbox(
+        "Filtro Placa Default",
+        opcoes_filtro_placa,
+        index=opcoes_filtro_placa.index(placa_default_v),
+        key=f"placa_default_{tipo_modo}",
+        format_func=rotulo_placa_com_descricao,
+        disabled=not st.session_state.param_editando,
+    )
     meta_v = c_meta.number_input("Meta de Faturamento Mensal (R$)", value=float(dados_para_exibir.get('meta_faturamento', 50000.0)), key=f"meta_{tipo_modo}", disabled=not st.session_state.param_editando)
     frete_mensal_fixo_v = c_frete.number_input(
         "Valor Frete Mensal Fixo (R$)",
@@ -5542,7 +5718,8 @@ with aba10:
             'meta_faturamento': meta_v,
             'valor_frete_mensal_fixo': frete_mensal_fixo_v,
             'data_filtro_ini': dt_ini_param.strftime('%Y-%m-%d'),
-            'data_filtro_fim': dt_fim_param.strftime('%Y-%m-%d')
+            'data_filtro_fim': dt_fim_param.strftime('%Y-%m-%d'),
+            'filtro_placa_default': placa_default_v,
         }
 
         if st.session_state.simulacao_ativa:
@@ -5556,10 +5733,10 @@ with aba10:
                              consumo=?, manut=?, pneu=?, depre=?, 
                              qtde_pneu=?, vl_gasto_pneu_km=?,
                              motora_fixo=?, motora_pct=?, seguro=?, seguro_vida_motorista=?, financiamento=?,
-                             cmp_custo_escritorio=?, vl_custo_rastreador=?, pagto_ipva=?, imposto_pct=?, meta_faturamento=?, valor_frete_mensal_fixo=?, data_filtro_ini=?, data_filtro_fim=?
+                             cmp_custo_escritorio=?, vl_custo_rastreador=?, pagto_ipva=?, imposto_pct=?, meta_faturamento=?, valor_frete_mensal_fixo=?, data_filtro_ini=?, data_filtro_fim=?, filtro_placa_default=?
                              WHERE id=1""", 
                           (con_v, man_v, pne_v, dep_v, qtde_pneu_v, vl_gasto_pneu_km_v, fix_v, pct_v, seg_v, seg_vida_motorista_v, fin_v, esc_v, rastreador_v, ipva_v, imp_v,
-                           meta_v, frete_mensal_fixo_v, dt_ini_param.strftime('%Y-%m-%d'), dt_fim_param.strftime('%Y-%m-%d')))
+                           meta_v, frete_mensal_fixo_v, dt_ini_param.strftime('%Y-%m-%d'), dt_fim_param.strftime('%Y-%m-%d'), placa_default_v))
                 data_vigencia_param = dt_ini_param.isoformat()
                 c.execute(
                     """INSERT INTO parametros_historico (
@@ -5591,10 +5768,12 @@ with aba10:
                         qtde_pneu_v, vl_gasto_pneu_km_v,
                     ),
                 )
+                limpar_cache_bootstrap()
             st.session_state.p_simulado = {} # Limpa para garantir sincronia
             alerta_gravado()
         
         st.session_state.param_editando = False
+        st.session_state.filtro_placa_top_pendente = placa_default_v
         st.rerun()
 
     st.markdown("---")
@@ -6029,6 +6208,26 @@ with aba13:
             df_t = pd.read_sql("SELECT * FROM controle_trocas ORDER BY data_servico DESC", c)
         
         if not df_t.empty:
+            df_t["veiculo_label_filtro"] = df_t.apply(
+                lambda r: (
+                    f"{str(r.get('veiculo_placa') or '').strip()} - {str(r.get('descricao_veiculo') or '').strip()}"
+                    if str(r.get("descricao_veiculo") or "").strip()
+                    else str(r.get("veiculo_placa") or "").strip()
+                ),
+                axis=1,
+            )
+            opcoes_filtro_troca = ["Todos"] + sorted(
+                [v for v in df_t["veiculo_label_filtro"].dropna().unique().tolist() if str(v).strip()]
+            )
+            filtro_veiculo_troca = st.selectbox(
+                "Filtrar por Veículo",
+                opcoes_filtro_troca,
+                key="filtro_veiculo_troca",
+            )
+            if filtro_veiculo_troca != "Todos":
+                df_t = df_t[df_t["veiculo_label_filtro"] == filtro_veiculo_troca]
+
+        if not df_t.empty:
             hoje_troca = date.today()
             for idx, r in df_t.iterrows():
                 ed_key_t = f"edit_troca_{r['id']}"
@@ -6135,7 +6334,7 @@ with aba13:
                                 st.session_state[ed_key_t] = False
                                 st.rerun()
         else:
-            st.info("Nenhum registro de troca encontrado.")
+            st.info("Nenhum registro de troca encontrado para o filtro selecionado.")
 
 # =========================
 # ABA 14 - FRETE LIQUIDO NO PERIODO
@@ -6153,14 +6352,14 @@ with aba14:
             params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
         )
         df_abs_periodo = pd.read_sql(
-            """SELECT tipo_combustivel, qtde_litros, total_gasto
+            """SELECT tipo_combustivel, qtde_litros, total_gasto, veiculo_placa
                FROM abastecimentos
                WHERE date(data) BETWEEN ? AND ?""",
             c,
             params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
         )
         df_abs_ref = pd.read_sql(
-            """SELECT id, data, km_inicial, tipo_combustivel, qtde_litros, valor_unit
+            """SELECT id, data, km_inicial, tipo_combustivel, qtde_litros, valor_unit, veiculo_placa
                FROM abastecimentos
                WHERE data <= ?
                ORDER BY data ASC, id ASC""",
@@ -6172,6 +6371,17 @@ with aba14:
         placa_ref_liq = str(placa_filtro_calculo).strip().upper()
         df_viagens_liq = df_viagens_liq[
             df_viagens_liq["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_liq
+        ].copy()
+
+    if placa_filtro_calculo and not df_abs_periodo.empty and "veiculo_placa" in df_abs_periodo.columns:
+        placa_ref_abs_liq = str(placa_filtro_calculo).strip().upper()
+        df_abs_periodo = df_abs_periodo[
+            df_abs_periodo["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_abs_liq
+        ].copy()
+    if placa_filtro_calculo and not df_abs_ref.empty and "veiculo_placa" in df_abs_ref.columns:
+        placa_ref_abs_liq = str(placa_filtro_calculo).strip().upper()
+        df_abs_ref = df_abs_ref[
+            df_abs_ref["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_abs_liq
         ].copy()
 
     if not df_viagens_liq.empty:
@@ -9195,22 +9405,47 @@ with aba20:
         c1, c2 = st.columns([1, 3])
         data_anotacao = c1.date_input("Data", value=date.today(), format="DD/MM/YYYY", key="anot_data")
         descricao_anotacao = c2.text_area("Descrição", placeholder="Digite a anotação importante do dia...", key="anot_descricao")
+        documento_anotacao = st.file_uploader(
+            "Anexar Documento(s)",
+            type=["pdf", "png", "jpg", "jpeg", "webp", "doc", "docx", "xls", "xlsx", "txt", "csv"],
+            accept_multiple_files=True,
+            key="anot_documento",
+        )
 
         if st.form_submit_button("💾 Gravar", type="primary", key="btn_anotacoes_gravar"):
             if not str(descricao_anotacao or "").strip():
                 st.warning("Informe a descrição para salvar a anotação.")
             else:
+                documentos_salvos = salvar_documentos_anotacao(documento_anotacao)
+                documento_principal = documentos_salvos[0] if documentos_salvos else None
                 with conn() as c:
-                    c.execute(
-                        "INSERT INTO anotacoes (data, descricao) VALUES (?, ?)",
-                        (data_anotacao.isoformat(), descricao_anotacao.strip()),
+                    cursor = c.execute(
+                        "INSERT INTO anotacoes (data, descricao, documento_nome, documento_arquivo) VALUES (?, ?, ?, ?)",
+                        (
+                            data_anotacao.isoformat(),
+                            descricao_anotacao.strip(),
+                            documento_principal["nome_arquivo"] if documento_principal else None,
+                            documento_principal["caminho_arquivo"] if documento_principal else None,
+                        ),
                     )
+                    anotacao_id = int(cursor.lastrowid)
+                    for documento_salvo in documentos_salvos:
+                        c.execute(
+                            """INSERT INTO anotacoes_anexos (anotacao_id, nome_arquivo, caminho_arquivo, data_inclusao)
+                               VALUES (?, ?, ?, ?)""",
+                            (
+                                anotacao_id,
+                                documento_salvo["nome_arquivo"],
+                                documento_salvo["caminho_arquivo"],
+                                datetime.now().isoformat(),
+                            ),
+                        )
                 alerta_gravado()
                 st.rerun()
 
     with conn() as c:
         df_anotacoes = pd.read_sql(
-            """SELECT id, data, descricao
+            """SELECT id, data, descricao, documento_nome, documento_arquivo
                FROM anotacoes
                ORDER BY date(data) DESC, id DESC""",
             c,
@@ -9220,14 +9455,39 @@ with aba20:
         st.info("Nenhuma anotação cadastrada ainda.")
     else:
         df_anotacoes["data"] = pd.to_datetime(df_anotacoes["data"], errors="coerce").dt.date
+        df_anotacoes_exibir = df_anotacoes.copy()
+        ids_anotacoes = [int(v) for v in df_anotacoes_exibir["id"].tolist()]
+        caminhos_anexos = {}
+        if ids_anotacoes:
+            placeholders = ",".join(["?"] * len(ids_anotacoes))
+            with conn() as c:
+                rows_anexos = c.execute(
+                    f"""SELECT anotacao_id, caminho_arquivo
+                        FROM anotacoes_anexos
+                        WHERE anotacao_id IN ({placeholders})""",
+                    ids_anotacoes,
+                ).fetchall()
+            for anexo in rows_anexos:
+                caminhos_anexos.setdefault(int(anexo["anotacao_id"]), set()).add(str(anexo["caminho_arquivo"] or "").strip())
+
+        def rotulo_documento_anotacao(row):
+            caminhos = set(caminhos_anexos.get(int(row["id"]), set()))
+            caminho_legacy = str(row.get("documento_arquivo") or "").strip()
+            if caminho_legacy:
+                caminhos.add(caminho_legacy)
+            total = len([caminho for caminho in caminhos if caminho])
+            return f"{total} anexo(s)" if total else "Não"
+
+        df_anotacoes_exibir["documento"] = df_anotacoes_exibir.apply(rotulo_documento_anotacao, axis=1)
         st.dataframe(
-            df_anotacoes,
+            df_anotacoes_exibir[["id", "data", "descricao", "documento"]],
             use_container_width=True,
             hide_index=True,
             column_config={
                 "id": st.column_config.NumberColumn("ID", format="%d"),
                 "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
                 "descricao": st.column_config.TextColumn("Descrição"),
+                "documento": st.column_config.TextColumn("Documento"),
             },
         )
 
@@ -9267,8 +9527,31 @@ with aba20:
             st.warning(f"Confirma a exclusão da anotação ID {int(st.session_state.anot_excluir_id)}?")
             e1, e2 = st.columns(2)
             if e1.button("✅ Confirmar exclusão", key="btn_anot_confirmar_exclusao", type="primary", use_container_width=True):
+                caminhos_excluir = []
                 with conn() as c:
+                    row_doc = c.execute(
+                        "SELECT documento_arquivo FROM anotacoes WHERE id=?",
+                        (int(st.session_state.anot_excluir_id),),
+                    ).fetchone()
+                    caminho_documento_legacy = str(row_doc["documento_arquivo"] or "").strip() if row_doc else None
+                    if caminho_documento_legacy:
+                        caminhos_excluir.append(caminho_documento_legacy)
+                    rows_anexos_excluir = c.execute(
+                        "SELECT caminho_arquivo FROM anotacoes_anexos WHERE anotacao_id=?",
+                        (int(st.session_state.anot_excluir_id),),
+                    ).fetchall()
+                    caminhos_excluir.extend(
+                        str(r["caminho_arquivo"] or "").strip()
+                        for r in rows_anexos_excluir
+                        if str(r["caminho_arquivo"] or "").strip()
+                    )
+                    c.execute("DELETE FROM anotacoes_anexos WHERE anotacao_id=?", (int(st.session_state.anot_excluir_id),))
                     c.execute("DELETE FROM anotacoes WHERE id=?", (int(st.session_state.anot_excluir_id),))
+                for caminho_documento_excluir in set(caminhos_excluir):
+                    try:
+                        Path(caminho_documento_excluir).unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 st.session_state.anot_excluir_id = None
                 st.session_state.anot_editando_id = None
                 st.success("Anotação excluída com sucesso.")
@@ -9287,6 +9570,53 @@ with aba20:
                 reg = row_edit.iloc[0]
                 data_edit_atual = reg["data"] if pd.notna(reg["data"]) else date.today()
                 desc_edit_atual = str(reg["descricao"] or "")
+                documento_nome_atual = str(reg.get("documento_nome") or "").strip()
+                documento_arquivo_atual = str(reg.get("documento_arquivo") or "").strip()
+                with conn() as c:
+                    anexos_anotacao = c.execute(
+                        """SELECT id, nome_arquivo, caminho_arquivo
+                           FROM anotacoes_anexos
+                           WHERE anotacao_id=?
+                           ORDER BY id ASC""",
+                        (id_edit,),
+                    ).fetchall()
+                anexos_exibir = [
+                    {
+                        "id": int(anexo["id"]),
+                        "nome_arquivo": str(anexo["nome_arquivo"] or "").strip(),
+                        "caminho_arquivo": str(anexo["caminho_arquivo"] or "").strip(),
+                    }
+                    for anexo in anexos_anotacao
+                ]
+                if documento_arquivo_atual and documento_arquivo_atual not in {a["caminho_arquivo"] for a in anexos_exibir}:
+                    anexos_exibir.insert(
+                        0,
+                        {
+                            "id": 0,
+                            "nome_arquivo": documento_nome_atual,
+                            "caminho_arquivo": documento_arquivo_atual,
+                        },
+                    )
+
+                if anexos_exibir:
+                    st.markdown("##### Anexos da anotação")
+                    for anexo in anexos_exibir:
+                        caminho_anexo = anexo["caminho_arquivo"]
+                        if not caminho_anexo:
+                            continue
+                        path_documento_atual = Path(caminho_anexo)
+                        nome_download = anexo["nome_arquivo"] or path_documento_atual.name
+                        if path_documento_atual.exists():
+                            with path_documento_atual.open("rb") as f_doc_atual:
+                                st.download_button(
+                                    f"📎 Baixar: {nome_download}",
+                                    data=f_doc_atual.read(),
+                                    file_name=nome_download,
+                                    mime="application/octet-stream",
+                                    key=f"btn_anot_download_doc_{id_edit}_{anexo['id']}_{path_documento_atual.name}",
+                                )
+                        else:
+                            st.info(f"Documento registrado, mas não encontrado no disco: {nome_download}")
 
                 with st.form("form_anotacoes_editar"):
                     ed1, ed2 = st.columns([1, 3])
@@ -9301,6 +9631,12 @@ with aba20:
                         value=desc_edit_atual,
                         key=f"anot_edit_desc_{id_edit}",
                     )
+                    novo_documento_anotacao = st.file_uploader(
+                        "Adicionar Documento(s)",
+                        type=["pdf", "png", "jpg", "jpeg", "webp", "doc", "docx", "xls", "xlsx", "txt", "csv"],
+                        accept_multiple_files=True,
+                        key=f"anot_edit_documento_{id_edit}",
+                    )
                     b1, b2 = st.columns(2)
                     gravar_edit = b1.form_submit_button("💾 Gravar", use_container_width=True, key=f"btn_anot_gravar_edit_{id_edit}")
                     cancelar_edit = b2.form_submit_button("❌ CANCELAR", use_container_width=True)
@@ -9313,15 +9649,32 @@ with aba20:
                         if not str(nova_descricao_anotacao or "").strip():
                             st.warning("Informe a descrição para gravar.")
                         else:
+                            novos_documentos_salvos = salvar_documentos_anotacao(novo_documento_anotacao)
+                            documento_principal = novos_documentos_salvos[0] if novos_documentos_salvos else None
+                            documento_nome_final = documento_nome_atual or (documento_principal["nome_arquivo"] if documento_principal else None)
+                            documento_arquivo_final = documento_arquivo_atual or (documento_principal["caminho_arquivo"] if documento_principal else None)
                             with conn() as c:
                                 c.execute(
-                                    "UPDATE anotacoes SET data=?, descricao=? WHERE id=?",
+                                    "UPDATE anotacoes SET data=?, descricao=?, documento_nome=?, documento_arquivo=? WHERE id=?",
                                     (
                                         nova_data_anotacao.isoformat(),
                                         nova_descricao_anotacao.strip(),
+                                        documento_nome_final or None,
+                                        documento_arquivo_final or None,
                                         id_edit,
                                     ),
                                 )
+                                for documento_salvo in novos_documentos_salvos:
+                                    c.execute(
+                                        """INSERT INTO anotacoes_anexos (anotacao_id, nome_arquivo, caminho_arquivo, data_inclusao)
+                                           VALUES (?, ?, ?, ?)""",
+                                        (
+                                            id_edit,
+                                            documento_salvo["nome_arquivo"],
+                                            documento_salvo["caminho_arquivo"],
+                                            datetime.now().isoformat(),
+                                        ),
+                                    )
                             st.session_state.anot_editando_id = None
                             alerta_gravado()
                             st.rerun()
