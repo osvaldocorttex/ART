@@ -430,11 +430,12 @@ def limpar_cache_bootstrap():
 def _carregar_historico_parametros_raw():
     with conn() as c:
         return pd.read_sql(
-            """SELECT vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+            """SELECT COALESCE(NULLIF(TRIM(veiculo_placa), ''), 'GERAL') AS veiculo_placa,
+                      vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
                       seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                       qtde_pneu, vl_gasto_pneu_km
                FROM parametros_historico
-               ORDER BY date(vigencia_data) ASC, id ASC""",
+               ORDER BY veiculo_placa ASC, date(vigencia_data) ASC, id ASC""",
             c,
         )
 
@@ -527,7 +528,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS viagens (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, cliente TEXT, origem TEXT, destino TEXT, km REAL, toneladas REAL, valor_ton REAL, valor_km REAL DEFAULT 0.0, tipo_cobranca TEXT DEFAULT 'TONELADA', pedagio REAL, qtd_pedagio INTEGER DEFAULT 0, gasto_extra REAL DEFAULT 0.0, pagto_estadia REAL DEFAULT 0.0, valor_adicional_frete REAL DEFAULT 0.0, descricao_valor_adicional_frete TEXT, descricao_gasto_extra TEXT, diesel REAL, consumo REAL, arla REAL DEFAULT 0.0, consumo_arla REAL DEFAULT 0.0, hora_carregamento TEXT, data_chegada TEXT, hora_chegada TEXT, data_descarregamento TEXT, hora_descarregamento TEXT, obs TEXT, nf TEXT, veiculo_placa TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS cidades (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT UNIQUE)")
         c.execute("CREATE TABLE IF NOT EXISTS rotas (id INTEGER PRIMARY KEY AUTOINCREMENT, origem TEXT, destino TEXT, nome_empresa_origem TEXT, nome_empresa_destino TEXT, km REAL, valor_ton REAL DEFAULT 0.0, UNIQUE(origem, destino))")
-        c.execute("CREATE TABLE IF NOT EXISTS abastecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, local TEXT, doc_nf TEXT, km_inicial REAL, tipo_combustivel TEXT, qtde_litros REAL, valor_unit REAL, total_gasto REAL, veiculo_placa TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS abastecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, local TEXT, doc_nf TEXT, km_inicial REAL, tipo_combustivel TEXT, qtde_litros REAL, valor_unit REAL, desconto REAL DEFAULT 0.0, total_gasto REAL, veiculo_placa TEXT)")
         c.execute("""CREATE TABLE IF NOT EXISTS oficinas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT,
@@ -644,7 +645,8 @@ def init_db():
             c.execute("INSERT OR IGNORE INTO tipos_servico_troca (nome) VALUES (?)", (serv,))
         c.execute("""CREATE TABLE IF NOT EXISTS parametros_historico (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vigencia_data TEXT UNIQUE,
+            veiculo_placa TEXT DEFAULT 'GERAL',
+            vigencia_data TEXT,
             consumo REAL,
             manut REAL,
             pneu REAL,
@@ -660,7 +662,8 @@ def init_db():
             imposto_pct REAL,
             valor_frete_mensal_fixo REAL,
             qtde_pneu REAL,
-            vl_gasto_pneu_km REAL
+            vl_gasto_pneu_km REAL,
+            UNIQUE(veiculo_placa, vigencia_data)
         )""")
         
         # Tabela de Manutenção
@@ -835,6 +838,8 @@ def init_db():
         colunas_abastecimentos = [coluna[1] for coluna in cursor_abastecimentos.fetchall()]
         if "veiculo_placa" not in colunas_abastecimentos:
             c.execute("ALTER TABLE abastecimentos ADD COLUMN veiculo_placa TEXT")
+        if "desconto" not in colunas_abastecimentos:
+            c.execute("ALTER TABLE abastecimentos ADD COLUMN desconto REAL DEFAULT 0.0")
 
         # --- ATUALIZAÇÃO AUTOMÁTICA DAS COLUNAS DE ROTAS ---
         cursor_rotas = c.execute("PRAGMA table_info(rotas)")
@@ -947,6 +952,9 @@ def init_db():
 
         cursor_hist_param = c.execute("PRAGMA table_info(parametros_historico)")
         colunas_hist_param = [coluna[1] for coluna in cursor_hist_param.fetchall()]
+        if "veiculo_placa" not in colunas_hist_param:
+            c.execute("ALTER TABLE parametros_historico ADD COLUMN veiculo_placa TEXT DEFAULT 'GERAL'")
+            colunas_hist_param.append("veiculo_placa")
         coluna_seguro_vida_hist_criada = False
         if "seguro_vida_motorista" not in colunas_hist_param:
             c.execute("ALTER TABLE parametros_historico ADD COLUMN seguro_vida_motorista REAL DEFAULT 0.0")
@@ -963,6 +971,61 @@ def init_db():
                    )
                    WHERE COALESCE(seguro_vida_motorista, 0.0) = 0.0"""
             )
+        c.execute(
+            """UPDATE parametros_historico
+               SET veiculo_placa = 'GERAL'
+               WHERE veiculo_placa IS NULL OR TRIM(veiculo_placa) = ''"""
+        )
+
+        indices_hist_param = c.execute("PRAGMA index_list(parametros_historico)").fetchall()
+        precisa_recriar_hist_param = False
+        for indice in indices_hist_param:
+            if int(indice[2] or 0) != 1:
+                continue
+            nome_indice = indice[1]
+            cols_indice = [col[2] for col in c.execute(f"PRAGMA index_info({nome_indice})").fetchall()]
+            if cols_indice == ["vigencia_data"]:
+                precisa_recriar_hist_param = True
+                break
+        if precisa_recriar_hist_param:
+            c.execute("DROP TABLE IF EXISTS parametros_historico_nova")
+            c.execute("""CREATE TABLE parametros_historico_nova (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                veiculo_placa TEXT DEFAULT 'GERAL',
+                vigencia_data TEXT,
+                consumo REAL,
+                manut REAL,
+                pneu REAL,
+                depre REAL,
+                motora_fixo REAL,
+                motora_pct REAL,
+                seguro REAL,
+                seguro_vida_motorista REAL,
+                financiamento REAL,
+                pagto_ipva REAL,
+                cmp_custo_escritorio REAL,
+                vl_custo_rastreador REAL,
+                imposto_pct REAL,
+                valor_frete_mensal_fixo REAL,
+                qtde_pneu REAL,
+                vl_gasto_pneu_km REAL,
+                UNIQUE(veiculo_placa, vigencia_data)
+            )""")
+            c.execute("""INSERT OR REPLACE INTO parametros_historico_nova (
+                            id, veiculo_placa, vigencia_data, consumo, manut, pneu, depre,
+                            motora_fixo, motora_pct, seguro, seguro_vida_motorista, financiamento,
+                            pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct,
+                            valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
+                         )
+                         SELECT id, COALESCE(NULLIF(TRIM(veiculo_placa), ''), 'GERAL'), vigencia_data,
+                                consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro,
+                                seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio,
+                                vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
+                                qtde_pneu, vl_gasto_pneu_km
+                         FROM parametros_historico""")
+            c.execute("DROP TABLE parametros_historico")
+            c.execute("ALTER TABLE parametros_historico_nova RENAME TO parametros_historico")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_parametros_hist_placa_vigencia ON parametros_historico(veiculo_placa, vigencia_data)")
 
         # Índices para acelerar filtros e ordenação (especialmente no celular)
         c.execute("CREATE INDEX IF NOT EXISTS idx_viagens_data ON viagens(data)")
@@ -1162,11 +1225,16 @@ def carregar_historico_parametros():
     if df_hist.empty:
         base = {campo: float(p.get(campo, 0.0) or 0.0) for campo in PARAM_CAMPOS_HIST}
         base["vigencia_data"] = "1900-01-01"
+        base["veiculo_placa"] = "GERAL"
         df_hist = pd.DataFrame([base])
+    if "veiculo_placa" not in df_hist.columns:
+        df_hist["veiculo_placa"] = "GERAL"
+    df_hist["veiculo_placa"] = df_hist["veiculo_placa"].fillna("GERAL").astype(str).str.strip().str.upper()
+    df_hist.loc[df_hist["veiculo_placa"] == "", "veiculo_placa"] = "GERAL"
     df_hist["vigencia_data"] = pd.to_datetime(df_hist["vigencia_data"], errors="coerce").dt.normalize()
     for campo in PARAM_CAMPOS_HIST:
         df_hist[campo] = pd.to_numeric(df_hist.get(campo, 0.0), errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
-    return df_hist.sort_values("vigencia_data").reset_index(drop=True)
+    return df_hist.sort_values(["veiculo_placa", "vigencia_data"]).reset_index(drop=True)
 
 
 def aplicar_parametros_por_data(df_origem, col_data="data"):
@@ -1181,26 +1249,70 @@ def aplicar_parametros_por_data(df_origem, col_data="data"):
         return df_saida
     df_hist = carregar_historico_parametros()
     rename_hist = {campo: f"hist_{campo}" for campo in PARAM_CAMPOS_HIST}
-    hist_merge = df_hist[["vigencia_data"] + PARAM_CAMPOS_HIST].rename(columns=rename_hist).copy()
-    df_saida = pd.merge_asof(
+    hist_merge = df_hist[["veiculo_placa", "vigencia_data"] + PARAM_CAMPOS_HIST].rename(columns=rename_hist).copy()
+    ordem_original = pd.Series(range(len(df_saida)), index=df_saida.index)
+    df_saida["_ordem_param"] = ordem_original.values
+    if "veiculo_placa" in df_saida.columns:
+        df_saida["_placa_param"] = df_saida["veiculo_placa"].fillna("").astype(str).str.strip().str.upper()
+    else:
+        df_saida["_placa_param"] = "GERAL"
+    df_saida.loc[df_saida["_placa_param"] == "", "_placa_param"] = "GERAL"
+
+    hist_geral = hist_merge[hist_merge["veiculo_placa"] == "GERAL"].drop(columns=["veiculo_placa"]).sort_values("vigencia_data")
+    df_geral = pd.merge_asof(
         df_saida.sort_values("_data_ref_param"),
-        hist_merge.sort_values("vigencia_data"),
+        hist_geral,
         left_on="_data_ref_param",
         right_on="vigencia_data",
         direction="backward",
-    ).sort_index()
+    )
     for campo in PARAM_CAMPOS_HIST:
-        df_saida[f"param_{campo}"] = pd.to_numeric(df_saida.get(f"hist_{campo}", 0.0), errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
+        df_geral[f"geral_{campo}"] = pd.to_numeric(df_geral.get(f"hist_{campo}", 0.0), errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
+        if f"hist_{campo}" in df_geral.columns:
+            df_geral = df_geral.drop(columns=[f"hist_{campo}"])
+    if "vigencia_data" in df_geral.columns:
+        df_geral = df_geral.drop(columns=["vigencia_data"])
+
+    hist_placa = hist_merge[hist_merge["veiculo_placa"] != "GERAL"].rename(columns={"veiculo_placa": "_placa_param"}).sort_values(["_placa_param", "vigencia_data"])
+    if not hist_placa.empty:
+        partes_placa = []
+        for placa_ref, df_grupo in df_geral.groupby("_placa_param", sort=False):
+            hist_grupo = hist_placa[hist_placa["_placa_param"] == placa_ref].drop(columns=["_placa_param"])
+            if hist_grupo.empty:
+                partes_placa.append(df_grupo)
+                continue
+            partes_placa.append(
+                pd.merge_asof(
+                    df_grupo.sort_values("_data_ref_param"),
+                    hist_grupo.sort_values("vigencia_data"),
+                    left_on="_data_ref_param",
+                    right_on="vigencia_data",
+                    direction="backward",
+                )
+            )
+        df_saida = pd.concat(partes_placa, ignore_index=True) if partes_placa else df_geral
+    else:
+        df_saida = df_geral
+    for campo in PARAM_CAMPOS_HIST:
+        df_saida[f"param_{campo}"] = pd.to_numeric(df_saida.get(f"hist_{campo}", pd.NA), errors="coerce")
+        df_saida[f"param_{campo}"] = df_saida[f"param_{campo}"].fillna(pd.to_numeric(df_saida.get(f"geral_{campo}", 0.0), errors="coerce"))
+        df_saida[f"param_{campo}"] = df_saida[f"param_{campo}"].fillna(float(p.get(campo, 0.0) or 0.0))
         if f"hist_{campo}" in df_saida.columns:
             df_saida = df_saida.drop(columns=[f"hist_{campo}"])
+        if f"geral_{campo}" in df_saida.columns:
+            df_saida = df_saida.drop(columns=[f"geral_{campo}"])
     if "vigencia_data" in df_saida.columns:
         df_saida = df_saida.drop(columns=["vigencia_data"])
     if "_data_ref_param" in df_saida.columns:
         df_saida = df_saida.drop(columns=["_data_ref_param"])
+    if "_placa_param" in df_saida.columns:
+        df_saida = df_saida.drop(columns=["_placa_param"])
+    if "_ordem_param" in df_saida.columns:
+        df_saida = df_saida.sort_values("_ordem_param").drop(columns=["_ordem_param"])
     return df_saida
 
 
-def serie_parametro_diaria(campo, data_inicio, data_fim):
+def serie_parametro_diaria(campo, data_inicio, data_fim, veiculo_placa=None):
     if data_inicio is None or data_fim is None or data_fim < data_inicio:
         return pd.Series(dtype=float)
     dias_rateio = dias_rateio_periodo(data_inicio, data_fim)
@@ -1212,26 +1324,40 @@ def serie_parametro_diaria(campo, data_inicio, data_fim):
     if st.session_state.simulacao_ativa:
         return pd.Series(float(p.get(campo, 0.0) or 0.0), index=idx)
     hist = carregar_historico_parametros()
-    hist = hist[["vigencia_data", campo]].sort_values("vigencia_data")
+    placa_ref = str(veiculo_placa or placa_filtro_calculo or "GERAL").strip().upper()
+    if not placa_ref or placa_ref == "TODAS AS PLACAS":
+        placa_ref = "GERAL"
+    hist_geral = hist[hist["veiculo_placa"] == "GERAL"][["vigencia_data", campo]].sort_values("vigencia_data")
+    hist_placa = hist[hist["veiculo_placa"] == placa_ref][["vigencia_data", campo]].sort_values("vigencia_data")
     merged = pd.merge_asof(
         base.sort_values("data_ref"),
-        hist,
+        hist_geral,
         left_on="data_ref",
         right_on="vigencia_data",
         direction="backward",
     )
-    return pd.to_numeric(merged[campo], errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
+    serie_geral = pd.to_numeric(merged[campo], errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
+    if placa_ref == "GERAL" or hist_placa.empty:
+        return serie_geral
+    merged_placa = pd.merge_asof(
+        base.sort_values("data_ref"),
+        hist_placa,
+        left_on="data_ref",
+        right_on="vigencia_data",
+        direction="backward",
+    )
+    return pd.to_numeric(merged_placa[campo], errors="coerce").fillna(serie_geral)
 
 
-def valor_mensal_rateado_periodo(campo, data_inicio, data_fim):
-    serie = serie_parametro_diaria(campo, data_inicio, data_fim)
+def valor_mensal_rateado_periodo(campo, data_inicio, data_fim, veiculo_placa=None):
+    serie = serie_parametro_diaria(campo, data_inicio, data_fim, veiculo_placa=veiculo_placa)
     if serie.empty:
         return 0.0
     return float(serie.sum() / 30.0)
 
 
-def valor_anual_rateado_periodo(campo, data_inicio, data_fim):
-    serie = serie_parametro_diaria(campo, data_inicio, data_fim)
+def valor_anual_rateado_periodo(campo, data_inicio, data_fim, veiculo_placa=None):
+    serie = serie_parametro_diaria(campo, data_inicio, data_fim, veiculo_placa=veiculo_placa)
     if serie.empty:
         return 0.0
     return float(serie.sum() / 365.0)
@@ -1246,8 +1372,8 @@ def frete_fixo_mensal_atual():
         return 0.0
     return float(serie.iloc[0] or 0.0)
 
-def frete_fixo_rateado_periodo(data_inicio, data_fim):
-    return valor_mensal_rateado_periodo("valor_frete_mensal_fixo", data_inicio, data_fim)
+def frete_fixo_rateado_periodo(data_inicio, data_fim, veiculo_placa=None):
+    return valor_mensal_rateado_periodo("valor_frete_mensal_fixo", data_inicio, data_fim, veiculo_placa=veiculo_placa)
 
 valor_frete_fixo_periodo = frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
 
@@ -1998,12 +2124,9 @@ with aba_home:
                 df_abs_dash[df_abs_dash["tipo_combustivel"].str.contains("ARLA", na=False)]["total_gasto"].sum()
             )
             total_km_rateio_arla_dash = float(df_dash["km_total"].sum())
-            if total_km_rateio_arla_dash > 0:
+            if custo_arla_real_dash > 0 and total_km_rateio_arla_dash > 0:
                 df_dash["custo_arla"] = (custo_arla_real_dash * (df_dash["km_total"] / total_km_rateio_arla_dash)).fillna(0.0)
-            else:
-                df_dash["custo_arla"] = 0.0
-        else:
-            df_dash["custo_arla"] = 0.0
+            # else: mantém custo_arla calculado por arla/consumo_arla das viagens
         df_dash["custo_pedagio"] = (df_dash["pedagio"] * df_dash["qtd_viagens"]).fillna(0.0)
         df_dash["custo_extra"] = (df_dash["gasto_extra"] * df_dash["qtd_viagens"]).fillna(0.0)
         df_dash = aplicar_parametros_por_data(df_dash, col_data="data")
@@ -4174,22 +4297,45 @@ with aba4:
     st.markdown("---")
     st.subheader("📋 Histórico e Auditoria")
     
-    # Filtro por fornecedor da manutenção
-    fornecedores_manut_opcoes = ["Todos os fornecedores"] + list(dict_fornecedores_manutencao.keys())
-    fornecedor_manut_selecionado = st.selectbox("Filtrar por Fornecedor", fornecedores_manut_opcoes, key="filtro_fornecedor_manutencao")
-    
+    # Filtros: fornecedor e placa
     with conn() as c:
-        # Construir query com filtro opcional de fornecedor
-        query_base = """SELECT m.*, f.nome as fornecedor_nome FROM manutencoes m 
-                        JOIN fornecedores f ON m.oficina_id = f.id 
+        df_placas_manut = pd.read_sql(
+            """SELECT DISTINCT UPPER(TRIM(m.veiculo_placa)) as placa,
+                      COALESCE(v.descricao, '') as descricao
+               FROM manutencoes m
+               LEFT JOIN veiculos v ON UPPER(TRIM(v.placa)) = UPPER(TRIM(m.veiculo_placa))
+               WHERE m.veiculo_placa IS NOT NULL AND TRIM(m.veiculo_placa) <> ''
+               ORDER BY placa ASC""", c
+        )
+
+    # Monta dict label -> placa para o selectbox
+    mapa_placa_manut = {}
+    for _, row_p in df_placas_manut.iterrows():
+        label_p = f"{row_p['placa']} - {row_p['descricao']}" if row_p["descricao"] else row_p["placa"]
+        mapa_placa_manut[label_p] = row_p["placa"]
+
+    filtro_cols = st.columns(2)
+    fornecedores_manut_opcoes = ["Todos os fornecedores"] + list(dict_fornecedores_manutencao.keys())
+    fornecedor_manut_selecionado = filtro_cols[0].selectbox("Filtrar por Fornecedor", fornecedores_manut_opcoes, key="filtro_fornecedor_manutencao")
+    label_placa_selecionada = filtro_cols[1].selectbox("Filtrar por Placa", ["Todas as placas"] + list(mapa_placa_manut.keys()), key="filtro_placa_manutencao")
+
+    with conn() as c:
+        # Construir query com filtros opcionais de fornecedor e placa
+        query_base = """SELECT m.*, f.nome as fornecedor_nome FROM manutencoes m
+                        JOIN fornecedores f ON m.oficina_id = f.id
                         WHERE m.data_entrada BETWEEN ? AND ?"""
         params = [filtro_ini.isoformat(), filtro_fim.isoformat()]
-        
+
         if fornecedor_manut_selecionado != "Todos os fornecedores":
             fornecedor_id = dict_fornecedores_manutencao[fornecedor_manut_selecionado]
             query_base += " AND m.oficina_id = ?"
             params.append(fornecedor_id)
-        
+
+        if label_placa_selecionada != "Todas as placas":
+            placa_manut_selecionada = mapa_placa_manut[label_placa_selecionada]
+            query_base += " AND UPPER(TRIM(m.veiculo_placa)) = ?"
+            params.append(placa_manut_selecionada)
+
         query_base += " ORDER BY m.data_entrada DESC"
         df_m = pd.read_sql(query_base, c, params=params)
 
@@ -5244,7 +5390,7 @@ with aba9:
         local_abs = col_c.text_input("Local do Abastecimento")
         doc_nf_abs = col_d.text_input("Documento / NF")
 
-        col_e, col_f, col_g, col_h = st.columns(4)
+        col_e, col_f, col_g, col_h, col_i = st.columns(5)
         km_inicial_abs = col_e.number_input("KM Inicial", min_value=0.0, value=0.0, step=1.0)
         tipo_cadastrado_abs = col_f.selectbox(
             "Tipo Cadastrado (opcional)",
@@ -5259,9 +5405,11 @@ with aba9:
         ).strip()
         qtde_litros_abs = col_g.number_input("Qtde Litros", min_value=0.0, value=0.0, step=1.0)
         valor_unit_abs = col_h.number_input("Valor Unitário (R$)", min_value=0.0, value=0.0, step=0.01)
+        desconto_abs = col_i.number_input("Desconto (R$)", min_value=0.0, value=0.0, step=0.01)
 
-        total_gasto_abs = qtde_litros_abs * valor_unit_abs
-        st.caption(f"Total calculado: {brl(total_gasto_abs)}")
+        total_bruto_abs = qtde_litros_abs * valor_unit_abs
+        total_gasto_abs = max(total_bruto_abs - desconto_abs, 0.0)
+        st.caption(f"Total calculado: {brl(total_bruto_abs)} - desconto {brl(desconto_abs)} = {brl(total_gasto_abs)}")
 
         if st.form_submit_button("💾 Gravar", use_container_width=True, type="primary", key="btn_abastecimento_incluir_gravar"):
             if not placa_abs.strip():
@@ -5276,8 +5424,8 @@ with aba9:
                 with conn() as c:
                     c.execute(
                         """INSERT INTO abastecimentos
-                           (data, local, doc_nf, km_inicial, tipo_combustivel, qtde_litros, valor_unit, total_gasto, veiculo_placa)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           (data, local, doc_nf, km_inicial, tipo_combustivel, qtde_litros, valor_unit, desconto, total_gasto, veiculo_placa)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             data_abs.isoformat(),
                             local_abs.strip(),
@@ -5286,6 +5434,7 @@ with aba9:
                             normalizar_tipo_combustivel(tipo_comb_abs),
                             qtde_litros_abs,
                             valor_unit_abs,
+                            desconto_abs,
                             total_gasto_abs,
                             placa_abs.strip().upper(),
                         ),
@@ -5320,6 +5469,9 @@ with aba9:
         df_abs["km_inicial"] = pd.to_numeric(df_abs["km_inicial"], errors="coerce")
         df_abs["qtde_litros"] = pd.to_numeric(df_abs["qtde_litros"], errors="coerce").fillna(0.0)
         df_abs["valor_unit"] = pd.to_numeric(df_abs["valor_unit"], errors="coerce").fillna(0.0)
+        if "desconto" not in df_abs.columns:
+            df_abs["desconto"] = 0.0
+        df_abs["desconto"] = pd.to_numeric(df_abs["desconto"], errors="coerce").fillna(0.0)
         df_abs["total_gasto"] = pd.to_numeric(df_abs["total_gasto"], errors="coerce").fillna(0.0)
         df_abs["tipo_combustivel"] = df_abs["tipo_combustivel"].apply(normalizar_tipo_combustivel)
         tipos_filtro_abs = sorted([t for t in df_abs["tipo_combustivel"].dropna().unique().tolist() if t])
@@ -5421,9 +5573,9 @@ with aba9:
         if not df_abs.empty:
             df_abs["Data_BR"] = pd.to_datetime(df_abs["data_dt"]).dt.strftime('%d/%m/%Y')
             df_abs["Excluir"] = False
-            df_base_abs = df_abs[["id", "data", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit"]].copy()
+            df_base_abs = df_abs[["id", "data", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "desconto"]].copy()
             df_base_abs = df_base_abs.set_index("id")
-            df_editor_abs = df_abs[["id", "data_dt", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto", "Excluir"]].copy().reset_index(drop=True)
+            df_editor_abs = df_abs[["id", "data_dt", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "desconto", "total_gasto", "Excluir"]].copy().reset_index(drop=True)
 
             if "abastecimento_id_editando" not in st.session_state:
                 st.session_state.abastecimento_id_editando = None
@@ -5443,7 +5595,7 @@ with aba9:
             )
 
             st.dataframe(
-                df_lista_abs[["Data_BR", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "total_gasto"]].rename(
+                df_lista_abs[["Data_BR", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "desconto", "total_gasto"]].rename(
                     columns={
                         "Data_BR": "Data",
                         "veiculo_placa": "Placa",
@@ -5453,6 +5605,7 @@ with aba9:
                         "tipo_combustivel": "Tipo Combustível",
                         "qtde_litros": "Qtde Litros",
                         "valor_unit": "Valor Unitário",
+                        "desconto": "Desconto",
                         "total_gasto": "Total Gasto",
                     }
                 ),
@@ -5511,7 +5664,7 @@ with aba9:
                         local_ed = c3.text_input("Local do Abastecimento", value=str(r["local"] or ""))
                         doc_nf_ed = c4.text_input("Documento / NF", value=str(r["doc_nf"] or ""))
 
-                        c5, c6, c7, c8 = st.columns(4)
+                        c5, c6, c7, c8, c9 = st.columns(5)
                         km_inicial_ed = c5.number_input("KM Inicial", min_value=0.0, value=float(r["km_inicial"] or 0.0), step=1.0)
                         tipo_cadastrado_ed = c6.selectbox(
                             "Tipo Cadastrado (opcional)",
@@ -5526,9 +5679,11 @@ with aba9:
                         ).strip()
                         qtde_litros_ed = c7.number_input("Qtde Litros", min_value=0.0, value=float(r["qtde_litros"] or 0.0), step=1.0)
                         valor_unit_ed = c8.number_input("Valor Unitário (R$)", min_value=0.0, value=float(r["valor_unit"] or 0.0), step=0.01)
+                        desconto_ed = c9.number_input("Desconto (R$)", min_value=0.0, value=float(r["desconto"] or 0.0), step=0.01)
 
-                        total_gasto_ed = qtde_litros_ed * valor_unit_ed
-                        st.caption(f"Total calculado: {brl(total_gasto_ed)}")
+                        total_bruto_ed = qtde_litros_ed * valor_unit_ed
+                        total_gasto_ed = max(total_bruto_ed - desconto_ed, 0.0)
+                        st.caption(f"Total calculado: {brl(total_bruto_ed)} - desconto {brl(desconto_ed)} = {brl(total_gasto_ed)}")
 
                         a1, a2 = st.columns(2)
                         btn_atualizar = a1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
@@ -5547,7 +5702,7 @@ with aba9:
                             with conn() as c:
                                 c.execute(
                                     """UPDATE abastecimentos
-                                       SET data=?, local=?, doc_nf=?, km_inicial=?, tipo_combustivel=?, qtde_litros=?, valor_unit=?, total_gasto=?, veiculo_placa=?
+                                       SET data=?, local=?, doc_nf=?, km_inicial=?, tipo_combustivel=?, qtde_litros=?, valor_unit=?, desconto=?, total_gasto=?, veiculo_placa=?
                                        WHERE id=?""",
                                     (
                                         data_ed.isoformat(),
@@ -5557,6 +5712,7 @@ with aba9:
                                         normalizar_tipo_combustivel(tipo_comb_ed),
                                         qtde_litros_ed,
                                         valor_unit_ed,
+                                        desconto_ed,
                                         total_gasto_ed,
                                         placa_ed_abs.strip().upper(),
                                         int(st.session_state.abastecimento_id_editando),
@@ -5608,13 +5764,44 @@ with aba10:
     with conn() as c:
         p_real_banco = dict(c.execute("SELECT * FROM parametros WHERE id=1").fetchone())
 
+    opcoes_param_placa = list(apenas_placas)
+    if not opcoes_param_placa:
+        st.warning("Cadastre um veículo antes de cadastrar parâmetros por placa.")
+    if st.session_state.get("param_placa_cadastro") not in opcoes_param_placa:
+        st.session_state.param_placa_cadastro = opcoes_param_placa[0] if opcoes_param_placa else None
+    placa_param_cadastro = st.selectbox(
+        "Placa do Veículo para Cadastro de Parâmetros",
+        opcoes_param_placa,
+        index=0 if opcoes_param_placa else None,
+        key="param_placa_cadastro",
+        format_func=rotulo_placa_com_descricao,
+        placeholder="Selecione a placa do veículo",
+        help="Cada placa possui seu próprio cadastro de parâmetros.",
+    )
+    with conn() as c:
+        if placa_param_cadastro:
+            row_param_placa = c.execute(
+                """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                          seguro, seguro_vida_motorista, financiamento, pagto_ipva,
+                          cmp_custo_escritorio, vl_custo_rastreador, imposto_pct,
+                          valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
+                   FROM parametros_historico
+                   WHERE UPPER(TRIM(veiculo_placa)) = UPPER(TRIM(?))
+                   ORDER BY date(vigencia_data) DESC, id DESC
+                   LIMIT 1""",
+                (placa_param_cadastro,),
+            ).fetchone()
+            if row_param_placa:
+                p_real_banco = {**p_real_banco, **dict(row_param_placa)}
+
     # 3. DEFINE A FONTE DE DADOS PARA EXIBIÇÃO
     if st.session_state.simulacao_ativa and st.session_state.p_simulado:
         dados_para_exibir = st.session_state.p_simulado
         st.warning("⚠️ **MODO SIMULAÇÃO ATIVO:** Os valores abaixo são temporários.")
     else:
         dados_para_exibir = p_real_banco
-        st.info("✅ **MODO REAL:** Os valores abaixo estão salvos no banco de dados.")
+        if placa_param_cadastro:
+            st.info(f"✅ **MODO REAL:** Os valores abaixo estão salvos para `{rotulo_placa_com_descricao(placa_param_cadastro)}`.")
 
     # 4. CAMPOS COM CHAVE DINÂMICA (tipo_modo)
     # Fora de st.form para atualizar cálculos em tempo real
@@ -5708,7 +5895,7 @@ with aba10:
     st.markdown("<br>", unsafe_allow_html=True)
     btn_label = "💾 Gravar"
     
-    if st.button(btn_label, use_container_width=True, type="primary", key=f"btn_param_save_{tipo_modo}", disabled=not st.session_state.param_editando):
+    if st.button(btn_label, use_container_width=True, type="primary", key=f"btn_param_save_{tipo_modo}", disabled=(not st.session_state.param_editando or not placa_param_cadastro)):
         # Cria o dicionário de dados atualizados
         novos_dados = {
             'consumo': con_v, 'manut': man_v, 'pneu': pne_v, 'depre': dep_v,
@@ -5729,22 +5916,20 @@ with aba10:
         else:
             # Grava permanentemente no SQLite
             with conn() as c:
-                c.execute("""UPDATE parametros SET 
-                             consumo=?, manut=?, pneu=?, depre=?, 
-                             qtde_pneu=?, vl_gasto_pneu_km=?,
-                             motora_fixo=?, motora_pct=?, seguro=?, seguro_vida_motorista=?, financiamento=?,
-                             cmp_custo_escritorio=?, vl_custo_rastreador=?, pagto_ipva=?, imposto_pct=?, meta_faturamento=?, valor_frete_mensal_fixo=?, data_filtro_ini=?, data_filtro_fim=?, filtro_placa_default=?
-                             WHERE id=1""", 
-                          (con_v, man_v, pne_v, dep_v, qtde_pneu_v, vl_gasto_pneu_km_v, fix_v, pct_v, seg_v, seg_vida_motorista_v, fin_v, esc_v, rastreador_v, ipva_v, imp_v,
-                           meta_v, frete_mensal_fixo_v, dt_ini_param.strftime('%Y-%m-%d'), dt_fim_param.strftime('%Y-%m-%d'), placa_default_v))
+                c.execute(
+                    """UPDATE parametros
+                       SET data_filtro_ini=?, data_filtro_fim=?, filtro_placa_default=?
+                       WHERE id=1""",
+                    (dt_ini_param.strftime('%Y-%m-%d'), dt_fim_param.strftime('%Y-%m-%d'), placa_default_v),
+                )
                 data_vigencia_param = dt_ini_param.isoformat()
                 c.execute(
                     """INSERT INTO parametros_historico (
-                           vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                           veiculo_placa, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
                            seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                            qtde_pneu, vl_gasto_pneu_km
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(vigencia_data) DO UPDATE SET
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(veiculo_placa, vigencia_data) DO UPDATE SET
                            consumo=excluded.consumo,
                            manut=excluded.manut,
                            pneu=excluded.pneu,
@@ -5762,6 +5947,7 @@ with aba10:
                            qtde_pneu=excluded.qtde_pneu,
                            vl_gasto_pneu_km=excluded.vl_gasto_pneu_km""",
                     (
+                        placa_param_cadastro,
                         data_vigencia_param,
                         con_v, man_v, pne_v, dep_v, fix_v, pct_v,
                         seg_v, seg_vida_motorista_v, fin_v, ipva_v, esc_v, rastreador_v, imp_v, frete_mensal_fixo_v,
@@ -5782,11 +5968,12 @@ with aba10:
 
     with conn() as c:
         df_hist_param = pd.read_sql(
-            """SELECT id, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+            """SELECT id, COALESCE(NULLIF(TRIM(veiculo_placa), ''), 'GERAL') AS veiculo_placa,
+                      vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
                       seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                       qtde_pneu, vl_gasto_pneu_km
                FROM parametros_historico
-               ORDER BY date(vigencia_data) DESC, id DESC""",
+               ORDER BY veiculo_placa ASC, date(vigencia_data) DESC, id DESC""",
             c,
         )
 
@@ -5821,6 +6008,7 @@ with aba10:
             hide_index=True,
             column_config={
                 "id": st.column_config.NumberColumn("ID", format="%d"),
+                "veiculo_placa": st.column_config.TextColumn("Placa"),
                 "vigencia_data": st.column_config.DateColumn("Vigência", format="DD/MM/YYYY"),
                 "consumo": st.column_config.NumberColumn("Consumo", format="%.2f"),
                 "manut": st.column_config.NumberColumn("Manut.", format="R$ %.4f"),
@@ -5845,7 +6033,7 @@ with aba10:
         if "hist_param_excluir_id" not in st.session_state:
             st.session_state.hist_param_excluir_id = None
         mapa_hist = {
-            f"ID {int(r['id'])} | Vigência {str(r['vigencia_data'])}": int(r["id"])
+            f"ID {int(r['id'])} | Placa {str(r['veiculo_placa'] or 'GERAL')} | Vigência {str(r['vigencia_data'])}": int(r["id"])
             for _, r in df_hist_param.iterrows()
         }
         hist_sel_label = st.selectbox(
@@ -5860,9 +6048,23 @@ with aba10:
             id_hist_sel = mapa_hist[hist_sel_label]
             row_hist = df_hist_param[df_hist_param["id"] == id_hist_sel].iloc[0]
             vig_atual = pd.to_datetime(row_hist["vigencia_data"], errors="coerce").date()
+            placa_hist_atual = str(row_hist.get("veiculo_placa") or "GERAL").strip().upper()
+            opcoes_hist_placa = list(apenas_placas)
+            if placa_hist_atual != "GERAL" and placa_hist_atual not in opcoes_hist_placa:
+                opcoes_hist_placa.append(placa_hist_atual)
+            if not opcoes_hist_placa:
+                st.warning("Cadastre um veículo para editar registros de parâmetros por placa.")
 
             h1, h2, h3 = st.columns(3)
-            nova_vigencia = h1.date_input(
+            nova_placa_hist = h1.selectbox(
+                "Placa",
+                opcoes_hist_placa,
+                index=opcoes_hist_placa.index(placa_hist_atual) if placa_hist_atual in opcoes_hist_placa else (0 if opcoes_hist_placa else None),
+                key=f"hist_placa_{id_hist_sel}",
+                format_func=rotulo_placa_com_descricao,
+                placeholder="Selecione a placa",
+            )
+            nova_vigencia = h2.date_input(
                 "Data Vigência",
                 value=vig_atual,
                 min_value=date(1900, 1, 1),
@@ -5870,8 +6072,8 @@ with aba10:
                 format="DD/MM/YYYY",
                 key=f"hist_vig_{id_hist_sel}",
             )
-            novo_consumo = h2.number_input("Consumo (km/l)", value=float(row_hist["consumo"]), step=0.1, key=f"hist_con_{id_hist_sel}")
-            nova_manut = h3.number_input("Manutenção (R$/km)", value=float(row_hist["manut"]), step=0.01, key=f"hist_man_{id_hist_sel}")
+            novo_consumo = h3.number_input("Consumo (km/l)", value=float(row_hist["consumo"]), step=0.1, key=f"hist_con_{id_hist_sel}")
+            nova_manut = st.number_input("Manutenção (R$/km)", value=float(row_hist["manut"]), step=0.01, key=f"hist_man_{id_hist_sel}")
 
             h4, h5, h6 = st.columns(3)
             novo_pneu = h4.number_input("Pneu (R$/km)", value=float(row_hist["pneu"]), step=0.01, key=f"hist_pneu_{id_hist_sel}")
@@ -5904,23 +6106,24 @@ with aba10:
                 format="DD/MM/YYYY",
                 key=f"hist_dup_data_{id_hist_sel}",
             )
-            if d2.button("📄 Duplicar", use_container_width=True, key=f"btn_hist_dup_{id_hist_sel}"):
+            if d2.button("📄 Duplicar", use_container_width=True, key=f"btn_hist_dup_{id_hist_sel}", disabled=not nova_placa_hist):
                 data_dup_txt = data_duplicar.isoformat()
                 with conn() as c:
                     existe_dup = c.execute(
-                        "SELECT id FROM parametros_historico WHERE vigencia_data=?",
-                        (data_dup_txt,),
+                        "SELECT id FROM parametros_historico WHERE veiculo_placa=? AND vigencia_data=?",
+                        (nova_placa_hist, data_dup_txt),
                     ).fetchone()
                     if existe_dup:
-                        st.warning("Já existe um registro nessa data. Escolha outra data para duplicar.")
+                        st.warning("Já existe um registro nessa placa e data. Escolha outra data para duplicar.")
                     else:
                         c.execute(
                             """INSERT INTO parametros_historico (
-                                   vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                                   veiculo_placa, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
                                    seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                                    qtde_pneu, vl_gasto_pneu_km
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
+                                nova_placa_hist,
                                 data_dup_txt,
                                 float(row_hist["consumo"] or 0.0),
                                 float(row_hist["manut"] or 0.0),
@@ -5944,24 +6147,24 @@ with aba10:
                 st.rerun()
 
             a_salvar, a_excluir = st.columns(2)
-            if a_salvar.button("💾 Salvar Alteração de Vigência", use_container_width=True, key=f"btn_hist_save_{id_hist_sel}"):
+            if a_salvar.button("💾 Salvar Alteração de Vigência", use_container_width=True, key=f"btn_hist_save_{id_hist_sel}", disabled=not nova_placa_hist):
                 nova_vig_txt = nova_vigencia.isoformat()
                 with conn() as c:
                     existe_data = c.execute(
-                        "SELECT id FROM parametros_historico WHERE vigencia_data=? AND id<>?",
-                        (nova_vig_txt, int(id_hist_sel)),
+                        "SELECT id FROM parametros_historico WHERE veiculo_placa=? AND vigencia_data=? AND id<>?",
+                        (nova_placa_hist, nova_vig_txt, int(id_hist_sel)),
                     ).fetchone()
                     if existe_data:
-                        st.warning("Já existe outro registro nessa data de vigência.")
+                        st.warning("Já existe outro registro nessa placa e data de vigência.")
                     else:
                         c.execute(
                             """UPDATE parametros_historico
-                               SET vigencia_data=?, consumo=?, manut=?, pneu=?, depre=?, motora_fixo=?, motora_pct=?,
+                               SET veiculo_placa=?, vigencia_data=?, consumo=?, manut=?, pneu=?, depre=?, motora_fixo=?, motora_pct=?,
                                    seguro=?, seguro_vida_motorista=?, financiamento=?, pagto_ipva=?, cmp_custo_escritorio=?, vl_custo_rastreador=?, imposto_pct=?, valor_frete_mensal_fixo=?,
                                    qtde_pneu=?, vl_gasto_pneu_km=?
                                WHERE id=?""",
                             (
-                                nova_vig_txt, novo_consumo, nova_manut, novo_pneu, nova_depre, novo_mot_fixo, novo_mot_pct,
+                                nova_placa_hist, nova_vig_txt, novo_consumo, nova_manut, novo_pneu, nova_depre, novo_mot_fixo, novo_mot_pct,
                                 novo_seguro, novo_seguro_vida_motorista, novo_fin, novo_ipva, novo_escr, novo_rastreador, novo_imp, novo_frete_fixo,
                                 nova_qtde_pneu, novo_vl_pneu_km, int(id_hist_sel),
                             ),
@@ -6341,7 +6544,21 @@ with aba13:
 # =========================
 with aba14:
     st.subheader("💵 Frete Líquido no Período")
-    st.caption(f"Período: {filtro_ini.strftime('%d/%m/%Y')} até {filtro_fim.strftime('%d/%m/%Y')}")
+    opcoes_placa_frete_liq = ["Todas as placas"] + apenas_placas
+    placa_padrao_frete_liq = placa_filtro_calculo if placa_filtro_calculo in apenas_placas else "Todas as placas"
+    filtro_placa_frete_liq = st.selectbox(
+        "Filtrar por Placa",
+        opcoes_placa_frete_liq,
+        index=opcoes_placa_frete_liq.index(placa_padrao_frete_liq),
+        key="filtro_placa_frete_liq",
+        format_func=rotulo_placa_com_descricao,
+    )
+    placa_filtro_frete_liq = filtro_placa_frete_liq if filtro_placa_frete_liq != "Todas as placas" else None
+    placa_rateio_frete_liq = placa_filtro_frete_liq or "GERAL"
+    st.caption(
+        f"Período: {filtro_ini.strftime('%d/%m/%Y')} até {filtro_fim.strftime('%d/%m/%Y')}"
+        + (f" | Placa: {rotulo_placa_com_descricao(placa_filtro_frete_liq)}" if placa_filtro_frete_liq else " | Placa: Todas as placas")
+    )
 
     with conn() as c:
         df_viagens_liq = pd.read_sql(
@@ -6367,19 +6584,19 @@ with aba14:
             params=(filtro_fim.isoformat(),),
         )
 
-    if placa_filtro_calculo and not df_viagens_liq.empty and "veiculo_placa" in df_viagens_liq.columns:
-        placa_ref_liq = str(placa_filtro_calculo).strip().upper()
+    if placa_filtro_frete_liq and not df_viagens_liq.empty and "veiculo_placa" in df_viagens_liq.columns:
+        placa_ref_liq = str(placa_filtro_frete_liq).strip().upper()
         df_viagens_liq = df_viagens_liq[
             df_viagens_liq["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_liq
         ].copy()
 
-    if placa_filtro_calculo and not df_abs_periodo.empty and "veiculo_placa" in df_abs_periodo.columns:
-        placa_ref_abs_liq = str(placa_filtro_calculo).strip().upper()
+    if placa_filtro_frete_liq and not df_abs_periodo.empty and "veiculo_placa" in df_abs_periodo.columns:
+        placa_ref_abs_liq = str(placa_filtro_frete_liq).strip().upper()
         df_abs_periodo = df_abs_periodo[
             df_abs_periodo["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_abs_liq
         ].copy()
-    if placa_filtro_calculo and not df_abs_ref.empty and "veiculo_placa" in df_abs_ref.columns:
-        placa_ref_abs_liq = str(placa_filtro_calculo).strip().upper()
+    if placa_filtro_frete_liq and not df_abs_ref.empty and "veiculo_placa" in df_abs_ref.columns:
+        placa_ref_abs_liq = str(placa_filtro_frete_liq).strip().upper()
         df_abs_ref = df_abs_ref[
             df_abs_ref["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_abs_liq
         ].copy()
@@ -6468,13 +6685,15 @@ with aba14:
         df_abs_ref = pd.DataFrame(columns=["km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit"])
 
     qtde_viagem = int(df_viagens_liq["qtd_viagens"].sum()) if not df_viagens_liq.empty else 0
+    tem_viagem_frete_liq = qtde_viagem > 0
     valor_total_viagem = float(df_viagens_liq["total_frete"].sum()) if not df_viagens_liq.empty else 0.0
     valor_total_pedagio = float(df_viagens_liq["pedagio_total"].sum()) if not df_viagens_liq.empty else 0.0
     valor_total_gasto_extra = float(df_viagens_liq["gasto_extra_total"].sum()) if not df_viagens_liq.empty else 0.0
     valor_total_pagto_estadia = float(df_viagens_liq["pagto_estadia_total"].sum()) if not df_viagens_liq.empty else 0.0
     valor_total_adicional_frete = float(df_viagens_liq["valor_adicional_frete_total"].sum()) if not df_viagens_liq.empty else 0.0
     valor_total_viagem += (valor_total_pagto_estadia + valor_total_adicional_frete)
-    valor_total_viagem += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
+    if tem_viagem_frete_liq:
+        valor_total_viagem += frete_fixo_rateado_periodo(filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq)
     valor_pago_por_viagem = (valor_total_viagem / qtde_viagem) if qtde_viagem > 0 else 0.0
     km_total = float(df_viagens_liq["km_total"].sum()) if not df_viagens_liq.empty else 0.0
     km_por_viagem = (km_total / qtde_viagem) if qtde_viagem > 0 else 0.0
@@ -6539,22 +6758,35 @@ with aba14:
     else:
         valor_motorista_viagens = 0.0
         valor_imposto_viagens = 0.0
-    valor_motorista_frete_fixo = float(
-        (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
-         * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim) / 100.0)).sum()
-    )
-    valor_imposto_frete_fixo = float(
-        (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
-         * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim) / 100.0)).sum()
-    )
+    if tem_viagem_frete_liq:
+        valor_motorista_frete_fixo = float(
+            (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq) / 30.0
+             * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq) / 100.0)).sum()
+        )
+        valor_imposto_frete_fixo = float(
+            (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq) / 30.0
+             * (serie_parametro_diaria("imposto_pct", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq) / 100.0)).sum()
+        )
+    else:
+        valor_motorista_frete_fixo = 0.0
+        valor_imposto_frete_fixo = 0.0
     valor_motorista_10 = valor_motorista_viagens + valor_motorista_frete_fixo
-    valor_motorista_fixo_rateado = valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim)
-    valor_seguro_rateado = valor_mensal_rateado_periodo("seguro", filtro_ini, filtro_fim)
-    valor_seguro_vida_motorista_rateado = valor_mensal_rateado_periodo("seguro_vida_motorista", filtro_ini, filtro_fim)
-    valor_financiamento_rateado = valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim)
-    valor_ipva_rateado = valor_anual_rateado_periodo("pagto_ipva", filtro_ini, filtro_fim)
-    valor_escritorio_rateado = valor_mensal_rateado_periodo("cmp_custo_escritorio", filtro_ini, filtro_fim)
-    valor_rastreador_rateado = valor_mensal_rateado_periodo("vl_custo_rastreador", filtro_ini, filtro_fim)
+    if tem_viagem_frete_liq:
+        valor_motorista_fixo_rateado = valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq)
+        valor_seguro_rateado = valor_mensal_rateado_periodo("seguro", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq)
+        valor_seguro_vida_motorista_rateado = valor_mensal_rateado_periodo("seguro_vida_motorista", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq)
+        valor_financiamento_rateado = valor_mensal_rateado_periodo("financiamento", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq)
+        valor_ipva_rateado = valor_anual_rateado_periodo("pagto_ipva", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq)
+        valor_escritorio_rateado = valor_mensal_rateado_periodo("cmp_custo_escritorio", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq)
+        valor_rastreador_rateado = valor_mensal_rateado_periodo("vl_custo_rastreador", filtro_ini, filtro_fim, veiculo_placa=placa_rateio_frete_liq)
+    else:
+        valor_motorista_fixo_rateado = 0.0
+        valor_seguro_rateado = 0.0
+        valor_seguro_vida_motorista_rateado = 0.0
+        valor_financiamento_rateado = 0.0
+        valor_ipva_rateado = 0.0
+        valor_escritorio_rateado = 0.0
+        valor_rastreador_rateado = 0.0
     valor_motorista_total = valor_motorista_10 + valor_motorista_fixo_rateado
     valor_imposto = valor_imposto_viagens + valor_imposto_frete_fixo
     if not df_viagens_liq.empty:
@@ -6731,9 +6963,18 @@ with aba15:
     if "fornecedor_editando" not in st.session_state:
         st.session_state.fornecedor_editando = False
     with st.expander("➕ Cadastro de Fornecedor", expanded=False):
+        with conn() as c:
+            codigos_numericos = [
+                int(r[0]) for r in c.execute(
+                    "SELECT codigo FROM fornecedores WHERE codigo GLOB '[0-9]*'"
+                ).fetchall()
+                if str(r[0]).isdigit()
+            ]
+            proximo_codigo = str(max(codigos_numericos) + 1) if codigos_numericos else "1"
+
         with st.form("form_fornecedor", clear_on_submit=True):
             c1, c2, c3 = st.columns(3)
-            cod_forn = c1.text_input("Código Fornecedor").strip().upper()
+            cod_forn = c1.text_input("Código Fornecedor", value=proximo_codigo).strip().upper()
             nome_forn = c2.text_input("Nome do Fornecedor").strip()
             cnpj_forn = c3.text_input("CNPJ").strip()
 
@@ -7001,13 +7242,14 @@ with aba19:
                         data_vigencia_cmp = str(p.get("data_filtro_ini", date.today().isoformat()) or date.today().isoformat())
                         c.execute(
                             """INSERT INTO parametros_historico (
-                                   vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
+                                   veiculo_placa, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
                                    seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                                    qtde_pneu, vl_gasto_pneu_km
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                               ON CONFLICT(vigencia_data) DO UPDATE SET
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ON CONFLICT(veiculo_placa, vigencia_data) DO UPDATE SET
                                    cmp_custo_escritorio=excluded.cmp_custo_escritorio""",
                             (
+                                "GERAL",
                                 data_vigencia_cmp,
                                 float(p_hist_base["consumo"] or 0.0),
                                 float(p_hist_base["manut"] or 0.0),
