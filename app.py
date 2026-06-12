@@ -5595,8 +5595,9 @@ with aba9:
             )
 
             st.dataframe(
-                df_lista_abs[["Data_BR", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "desconto", "total_gasto"]].rename(
+                df_lista_abs[["id", "Data_BR", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "desconto", "total_gasto"]].rename(
                     columns={
+                        "id": "ID",
                         "Data_BR": "Data",
                         "veiculo_placa": "Placa",
                         "local": "Local",
