@@ -82,6 +82,7 @@ def conn():
     c.execute("PRAGMA synchronous=NORMAL")
     c.execute("PRAGMA temp_store=MEMORY")
     c.execute("PRAGMA cache_size=-64000")
+    c.execute("PRAGMA mmap_size=268435456")
     return c
 
 def salvar_anexos_pedido_fornecedor(arquivos):
@@ -378,7 +379,7 @@ def movimentos_fornecedor(c, fornecedor_id):
     qtd_pecas = c.execute("SELECT COUNT(*) FROM manutencoes_pecas WHERE fornecedor_id=?", (fornecedor_id,)).fetchone()[0]
     if qtd_pecas:
         usos.append(f"Peças de manutenção: {qtd_pecas}")
-    qtd_cp = c.execute("SELECT COUNT(*) FROM contas_pagar WHERE fornecedor_id=?", (fornecedor_id,)).fetchone()[0]
+    qtd_cp = c.execute("SELECT COUNT(*) FROM contas_pagar WHERE fornecedor=?", (str(fornecedor_id),)).fetchone()[0]
     if qtd_cp:
         usos.append(f"Contas a pagar: {qtd_cp}")
     return usos
@@ -570,21 +571,31 @@ def init_db():
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS contas_pagar (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fornecedor_id INTEGER,
-            n_nf TEXT,
-            data_entrada TEXT,
-            valor_total_nf REAL,
-            obrigacao_id INTEGER,
-            dados_nf TEXT,
-            quantidade_parcelas INTEGER,
-            vencimentos_parcelas TEXT,
-            valor_parcela REAL,
-            tipo_lancamento TEXT DEFAULT 'NAO_MENSAL',
-            dia_vencimento_mensal INTEGER,
-            data_vencimento_base TEXT,
-            competencia_paga_mensal TEXT,
-            parcelas_pagas TEXT,
-            dias_alerta INTEGER DEFAULT 7
+            descricao TEXT NOT NULL,
+            fornecedor TEXT,
+            categoria TEXT,
+            n_documento TEXT,
+            data_emissao TEXT,
+            data_vencimento TEXT NOT NULL,
+            valor REAL NOT NULL DEFAULT 0.0,
+            data_pagamento TEXT,
+            forma_pagamento TEXT DEFAULT 'PIX',
+            observacao TEXT,
+            data_cadastro TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS contas_receber (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descricao TEXT NOT NULL,
+            cliente TEXT,
+            categoria TEXT,
+            n_documento TEXT,
+            data_emissao TEXT,
+            data_vencimento TEXT NOT NULL,
+            valor REAL NOT NULL DEFAULT 0.0,
+            data_recebimento TEXT,
+            forma_recebimento TEXT DEFAULT 'PIX',
+            observacao TEXT,
+            data_cadastro TEXT
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS me_lembra (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1033,6 +1044,14 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_viagens_origem_destino ON viagens(origem, destino)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_abastecimentos_data ON abastecimentos(data)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_abastecimentos_placa_data ON abastecimentos(veiculo_placa, data)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_manutencoes_oficina ON manutencoes(oficina_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_manutencoes_placa ON manutencoes(veiculo_placa)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_manutencoes_data ON manutencoes(data_entrada)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_manutencoes_pecas_forn ON manutencoes_pecas(fornecedor_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_contas_pagar_venc ON contas_pagar(data_vencimento)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_contas_receber_venc ON contas_receber(data_vencimento)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_me_lembra_venc ON me_lembra(data_vencimento)")
+        c.execute("PRAGMA optimize")
 
 
 # Executa a função para garantir que o banco está atualizado
@@ -1086,23 +1105,323 @@ v_arla_sug = float(last_v["arla"]) if last_v else 0.0
 v_cons_arla_sug = float(last_v["consumo_arla"]) if last_v else 0.0
 
 # INTERFACE
-st.title("🚛 Gestão ART Amaral Rota Transportes")
 st.markdown(
     """
     <style>
-    /* Ajustes focados apenas em celular */
+    /* ===== DESIGN SYSTEM ===== */
+    :root {
+        --navy:      #0b3c5d;
+        --blue:      #1b6ca8;
+        --teal:      #00a6a6;
+        --bg:        #eef4fb;
+        --surface:   #ffffff;
+        --border:    #cfdce9;
+        --text:      #102a43;
+        --text-sec:  #37516c;
+        --text-muted:#627d98;
+        --success:   #10b981;
+        --warning:   #f59e0b;
+        --danger:    #ef4444;
+        --radius:    12px;
+        --shadow-sm: 0 1px 3px rgba(11,60,93,0.07), 0 1px 2px rgba(11,60,93,0.04);
+        --shadow:    0 4px 12px rgba(11,60,93,0.10), 0 2px 4px rgba(11,60,93,0.06);
+        --shadow-lg: 0 10px 28px rgba(11,60,93,0.15), 0 4px 8px rgba(11,60,93,0.08);
+    }
+
+    /* ===== APP BACKGROUND ===== */
+    .stApp {
+        background: linear-gradient(160deg, #e8f2fa 0%, #f4f9ff 45%, #edf7f7 100%) !important;
+        font-family: "Inter", "Segoe UI", "Trebuchet MS", sans-serif !important;
+    }
+
+    /* ===== MAIN CONTAINER ===== */
+    .main .block-container {
+        padding-top: 1.0rem !important;
+        padding-bottom: 2rem !important;
+        max-width: 1440px !important;
+    }
+
+    /* ===== PROFESSIONAL HEADER ===== */
+    .art-header {
+        background: linear-gradient(120deg, #0b3c5d 0%, #1b6ca8 55%, #00a6a6 100%);
+        border-radius: 16px;
+        padding: 16px 24px;
+        margin-bottom: 14px;
+        box-shadow: 0 8px 28px rgba(11,60,93,0.32);
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        position: relative;
+        overflow: hidden;
+        animation: art-risein 0.45s ease-out;
+    }
+    .art-header::before {
+        content: '';
+        position: absolute;
+        right: -40px; top: -50px;
+        width: 200px; height: 200px;
+        background: rgba(255,255,255,0.06);
+        border-radius: 50%;
+    }
+    .art-header::after {
+        content: '';
+        position: absolute;
+        right: 80px; bottom: -60px;
+        width: 140px; height: 140px;
+        background: rgba(0,166,166,0.12);
+        border-radius: 50%;
+    }
+    .art-header-icon { font-size: 2.4rem; line-height: 1; position: relative; z-index: 1; }
+    .art-header-text { position: relative; z-index: 1; }
+    .art-header-text h1 {
+        margin: 0;
+        color: #ffffff;
+        font-size: 1.45rem;
+        font-weight: 800;
+        letter-spacing: -0.2px;
+        line-height: 1.25;
+        text-shadow: 0 1px 3px rgba(0,0,0,0.15);
+    }
+    .art-header-text p {
+        margin: 3px 0 0;
+        color: rgba(255,255,255,0.78);
+        font-size: 0.76rem;
+        font-weight: 600;
+        letter-spacing: 0.8px;
+        text-transform: uppercase;
+    }
+    @keyframes art-risein {
+        from { opacity: 0; transform: translateY(-6px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ===== FILTER BAR ===== */
+    .filter-bar-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 10px 16px 6px;
+        margin-bottom: 10px;
+        box-shadow: var(--shadow-sm);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .filter-bar-label {
+        font-size: 0.72rem;
+        font-weight: 700;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.7px;
+        white-space: nowrap;
+        padding-right: 8px;
+        border-right: 2px solid var(--border);
+        margin-right: 4px;
+    }
+
+    /* ===== TABS ===== */
+    div[data-testid="stTabs"] [role="tablist"] {
+        background: var(--surface) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 12px !important;
+        padding: 4px 5px !important;
+        gap: 3px !important;
+        box-shadow: var(--shadow-sm) !important;
+        margin-bottom: 2px !important;
+    }
+    div[data-testid="stTabs"] button[data-baseweb="tab"] {
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        font-size: 0.80rem !important;
+        padding: 7px 13px !important;
+        color: var(--text-sec) !important;
+        border: none !important;
+        transition: all 0.16s ease !important;
+        background: transparent !important;
+        white-space: nowrap !important;
+    }
+    div[data-testid="stTabs"] button[data-baseweb="tab"]:hover:not([aria-selected="true"]) {
+        background: #eef4fb !important;
+        color: var(--blue) !important;
+    }
+    div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] {
+        background: linear-gradient(120deg, var(--navy) 0%, var(--blue) 100%) !important;
+        color: #ffffff !important;
+        box-shadow: 0 3px 10px rgba(27,108,168,0.38) !important;
+    }
+    div[data-testid="stTabs"] button[data-baseweb="tab"] p {
+        font-weight: inherit !important;
+        font-size: inherit !important;
+        color: inherit !important;
+    }
+    div[data-testid="stTabs"] [role="tablist"] > div[role="presentation"] {
+        display: none !important;
+    }
+
+    /* ===== METRIC CARDS ===== */
+    div[data-testid="stMetric"] {
+        background: var(--surface) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: var(--radius) !important;
+        padding: 12px 16px !important;
+        box-shadow: var(--shadow-sm) !important;
+        transition: box-shadow 0.18s ease, transform 0.18s ease !important;
+    }
+    div[data-testid="stMetric"]:hover {
+        box-shadow: var(--shadow) !important;
+        transform: translateY(-1px);
+    }
+    div[data-testid="stMetricLabel"] p,
+    div[data-testid="stMetricLabel"] {
+        font-size: 0.72rem !important;
+        font-weight: 700 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.7px !important;
+        color: var(--text-muted) !important;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.45rem !important;
+        font-weight: 800 !important;
+        color: var(--text) !important;
+        line-height: 1.2 !important;
+    }
+    div[data-testid="stMetricDelta"] { font-size: 0.78rem !important; }
+
+    /* ===== BUTTONS ===== */
+    .stButton > button {
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        font-size: 0.86rem !important;
+        padding: 7px 18px !important;
+        transition: all 0.16s ease !important;
+        box-shadow: var(--shadow-sm) !important;
+        letter-spacing: 0.1px !important;
+    }
+    .stButton > button:not([kind="secondary"]):not([kind="tertiary"]) {
+        background: linear-gradient(120deg, var(--navy) 0%, var(--blue) 100%) !important;
+        color: #ffffff !important;
+        border: 1.5px solid var(--blue) !important;
+    }
+    .stButton > button:not([kind="secondary"]):not([kind="tertiary"]):hover {
+        box-shadow: 0 4px 14px rgba(27,108,168,0.42) !important;
+        transform: translateY(-1px);
+    }
+    .stButton > button[kind="secondary"] {
+        background: var(--surface) !important;
+        color: var(--blue) !important;
+        border: 1.5px solid var(--border) !important;
+    }
+    .stButton > button[kind="secondary"]:hover {
+        border-color: var(--blue) !important;
+        background: #eef4fb !important;
+    }
+
+    /* ===== FORM INPUTS ===== */
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stNumberInput"] input,
+    div[data-testid="stDateInput"] input,
+    div[data-testid="stTextArea"] textarea {
+        border-radius: 8px !important;
+        border-color: var(--border) !important;
+        font-size: 0.88rem !important;
+        background: var(--surface) !important;
+        transition: border-color 0.15s, box-shadow 0.15s !important;
+    }
+    div[data-testid="stTextInput"] input:focus,
+    div[data-testid="stNumberInput"] input:focus,
+    div[data-testid="stTextArea"] textarea:focus {
+        border-color: var(--blue) !important;
+        box-shadow: 0 0 0 2.5px rgba(27,108,168,0.16) !important;
+    }
+    div[data-testid="stSelectbox"] > div > div {
+        border-radius: 8px !important;
+        border-color: var(--border) !important;
+        font-size: 0.88rem !important;
+    }
+
+    /* ===== INPUT LABELS ===== */
+    div[data-testid="stTextInput"] label,
+    div[data-testid="stNumberInput"] label,
+    div[data-testid="stSelectbox"] label,
+    div[data-testid="stDateInput"] label,
+    div[data-testid="stTextArea"] label,
+    div[data-testid="stCheckbox"] label {
+        font-size: 0.78rem !important;
+        font-weight: 600 !important;
+        color: var(--text-sec) !important;
+        letter-spacing: 0.1px !important;
+    }
+
+    /* ===== EXPANDERS ===== */
+    div[data-testid="stExpander"] details {
+        border: 1px solid var(--border) !important;
+        border-radius: var(--radius) !important;
+        background: var(--surface) !important;
+        box-shadow: var(--shadow-sm) !important;
+        overflow: hidden !important;
+    }
+    div[data-testid="stExpander"] summary {
+        font-weight: 600 !important;
+        color: var(--text-sec) !important;
+        padding: 10px 14px !important;
+        font-size: 0.88rem !important;
+    }
+    div[data-testid="stExpander"] details[open] summary {
+        color: var(--blue) !important;
+        border-bottom: 1px solid var(--border);
+        background: #f7fbff;
+    }
+
+    /* ===== SECTION HEADERS ===== */
+    h2 { color: var(--navy) !important; font-weight: 700 !important; font-size: 1.15rem !important; }
+    h3 { color: var(--navy) !important; font-weight: 600 !important; font-size: 1.00rem !important; }
+
+    /* ===== DATAFRAMES ===== */
+    div[data-testid="stDataFrame"],
+    div[data-testid="stTable"] {
+        border: 1px solid var(--border) !important;
+        border-radius: var(--radius) !important;
+        overflow: hidden !important;
+        box-shadow: var(--shadow-sm) !important;
+    }
+
+    /* ===== ALERTS ===== */
+    div[data-testid="stSuccess"]  { border-radius: 10px !important; border-left: 4px solid var(--success) !important; }
+    div[data-testid="stWarning"]  { border-radius: 10px !important; border-left: 4px solid var(--warning) !important; }
+    div[data-testid="stError"]    { border-radius: 10px !important; border-left: 4px solid var(--danger)  !important; }
+    div[data-testid="stInfo"]     { border-radius: 10px !important; border-left: 4px solid var(--blue)    !important; }
+
+    /* ===== CAPTION ===== */
+    div[data-testid="stCaptionContainer"] p,
+    small, .caption { color: var(--text-muted) !important; font-size: 0.76rem !important; }
+
+    /* ===== DIVIDER ===== */
+    hr { border-color: var(--border) !important; margin: 10px 0 !important; }
+
+    /* ===== SCROLLBAR ===== */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #eef4fb; border-radius: 99px; }
+    ::-webkit-scrollbar-thumb { background: #b0c8df; border-radius: 99px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--blue); }
+
+    /* ===== CHECKBOX & RADIO ===== */
+    div[data-testid="stCheckbox"] input:checked + div { border-color: var(--blue) !important; background: var(--blue) !important; }
+
+    /* ===== MOBILE RESPONSIVE ===== */
     @media (max-width: 900px) {
         .main .block-container {
-            padding-top: 0.6rem;
-            padding-bottom: 0.8rem;
-            padding-left: 0.55rem;
-            padding-right: 0.55rem;
+            padding-top: 0.5rem !important;
+            padding-bottom: 0.8rem !important;
+            padding-left: 0.5rem !important;
+            padding-right: 0.5rem !important;
         }
-        div[data-testid="stAppViewContainer"] {
-            overflow-x: hidden;
-        }
+        .art-header { padding: 11px 14px; gap: 10px; }
+        .art-header-icon { font-size: 1.8rem; }
+        .art-header-text h1 { font-size: 1.05rem; }
+        .art-header-text p { font-size: 0.68rem; }
+        div[data-testid="stAppViewContainer"] { overflow-x: hidden; }
         div[data-testid="stHorizontalBlock"] {
-            gap: 0.45rem !important;
+            gap: 0.4rem !important;
             flex-wrap: wrap;
         }
         div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
@@ -1110,60 +1429,62 @@ st.markdown(
             flex: 1 1 100% !important;
         }
         div[data-testid="stTabs"] [role="tablist"] {
-            display: flex;
             flex-wrap: wrap !important;
-            overflow: visible;
-            gap: 0.3rem;
-            padding-bottom: 0.2rem;
+            overflow: visible !important;
+            gap: 0.3rem !important;
         }
         div[data-testid="stTabs"] button[data-baseweb="tab"] {
             white-space: normal !important;
-            min-height: 2rem;
-            padding: 0.3rem 0.5rem;
-            border-radius: 0.6rem;
-            flex: 1 1 48%;
+            min-height: 2rem !important;
+            padding: 0.3rem 0.5rem !important;
+            flex: 1 1 46% !important;
         }
         div[data-testid="stTabs"] button[data-baseweb="tab"] p {
             white-space: normal !important;
-            font-size: 0.76rem;
-            line-height: 1.2;
-            text-align: center;
+            font-size: 0.73rem !important;
+            line-height: 1.2 !important;
+            text-align: center !important;
         }
-        div[data-testid="stMetric"] {
-            padding: 0.45rem 0.5rem;
-        }
-        div[data-testid="stMetric"] label,
-        div[data-testid="stMetric"] div {
-            word-break: break-word;
-        }
-        div[data-testid="stMetricValue"] {
-            font-size: 1.2rem;
-            line-height: 1.2;
-        }
-        .stButton > button {
-            width: 100%;
-        }
-        input, select, textarea {
-            font-size: 16px !important;
-        }
+        div[data-testid="stMetric"] { padding: 8px 10px !important; }
+        div[data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+        .stButton > button { width: 100% !important; }
+        input, select, textarea { font-size: 16px !important; }
         div[data-testid="stDataFrame"],
-        div[data-testid="stTable"] {
-            overflow-x: auto;
-        }
+        div[data-testid="stTable"] { overflow-x: auto !important; }
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+st.markdown(
+    """
+    <div class="art-header">
+        <div class="art-header-icon">🚛</div>
+        <div class="art-header-text">
+            <h1>ART Amaral Rota Transportes</h1>
+            <p>Sistema de Gestão Operacional &nbsp;·&nbsp; Viagens &amp; Financeiro</p>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    '<div style="background:#fff;border:1px solid #cfdce9;border-radius:12px;padding:4px 14px 2px;'
+    'margin-bottom:8px;box-shadow:0 1px 3px rgba(11,60,93,0.07);">'
+    '<span style="font-size:0.70rem;font-weight:700;color:#627d98;text-transform:uppercase;'
+    'letter-spacing:0.8px;">⚙️&nbsp; Filtros Globais</span></div>',
+    unsafe_allow_html=True,
+)
 c_f1, c_f2, c_f3 = st.columns(3)
 if "filtro_ini_top" not in st.session_state:
     st.session_state.filtro_ini_top = data_ini_carregar
 if "filtro_fim_top" not in st.session_state:
     st.session_state.filtro_fim_top = data_fim_carregar
 
-c_f1.date_input("Início", format="DD/MM/YYYY", key="filtro_ini_top")
-c_f2.date_input("Fim", format="DD/MM/YYYY", key="filtro_fim_top")
+c_f1.date_input("Período — Início", format="DD/MM/YYYY", key="filtro_ini_top")
+c_f2.date_input("Período — Fim", format="DD/MM/YYYY", key="filtro_fim_top")
 opcoes_filtro_placa = ["Todas as placas"] + apenas_placas
 placa_default_param = str(p.get("filtro_placa_default") or "Todas as placas").strip()
 if placa_default_param not in opcoes_filtro_placa:
@@ -1175,7 +1496,7 @@ if "filtro_placa_top" not in st.session_state:
     st.session_state.filtro_placa_top = placa_default_param
 if st.session_state.filtro_placa_top not in opcoes_filtro_placa:
     st.session_state.filtro_placa_top = placa_default_param
-c_f3.selectbox("Placa (Cálculos)", opcoes_filtro_placa, key="filtro_placa_top", format_func=rotulo_placa_com_descricao)
+c_f3.selectbox("Filtrar por Placa", opcoes_filtro_placa, key="filtro_placa_top", format_func=rotulo_placa_com_descricao)
 filtro_ini = st.session_state.filtro_ini_top
 filtro_fim = st.session_state.filtro_fim_top
 placa_filtro_calculo = (
@@ -1184,7 +1505,7 @@ placa_filtro_calculo = (
     else None
 )
 if placa_filtro_calculo:
-    st.caption(f"Filtro de cálculos por placa ativo: `{rotulo_placa_com_descricao(placa_filtro_calculo)}`")
+    st.info(f"**Filtro por placa ativo:** {rotulo_placa_com_descricao(placa_filtro_calculo)}", icon="🚛")
 
 def fator_rateio_mensal_por_periodo(data_inicio, data_fim):
     if data_inicio is None or data_fim is None or data_fim < data_inicio:
@@ -1266,12 +1587,15 @@ def aplicar_parametros_por_data(df_origem, col_data="data"):
         right_on="vigencia_data",
         direction="backward",
     )
+    _cols_drop_geral = []
     for campo in PARAM_CAMPOS_HIST:
         df_geral[f"geral_{campo}"] = pd.to_numeric(df_geral.get(f"hist_{campo}", 0.0), errors="coerce").fillna(float(p.get(campo, 0.0) or 0.0))
         if f"hist_{campo}" in df_geral.columns:
-            df_geral = df_geral.drop(columns=[f"hist_{campo}"])
+            _cols_drop_geral.append(f"hist_{campo}")
     if "vigencia_data" in df_geral.columns:
-        df_geral = df_geral.drop(columns=["vigencia_data"])
+        _cols_drop_geral.append("vigencia_data")
+    if _cols_drop_geral:
+        df_geral = df_geral.drop(columns=_cols_drop_geral)
 
     hist_placa = hist_merge[hist_merge["veiculo_placa"] != "GERAL"].rename(columns={"veiculo_placa": "_placa_param"}).sort_values(["_placa_param", "vigencia_data"])
     if not hist_placa.empty:
@@ -1293,14 +1617,17 @@ def aplicar_parametros_por_data(df_origem, col_data="data"):
         df_saida = pd.concat(partes_placa, ignore_index=True) if partes_placa else df_geral
     else:
         df_saida = df_geral
+    _cols_drop_saida = []
     for campo in PARAM_CAMPOS_HIST:
         df_saida[f"param_{campo}"] = pd.to_numeric(df_saida.get(f"hist_{campo}", pd.NA), errors="coerce")
         df_saida[f"param_{campo}"] = df_saida[f"param_{campo}"].fillna(pd.to_numeric(df_saida.get(f"geral_{campo}", 0.0), errors="coerce"))
         df_saida[f"param_{campo}"] = df_saida[f"param_{campo}"].fillna(float(p.get(campo, 0.0) or 0.0))
         if f"hist_{campo}" in df_saida.columns:
-            df_saida = df_saida.drop(columns=[f"hist_{campo}"])
+            _cols_drop_saida.append(f"hist_{campo}")
         if f"geral_{campo}" in df_saida.columns:
-            df_saida = df_saida.drop(columns=[f"geral_{campo}"])
+            _cols_drop_saida.append(f"geral_{campo}")
+    if _cols_drop_saida:
+        df_saida = df_saida.drop(columns=_cols_drop_saida)
     if "vigencia_data" in df_saida.columns:
         df_saida = df_saida.drop(columns=["vigencia_data"])
     if "_data_ref_param" in df_saida.columns:
@@ -1399,11 +1726,10 @@ if not st.session_state.popup_vencido_exibido:
             )
 
         if not df_alerta_ml.empty:
-            df_alerta_ml["data_vencimento"] = pd.to_datetime(df_alerta_ml["data_vencimento"], errors="coerce").dt.date
+            _dv_ts = pd.to_datetime(df_alerta_ml["data_vencimento"], errors="coerce")
+            df_alerta_ml["dias_para_vencer"] = (_dv_ts - pd.Timestamp(hoje_ml)).dt.days
+            df_alerta_ml["data_vencimento"] = _dv_ts.dt.date
             df_alerta_ml["dias_alerta"] = pd.to_numeric(df_alerta_ml["dias_alerta"], errors="coerce").fillna(30).astype(int)
-            df_alerta_ml["dias_para_vencer"] = df_alerta_ml["data_vencimento"].apply(
-                lambda d: (d - hoje_ml).days if pd.notna(d) else None
-            )
             df_alerta_ml = df_alerta_ml[
                 df_alerta_ml["dias_para_vencer"].notna()
                 & (
@@ -1414,17 +1740,14 @@ if not st.session_state.popup_vencido_exibido:
                     )
                 )
             ].copy()
-            df_alerta_ml["status"] = df_alerta_ml.apply(
-                lambda r: "Vencido" if int(r["dias_para_vencer"]) < 0 else f"Vence em até {int(r['dias_alerta'])} dias",
-                axis=1,
-            )
-            df_alerta_ml["situacao_popup"] = df_alerta_ml.apply(
-                lambda r: (
-                    f"Vencido há {abs(int(r['dias_para_vencer']))} dia(s)"
-                    if int(r["dias_para_vencer"]) < 0
-                    else ("Vence hoje" if int(r["dias_para_vencer"]) == 0 else f"Faltam {int(r['dias_para_vencer'])} dia(s) para vencer")
-                ),
-                axis=1,
+            _dpv = df_alerta_ml["dias_para_vencer"].astype(int)
+            df_alerta_ml["status"] = (
+                "Vence em até " + df_alerta_ml["dias_alerta"].astype(str) + " dias"
+            ).where(_dpv >= 0, "Vencido")
+            df_alerta_ml["situacao_popup"] = pd.Series(
+                ["Vencido há " + str(abs(d)) + " dia(s)" if d < 0 else ("Vence hoje" if d == 0 else "Faltam " + str(d) + " dia(s) para vencer")
+                 for d in _dpv],
+                index=df_alerta_ml.index,
             )
             df_alerta_ml["descricao_veiculo"] = df_alerta_ml["descricao_veiculo"].fillna("").astype(str)
             qtd_vencidos_ml = int((df_alerta_ml["dias_para_vencer"] < 0).sum())
@@ -1474,9 +1797,9 @@ if not st.session_state.popup_vencido_exibido:
                         },
                     )
                     if st.button("OK, ENTENDI", type="primary", use_container_width=True):
-                        st.session_state.popup_vencido_exibido = True
                         st.rerun()
 
+                st.session_state.popup_vencido_exibido = True
                 popup_alerta_ml()
             else:
                 itens_txt = []
@@ -1603,9 +1926,9 @@ if not st.session_state.popup_trocas_exibido:
                         },
                     )
                     if st.button("OK, ENTENDI", type="primary", use_container_width=True, key="btn_ok_popup_trocas"):
-                        st.session_state.popup_trocas_exibido = True
                         st.rerun()
 
+                st.session_state.popup_trocas_exibido = True
                 popup_alerta_trocas()
             else:
                 itens_trocas_txt = []
@@ -1625,7 +1948,7 @@ if not st.session_state.popup_trocas_exibido:
         else:
             st.session_state.popup_trocas_exibido = True
     except Exception:
-        st.session_state.popup_trocas_exibido = False
+        st.session_state.popup_trocas_exibido = True
 
 # Alerta em popup ao abrir o sistema para vencimentos na aba CONTAS A PAGAR
 if not st.session_state.popup_cp_exibido:
@@ -1840,9 +2163,9 @@ if not st.session_state.popup_cp_exibido:
                         },
                     )
                     if st.button("OK, ENTENDI", type="primary", use_container_width=True, key="btn_ok_popup_cp"):
-                        st.session_state.popup_cp_exibido = True
                         st.rerun()
 
+                st.session_state.popup_cp_exibido = True
                 popup_alerta_cp()
             else:
                 itens_cp_txt = []
@@ -1903,11 +2226,12 @@ if not df_db.empty:
 # =========================
 # DEFINIÇÃO DAS ABAS
 # =========================
-aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14, aba17, aba18, aba20 = st.tabs([
+aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14, aba17, aba_cr, aba18, aba20, aba_calc = st.tabs([
     "🏠 Dashboard Executivo",
     "📌 Movimento Viagens", "📋 Viagens Executadas", "📊 Análise", "🛠️ Manutenção", "🗂️ Cadastro",
     "📑 Relatório", "⛽ Abastecimento", "🎯 Metas", "🛢️ Trocas",
-    "💵 Frete Líquido no Período", "🧾 Contas a Pagar", "🔔 ME LEMBRA", "📝 Anotações"
+    "💵 Frete Líquido no Período", "🧾 Contas a Pagar", "💰 Contas a Receber", "🔔 ME LEMBRA", "📝 Anotações",
+    "🧮 Cálculo Rápido"
 ])
 
 with aba_cadastro:
@@ -2871,12 +3195,12 @@ with aba2:
             df_rotas_ref_exec["origem"] = df_rotas_ref_exec["origem"].fillna("").astype(str).str.strip().str.upper()
             df_rotas_ref_exec["destino"] = df_rotas_ref_exec["destino"].fillna("").astype(str).str.strip().str.upper()
             df_rotas_ref_exec["valor_ton"] = pd.to_numeric(df_rotas_ref_exec["valor_ton"], errors="coerce").fillna(0.0)
-            for _, r_rota in df_rotas_ref_exec.iterrows():
-                chave_ida = (r_rota["origem"], r_rota["destino"])
-                chave_volta = (r_rota["destino"], r_rota["origem"])
-                mapa_valor_ton_exec[chave_ida] = float(r_rota["valor_ton"])
-                if chave_volta not in mapa_valor_ton_exec:
-                    mapa_valor_ton_exec[chave_volta] = float(r_rota["valor_ton"])
+            mapa_valor_ton_exec = dict(
+                zip(zip(df_rotas_ref_exec["origem"], df_rotas_ref_exec["destino"]), df_rotas_ref_exec["valor_ton"])
+            )
+            for (o, d), v in list(mapa_valor_ton_exec.items()):
+                if (d, o) not in mapa_valor_ton_exec:
+                    mapa_valor_ton_exec[(d, o)] = v
 
         def buscar_valor_ton_rota_exec(origem, destino):
             chave = (str(origem or "").strip().upper(), str(destino or "").strip().upper())
@@ -3573,15 +3897,15 @@ with aba2:
                         if chave_rota_inversa not in mapa_empresas_rota_hist or not any(mapa_empresas_rota_hist[chave_rota_inversa]):
                             mapa_empresas_rota_hist[chave_rota_inversa] = (nome_destino_rota, nome_origem_rota)
 
-                total_frete_periodo = float(pd.to_numeric(df_ed["Total Frete Valor"], errors="coerce").fillna(0.0).sum())
+                total_frete_periodo = float(pd.to_numeric(df_exibir["Total Frete Valor"], errors="coerce").fillna(0.0).sum())
                 total_frete_periodo += frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
-                if "qtd_viagens" in df_ed.columns:
-                    qtd_imp = pd.to_numeric(df_ed["qtd_viagens"], errors="coerce").fillna(1.0)
+                if "qtd_viagens" in df_exibir.columns:
+                    qtd_imp = pd.to_numeric(df_exibir["qtd_viagens"], errors="coerce").fillna(1.0)
                     qtd_imp = qtd_imp.apply(lambda x: max(1, int(round(float(x)))))
                 else:
-                    qtd_imp = pd.Series(1, index=df_ed.index, dtype=int)
-                total_gasto_extra_periodo = float((pd.to_numeric(df_ed["gasto_extra"], errors="coerce").fillna(0.0) * qtd_imp).sum())
-                total_estadia_periodo = float((pd.to_numeric(df_ed["pagto_estadia"], errors="coerce").fillna(0.0) * qtd_imp).sum())
+                    qtd_imp = pd.Series(1, index=df_exibir.index, dtype=int)
+                total_gasto_extra_periodo = float((pd.to_numeric(df_exibir["gasto_extra"], errors="coerce").fillna(0.0) * qtd_imp).sum())
+                total_estadia_periodo = float((pd.to_numeric(df_exibir["pagto_estadia"], errors="coerce").fillna(0.0) * qtd_imp).sum())
                 html_hist = f"""
                 <html>
                 <head>
@@ -3623,21 +3947,26 @@ with aba2:
                         <tbody>
                 """
 
+                df_ed["_data_br"] = pd.to_datetime(df_ed["data"], errors="coerce").dt.strftime('%d/%m/%Y').fillna("-")
+                df_ed["_peso_kg"] = pd.to_numeric(df_ed["peso_kg"], errors="coerce").fillna(0.0)
+                df_ed["_valor_ton"] = pd.to_numeric(df_ed["valor_ton"], errors="coerce").fillna(0.0)
+                df_ed["_total_frete"] = pd.to_numeric(df_exibir["Total Frete Valor"], errors="coerce").fillna(0.0)
+                df_ed["_gasto_extra"] = pd.to_numeric(df_exibir["gasto_extra"], errors="coerce").fillna(0.0)
+                df_ed["_pagto_estadia"] = pd.to_numeric(df_exibir["pagto_estadia"], errors="coerce").fillna(0.0)
                 for _, r in df_ed.iterrows():
-                    dt = pd.to_datetime(r["data"], errors="coerce")
-                    data_br = dt.strftime('%d/%m/%Y') if pd.notna(dt) else "-"
+                    data_br = r["_data_br"]
                     nf = str(r["nf"]).strip() if pd.notna(r["nf"]) and str(r["nf"]).strip() else "-"
                     origem = str(r["origem"]).strip() if pd.notna(r["origem"]) else "-"
                     destino = str(r["destino"]).strip() if pd.notna(r["destino"]) else "-"
                     origem_key = origem.strip().upper() if origem != "-" else ""
                     destino_key = destino.strip().upper() if destino != "-" else ""
                     nome_empresa_origem, nome_empresa_destino = mapa_empresas_rota_hist.get((origem_key, destino_key), ("", ""))
-                    peso_kg = float(pd.to_numeric(r["peso_kg"], errors="coerce")) if pd.notna(pd.to_numeric(r["peso_kg"], errors="coerce")) else 0.0
-                    valor_ton = float(pd.to_numeric(r["valor_ton"], errors="coerce")) if pd.notna(pd.to_numeric(r["valor_ton"], errors="coerce")) else 0.0
+                    peso_kg = r["_peso_kg"]
+                    valor_ton = r["_valor_ton"]
                     placa = str(r["veiculo_placa"]).strip() if pd.notna(r["veiculo_placa"]) else "-"
-                    total_frete = float(pd.to_numeric(r["Total Frete Valor"], errors="coerce")) if pd.notna(pd.to_numeric(r["Total Frete Valor"], errors="coerce")) else 0.0
-                    gasto_extra = float(pd.to_numeric(r["gasto_extra"], errors="coerce")) if pd.notna(pd.to_numeric(r["gasto_extra"], errors="coerce")) else 0.0
-                    pagto_estadia = float(pd.to_numeric(r["pagto_estadia"], errors="coerce")) if pd.notna(pd.to_numeric(r["pagto_estadia"], errors="coerce")) else 0.0
+                    total_frete = r["_total_frete"]
+                    gasto_extra = r["_gasto_extra"]
+                    pagto_estadia = r["_pagto_estadia"]
                     desc_gasto_extra = str(r["descricao_gasto_extra"]).strip() if pd.notna(r["descricao_gasto_extra"]) and str(r["descricao_gasto_extra"]).strip() else "-"
                     html_hist += f"""
                         <tr>
@@ -5298,9 +5627,9 @@ with aba8:
             # Loop das linhas da tabela
             for i_rel, r in df_db.iterrows():
                 qtd_linha = int(qtd_rel.loc[i_rel]) if i_rel in qtd_rel.index else 1
-                pagto_estadia_linha = pd.to_numeric(pd.Series([r.get("pagto_estadia", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
-                adicional_frete_linha = pd.to_numeric(pd.Series([r.get("valor_adicional_frete", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
-                frete_base_linha = pd.to_numeric(pd.Series([r.get("Total Frete", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+                pagto_estadia_linha = float(r.get("pagto_estadia") or 0.0)
+                adicional_frete_linha = float(r.get("valor_adicional_frete") or 0.0)
+                frete_base_linha = float(r.get("Total Frete") or 0.0)
                 total_frete_linha = float((frete_base_linha + pagto_estadia_linha + adicional_frete_linha) * qtd_linha)
                 html += f"""
                 <tr>
@@ -5501,26 +5830,22 @@ with aba9:
                 km_final_periodo = float(df_km_valido.iloc[-1]["km_inicial"])
                 distancia_total = km_final_periodo - km_inicial_periodo
 
-                # Referência para média de consumo: 2 últimos KMs diferentes em ordem cronológica.
-                km_final_media = None
-                km_anterior = None
-                for km_lido in reversed(df_km_valido["km_inicial"].tolist()):
-                    km_atual = float(km_lido)
-                    if km_final_media is None:
-                        km_final_media = km_atual
-                    elif km_atual != km_final_media:
-                        km_anterior = km_atual
-                        break
-                tem_base_media = (km_final_media is not None) and (km_anterior is not None)
-                distancia_media_ref = (km_final_media - km_anterior) if tem_base_media else 0.0
+                def calcular_media_por_tipo(df, termo_tipo):
+                    df_tipo = df[df["tipo_combustivel"].str.contains(termo_tipo, na=False)].copy()
+                    kms_validos = sorted(df_tipo["km_inicial"].dropna().unique().tolist(), reverse=True)
+                    if len(kms_validos) < 2:
+                        return 0.0
+                    km_final = float(kms_validos[0])
+                    km_anterior = float(kms_validos[1])
+                    ultimo = df_tipo[df_tipo["km_inicial"] == km_final].iloc[-1]
+                    litros_final = float(ultimo["qtde_litros"])
+                    return (km_final - km_anterior) / litros_final if litros_final > 0 and km_final > km_anterior else 0.0
 
-                df_ultimo_km_media = df_km_valido[df_km_valido["km_inicial"] == km_final_media].copy() if tem_base_media else pd.DataFrame(columns=df_km_valido.columns)
-                df_diesel = df_ultimo_km_media[df_ultimo_km_media['tipo_combustivel'].str.contains("DIESEL", na=False)]
-                df_arla = df_ultimo_km_media[df_ultimo_km_media['tipo_combustivel'].str.contains("ARLA", na=False)]
-
-                # Litros usados para calcular a média (regra do último KM de referência).
-                litros_diesel_ref = df_diesel['qtde_litros'].sum()
-                litros_arla_ref = df_arla['qtde_litros'].sum()
+                media_diesel = calcular_media_por_tipo(df_abs, "DIESEL")
+                media_arla = calcular_media_por_tipo(df_abs, "ARLA")
+                tem_base_media = (media_diesel > 0) or (media_arla > 0)
+                media_diesel_txt = f"{media_diesel:.2f} KM/L" if media_diesel > 0 else "-"
+                media_arla_txt = f"{media_arla:.2f} KM/L" if media_arla > 0 else "-"
 
                 # Totais reais do período filtrado.
                 litros_diesel_periodo = df_abs[df_abs['tipo_combustivel'].str.contains("DIESEL", na=False)]['qtde_litros'].sum()
@@ -5528,12 +5853,6 @@ with aba9:
                 gasto_diesel_periodo = df_abs[df_abs['tipo_combustivel'].str.contains("DIESEL", na=False)]['total_gasto'].sum()
                 gasto_arla_periodo = df_abs[df_abs['tipo_combustivel'].str.contains("ARLA", na=False)]['total_gasto'].sum()
                 investimento_periodo = df_abs['total_gasto'].sum()
-
-                # 3. CÁLCULO DAS MÉDIAS (KM RODADO ENTRE LEITURAS / LITROS DO ABASTECIMENTO FINAL)
-                media_diesel = distancia_media_ref / litros_diesel_ref if litros_diesel_ref > 0 else 0
-                media_arla = distancia_media_ref / litros_arla_ref if litros_arla_ref > 0 else 0
-                media_diesel_txt = f"{media_diesel:.2f} KM/L" if tem_base_media else "-"
-                media_arla_txt = f"{media_arla:.2f} KM/L" if tem_base_media else "-"
 
                 # --- EXIBIÇÃO DAS MÉTRICAS ---
                 c1, c2, c3 = st.columns(3)
@@ -5549,19 +5868,12 @@ with aba9:
                 g1.metric("💵 Gasto com Diesel", brl(gasto_diesel_periodo))
                 g2.metric("💵 Gasto com Arla", brl(gasto_arla_periodo))
 
-                if tem_base_media:
-                    st.info(
-                        f"💡 Distância do período: ({km_final_periodo:,.0f} - {km_inicial_periodo:,.0f}). "
-                        f"Média de consumo: ({km_final_media:,.0f} - {km_anterior:,.0f}) dividido pelos litros do KM final {km_final_media:,.0f}. "
-                        "Os totais de litros e investimento consideram todo o período filtrado."
-                        .replace(",", ".")
-                    )
-                else:
-                    st.info(
-                        f"💡 Distância do período: ({km_final_periodo:,.0f} - {km_inicial_periodo:,.0f}). "
-                        "Média de consumo indisponível: é necessário ter 2 KMs diferentes no período filtrado."
-                        .replace(",", ".")
-                    )
+                st.info(
+                    f"💡 Distância do período: ({km_final_periodo:,.0f} - {km_inicial_periodo:,.0f}). "
+                    "Média de consumo usa os dois últimos abastecimentos do mesmo tipo e os litros do último abastecimento. "
+                    "Os totais de litros e investimento consideram todo o período filtrado."
+                    .replace(",", ".")
+                )
                 st.markdown("---")
             else:
                 st.info("ℹ️ Para calcular a média, é necessário ter pelo menos 2 leituras de KM diferentes no período.")
@@ -7925,1164 +8237,607 @@ with aba21:
 # =========================
 # ABA 17 - CONTAS A PAGAR
 # =========================
-with aba17:
-    st.subheader("🧾 Contas a Pagar")
-    if st.session_state.get("cp_flash_msg"):
-        st.success(st.session_state["cp_flash_msg"])
-        st.session_state["cp_flash_msg"] = None
 
-    def _cp_parse_valor(txt):
-        if txt is None:
-            return 0.0
-        s = str(txt).strip().replace("R$", "").replace(" ", "")
-        if not s:
-            return 0.0
-        if "," in s and "." in s:
-            s = s.replace(".", "").replace(",", ".")
-        elif "," in s:
-            s = s.replace(",", ".")
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
+CATEGORIAS_CP = [
+    "Combustível", "Manutenção", "Pneus", "Pedágio", "Seguro",
+    "IPVA / Licenciamento", "Financiamento / Parcela", "Salários",
+    "Impostos / Taxas", "Aluguel", "Água / Energia", "Telefone / Internet",
+    "Material de Escritório", "Outros",
+]
+FORMAS_PAGAMENTO_CP = ["PIX", "TED / DOC", "Dinheiro", "Cheque", "Boleto", "Débito Automático", "Cartão", "Outros"]
 
-    def _cp_extrair_parcelas(vencimentos_texto):
-        parcelas = []
-        if not vencimentos_texto:
-            return parcelas
-        for idx, item in enumerate(str(vencimentos_texto).split(";")):
-            trecho = item.strip()
-            if not trecho:
-                continue
-            numero = None
-            restante = trecho
-            if ":" in trecho:
-                pref, possivel_restante = trecho.split(":", 1)
-                if pref.strip().isdigit():
-                    numero = int(pref.strip())
-                    restante = possivel_restante
-            data_txt = restante
-            valor_txt = ""
-            if "|" in restante:
-                data_txt, valor_txt = restante.split("|", 1)
-            data_parcela = pd.to_datetime(str(data_txt).strip(), dayfirst=True, errors="coerce")
-            if pd.isna(data_parcela):
-                continue
-            if numero is None:
-                numero = idx + 1
-            parcelas.append(
-                {
-                    "parcela": numero,
-                    "data": data_parcela.date(),
-                    "valor": _cp_parse_valor(valor_txt),
-                }
-            )
-        return parcelas
+CATEGORIAS_CR = ["Frete", "Serviço", "Bonificação", "Aluguel", "Outros"]
+FORMAS_RECEBIMENTO_CR = ["PIX", "TED / DOC", "Dinheiro", "Cheque", "Depósito", "Cartão", "Outros"]
 
-    def _cp_parse_parcelas_pagas_detalhe(parcelas_pagas_texto):
-        pagas = {}
-        if not parcelas_pagas_texto:
-            return pagas
-        for token in str(parcelas_pagas_texto).replace(",", ";").split(";"):
-            t = token.strip()
-            if not t:
-                continue
-            num_txt = t
-            dt_pag = None
-            if "@" in t:
-                num_txt, dt_txt = t.split("@", 1)
-                dt_conv = pd.to_datetime(str(dt_txt).strip(), errors="coerce")
-                dt_pag = dt_conv.date() if pd.notna(dt_conv) else None
-            if str(num_txt).strip().isdigit():
-                pagas[int(str(num_txt).strip())] = dt_pag
-        return pagas
-
-    def _cp_parse_parcelas_pagas(parcelas_pagas_texto):
-        return set(_cp_parse_parcelas_pagas_detalhe(parcelas_pagas_texto).keys())
-
-    def _cp_serializar_parcelas_pagas_detalhe(parcelas_pagas_dict):
-        itens = []
-        for num in sorted({int(k) for k in parcelas_pagas_dict.keys() if int(k) > 0}):
-            dt_pag = parcelas_pagas_dict.get(num)
-            if dt_pag is None:
-                itens.append(str(num))
-            else:
-                itens.append(f"{num}@{pd.to_datetime(dt_pag, errors='coerce').strftime('%Y-%m-%d')}")
-        return ";".join(itens)
-
-    def _cp_serializar_parcelas_pagas(parcelas_pagas):
-        try:
-            nums = sorted({int(x) for x in parcelas_pagas if int(x) > 0})
-        except Exception:
-            nums = []
-        return _cp_serializar_parcelas_pagas_detalhe({n: None for n in nums})
-
-    def _cp_status_pagamento(data_venc, data_pag):
-        venc = pd.to_datetime(data_venc, errors="coerce")
-        pag = pd.to_datetime(data_pag, errors="coerce")
-        if pd.isna(venc) or pd.isna(pag):
-            return "-"
-        vd = venc.date()
-        pdg = pag.date()
-        if pdg < vd:
-            return "Antecipado"
-        if pdg == vd:
-            return "No vencimento"
-        return "Atrasado"
-
-    def _cp_competencia_ref(data_ref):
-        dt = pd.to_datetime(data_ref, errors="coerce")
-        if pd.isna(dt):
-            return ""
-        return dt.strftime("%Y-%m")
-
-    def _cp_proximo_vencimento_mensal(hoje_ref, dia_venc, data_base=None):
-        data_base_dt = pd.to_datetime(data_base, errors="coerce")
-        if pd.notna(data_base_dt):
-            data_base_date = data_base_dt.date()
-            if data_base_date >= hoje_ref:
-                return data_base_date
-            dia_ref = int(data_base_date.day)
-        else:
-            dia_ref = int(dia_venc or 1)
-
-        dia = max(1, min(31, dia_ref))
-        ano = hoje_ref.year
-        mes = hoje_ref.month
-        dias_mes = int(pd.Period(f"{ano}-{mes:02d}").days_in_month)
-        venc_atual = date(ano, mes, min(dia, dias_mes))
-        if venc_atual < hoje_ref:
-            if mes == 12:
-                ano += 1
-                mes = 1
-            else:
-                mes += 1
-            dias_mes = int(pd.Period(f"{ano}-{mes:02d}").days_in_month)
-            venc_atual = date(ano, mes, min(dia, dias_mes))
-        return venc_atual
-
-    def _cp_distribuir_valor(total, qtd):
-        qtd_ok = max(1, int(qtd or 1))
-        total_ok = float(total or 0.0)
-        base = round(total_ok / qtd_ok, 2)
-        valores = [base for _ in range(qtd_ok)]
-        ajuste = round(total_ok - sum(valores), 2)
-        valores[-1] = round(valores[-1] + ajuste, 2)
-        return valores
-
-    def _cp_montar_alertas(df_base):
-        alertas = []
-        hoje_ref = date.today()
-        for _, r in df_base.iterrows():
-            tipo = str(r.get("tipo_lancamento") or "NAO_MENSAL")
-            dias_alerta = int(r.get("dias_alerta") or 7)
-            dias_alerta = max(0, dias_alerta)
-            fornecedor = str(r.get("fornecedor") or "-")
-            obrigacao = str(r.get("descricao_obrigacao") or "-")
-            nf_ref = str(r.get("n_nf") or "-")
-
-            if tipo == "MENSAL_FIXO":
-                prox = _cp_proximo_vencimento_mensal(
-                    hoje_ref,
-                    r.get("dia_vencimento_mensal"),
-                    r.get("data_vencimento_base"),
-                )
-                comp_prox = _cp_competencia_ref(prox)
-                comp_paga = str(r.get("competencia_paga_mensal") or "").strip()
-                if comp_paga == comp_prox:
-                    continue
-                dias = (prox - hoje_ref).days
-                if 0 <= dias <= dias_alerta:
-                    alertas.append(
-                        {
-                            "ID": int(r["id"]),
-                            "Tipo": "Mensal Fixa",
-                            "Fornecedor": fornecedor,
-                            "Obrigação": obrigacao,
-                            "NF": nf_ref,
-                            "Parcela": "-",
-                            "Vencimento": prox,
-                            "Dias": dias,
-                            "Valor (R$)": float(r.get("valor_parcela") or r.get("valor_total_nf") or 0.0),
-                            "Situação": "Vence hoje" if dias == 0 else f"Vence em {dias} dia(s)",
-                        }
-                    )
-                continue
-
-            parcelas = _cp_extrair_parcelas(r.get("vencimentos_parcelas"))
-            parcelas_pagas = _cp_parse_parcelas_pagas(r.get("parcelas_pagas"))
-            for p_item in parcelas:
-                parcela_num = int(p_item["parcela"]) if p_item["parcela"] is not None else None
-                if parcela_num is not None and parcela_num in parcelas_pagas:
-                    continue
-                dias = (p_item["data"] - hoje_ref).days
-                if 0 <= dias <= dias_alerta:
-                    alertas.append(
-                        {
-                            "ID": int(r["id"]),
-                            "Tipo": "Não mensal",
-                            "Fornecedor": fornecedor,
-                            "Obrigação": obrigacao,
-                            "NF": nf_ref,
-                            "Parcela": parcela_num if parcela_num is not None else "-",
-                            "Vencimento": p_item["data"],
-                            "Dias": dias,
-                            "Valor (R$)": float(p_item["valor"] or r.get("valor_parcela") or 0.0),
-                            "Situação": "Vence hoje" if dias == 0 else f"Vence em {dias} dia(s)",
-                        }
-                    )
-        if not alertas:
-            return pd.DataFrame()
-        df_alertas = pd.DataFrame(alertas).sort_values(by=["Dias", "Vencimento", "ID"], ascending=[True, True, True]).reset_index(drop=True)
-        return df_alertas
-
-    def _cp_proximo_vencimento_grade(row):
-        tipo = str(row.get("tipo_lancamento") or "NAO_MENSAL")
-        if tipo == "MENSAL_FIXO":
-            return _cp_proximo_vencimento_mensal(
-                date.today(),
-                row.get("dia_vencimento_mensal"),
-                row.get("data_vencimento_base"),
-            )
-        parcelas = _cp_extrair_parcelas(row.get("vencimentos_parcelas"))
-        if not parcelas:
-            return None
-        parcelas_pagas = _cp_parse_parcelas_pagas(row.get("parcelas_pagas"))
-        hoje_ref = date.today()
-        datas = sorted(
-            [
-                p["data"]
-                for p in parcelas
-                if p.get("data") is not None and int(p.get("parcela") or 0) not in parcelas_pagas
-            ]
+def _add_status_cp(df):
+    hoje = date.today()
+    df = df.copy()
+    df["status"] = "PENDENTE"
+    if df.empty:
+        return df
+    try:
+        mask_pago = df["data_pagamento"].apply(lambda d: d is not None and str(d) not in ("None", "NaT", ""))
+        df.loc[mask_pago, "status"] = "PAGO"
+        mask_venc = ~mask_pago & df["data_vencimento"].apply(
+            lambda d: d is not None and str(d) not in ("None", "NaT", "") and d < hoje
         )
-        if not datas:
-            return None
-        futuras = [d for d in datas if d >= hoje_ref]
-        return futuras[0] if futuras else datas[-1]
+        df.loc[mask_venc, "status"] = "VENCIDO"
+    except Exception:
+        pass
+    return df
 
-    with conn() as c:
-        fornecedores_cp = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
-        obrigacoes_cp = c.execute("SELECT id, descricao_obrigacao FROM obrigacoes ORDER BY descricao_obrigacao ASC").fetchall()
+def _add_status_cr(df):
+    hoje = date.today()
+    df = df.copy()
+    df["status"] = "PENDENTE"
+    if df.empty:
+        return df
+    try:
+        mask_rec = df["data_recebimento"].apply(lambda d: d is not None and str(d) not in ("None", "NaT", ""))
+        df.loc[mask_rec, "status"] = "RECEBIDO"
+        mask_venc = ~mask_rec & df["data_vencimento"].apply(
+            lambda d: d is not None and str(d) not in ("None", "NaT", "") and d < hoje
+        )
+        df.loc[mask_venc, "status"] = "VENCIDO"
+    except Exception:
+        pass
+    return df
 
-    if not fornecedores_cp:
-        st.warning("Cadastre pelo menos um fornecedor na aba Fornecedores.")
-    elif not obrigacoes_cp:
-        st.warning("Cadastre pelo menos uma obrigação na aba Obrigação.")
-    else:
-        mapa_forn = {f"{f['codigo']} - {f['nome']}": f["id"] for f in fornecedores_cp}
-        mapa_obr = {o["descricao_obrigacao"]: o["id"] for o in obrigacoes_cp}
-        with st.expander("➕ Cadastro de Contas a Pagar", expanded=False):
-            st.markdown("##### Dados Principais")
-            p1, p2, p3 = st.columns(3)
-            sel_forn = p1.selectbox("Código Fornecedor", list(mapa_forn.keys()), key="cp_sel_forn")
-            n_nf_cp = p2.text_input("N.NF", key="cp_nf").strip()
-            dt_ent_cp = p3.date_input("Data Entrada", format="DD/MM/YYYY", key="cp_dt_entrada")
-
-            p4, p5, p6 = st.columns(3)
-            valor_total_nf_cp = p4.number_input("Valor Total da NF", min_value=0.0, step=0.01, key="cp_valor_total_nf")
-            sel_obr = p5.selectbox("Obrigação", list(mapa_obr.keys()), key="cp_sel_obrigacao")
-            tipo_label_cp = p6.selectbox(
-                "Tipo de Lançamento",
-                options=["Não mensal (único/parcelado)", "Mensal fixa (todo mês)"],
-                key="cp_tipo_lancamento_sel",
-            )
-            tipo_lancamento_cp = "MENSAL_FIXO" if "Mensal fixa" in tipo_label_cp else "NAO_MENSAL"
-            dados_nf_cp = st.text_input("Dados da NF", key="cp_dados_nf").strip()
-
-            c_cfg1, c_cfg2, c_cfg3 = st.columns(3)
-            dias_alerta_cp = int(c_cfg1.number_input("Avisar com antecedência (dias)", min_value=0, max_value=90, step=1, value=7, key="cp_dias_alerta"))
-            dia_vencimento_mensal_cp = None
-            data_vencimento_base_cp = None
-            qtd_parc_cp = 1
-            if tipo_lancamento_cp == "MENSAL_FIXO":
-                data_vencimento_base_cp = c_cfg2.date_input(
-                    "Data de Vencimento",
-                    value=dt_ent_cp + timedelta(days=30),
-                    format="DD/MM/YYYY",
-                    key="cp_data_vencimento_base",
-                )
-                dia_vencimento_mensal_cp = int(data_vencimento_base_cp.day)
-                c_cfg3.info("Informe a data de vencimento. O sistema usa essa data como referência.")
-            else:
-                qtd_parc_cp = int(c_cfg2.number_input("Quantidade Parcelas", min_value=1, step=1, value=1, key="cp_qtd_parcelas"))
-                c_cfg3.info("Para não mensal, informe as parcelas abaixo.")
-
-            st.markdown("##### Parcelas (Vencimento e Valor)")
-            valor_parcela_base = (float(valor_total_nf_cp) / qtd_parc_cp) if qtd_parc_cp > 0 else 0.0
-            df_parcelas_edit = pd.DataFrame(columns=["Parcela", "Vencimento", "Valor", "Paga", "Data Pagamento"])
-
-            if tipo_lancamento_cp == "NAO_MENSAL":
-                if "cp_parcelas_df" not in st.session_state:
-                    st.session_state.cp_parcelas_df = pd.DataFrame(columns=["Parcela", "Vencimento", "Valor", "Paga", "Data Pagamento"])
-
-                df_parc_state = st.session_state.cp_parcelas_df.copy()
-                if "Paga" not in df_parc_state.columns:
-                    df_parc_state["Paga"] = False
-                    st.session_state.cp_parcelas_df = df_parc_state
-                if "Data Pagamento" not in df_parc_state.columns:
-                    df_parc_state["Data Pagamento"] = pd.NaT
-                    st.session_state.cp_parcelas_df = df_parc_state
-                precisa_regerar = (
-                    df_parc_state.empty
-                    or len(df_parc_state) != qtd_parc_cp
-                    or "cp_qtd_parcelas_prev" not in st.session_state
-                    or st.session_state.get("cp_qtd_parcelas_prev") != qtd_parc_cp
-                )
-
-                if precisa_regerar:
-                    linhas = []
-                    for i in range(qtd_parc_cp):
-                        linhas.append(
-                            {
-                                "Parcela": i + 1,
-                                "Vencimento": dt_ent_cp + timedelta(days=30 * (i + 1)),
-                                "Valor": round(valor_parcela_base, 2),
-                                "Paga": False,
-                                "Data Pagamento": None,
-                            }
-                        )
-                    st.session_state.cp_parcelas_df = pd.DataFrame(linhas)
-                    st.session_state.cp_qtd_parcelas_prev = qtd_parc_cp
-
-                cpar_a, cpar_b = st.columns([1, 1])
-                if cpar_a.button("🔄 Redistribuir Valor Igual", key="cp_btn_redistribuir"):
-                    df_tmp = st.session_state.cp_parcelas_df.copy()
-                    if not df_tmp.empty:
-                        df_tmp["Valor"] = round(valor_parcela_base, 2)
-                        st.session_state.cp_parcelas_df = df_tmp
-                        st.rerun()
-                cpar_b.caption(f"Valor base por parcela: {brl(valor_parcela_base)}")
-
-                df_parcelas_edit = st.data_editor(
-                    st.session_state.cp_parcelas_df,
-                    key="cp_editor_parcelas",
-                    hide_index=True,
-                    use_container_width=True,
-                    num_rows="fixed",
-                    disabled=["Parcela"],
-                    column_config={
-                        "Parcela": st.column_config.NumberColumn("Parcela", format="%d"),
-                        "Vencimento": st.column_config.DateColumn("Data Parcela", format="DD/MM/YYYY"),
-                        "Valor": st.column_config.NumberColumn("Valor Parcela (R$)", format="R$ %.2f", min_value=0.0, step=0.01),
-                        "Paga": st.column_config.CheckboxColumn("Paga", default=False),
-                        "Data Pagamento": st.column_config.DateColumn("Data Pagamento", format="DD/MM/YYYY"),
-                    },
-                )
-                st.session_state.cp_parcelas_df = df_parcelas_edit
-                soma_parcelas = float(pd.to_numeric(df_parcelas_edit["Valor"], errors="coerce").fillna(0.0).sum()) if not df_parcelas_edit.empty else 0.0
-                diferenca = float(valor_total_nf_cp) - soma_parcelas
-                if not df_parcelas_edit.empty:
-                    df_pag_view = df_parcelas_edit.copy()
-                    df_pag_view["Vencimento"] = pd.to_datetime(df_pag_view["Vencimento"], errors="coerce").dt.date
-                    df_pag_view["Data Pagamento"] = pd.to_datetime(df_pag_view.get("Data Pagamento"), errors="coerce").dt.date
-                    df_pag_view = df_pag_view[df_pag_view["Paga"] == True].copy()
-                    if not df_pag_view.empty:
-                        df_pag_view["Status Pagamento"] = df_pag_view.apply(
-                            lambda rr: _cp_status_pagamento(rr.get("Vencimento"), rr.get("Data Pagamento")),
-                            axis=1,
-                        )
-                        st.dataframe(
-                            df_pag_view[["Parcela", "Vencimento", "Data Pagamento", "Status Pagamento"]],
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-            else:
-                st.info("Lançamento mensal fixo: o valor será considerado recorrente todo mês.")
-                soma_parcelas = float(valor_total_nf_cp)
-                diferenca = 0.0
-
-            r1, r2, r3 = st.columns(3)
-            r1.metric("Total NF", brl(valor_total_nf_cp))
-            r2.metric("Soma das Parcelas", brl(soma_parcelas))
-            r3.metric("Diferença", brl(diferenca))
-
-            if st.button("💾 Gravar", type="primary", key="btn_salvar_cp"):
-                if tipo_lancamento_cp == "NAO_MENSAL" and not n_nf_cp:
-                    st.warning("Informe o número da NF.")
-                elif tipo_lancamento_cp == "NAO_MENSAL" and df_parcelas_edit.empty:
-                    st.warning("Informe as parcelas antes de salvar.")
-                elif tipo_lancamento_cp == "MENSAL_FIXO" and float(valor_total_nf_cp) <= 0:
-                    st.warning("Informe o valor mensal para o lançamento fixo.")
-                else:
-                    detalhes_parcelas = ""
-                    parcelas_pagas_salvar = ""
-                    valor_medio_parcela = float(valor_total_nf_cp)
-                    qtd_parcelas_salvar = int(qtd_parc_cp)
-                    dia_venc_salvar = int(dia_vencimento_mensal_cp) if tipo_lancamento_cp == "MENSAL_FIXO" else None
-                    data_venc_base_salvar = data_vencimento_base_cp.isoformat() if (tipo_lancamento_cp == "MENSAL_FIXO" and data_vencimento_base_cp) else None
-
-                    if tipo_lancamento_cp == "NAO_MENSAL":
-                        df_save = df_parcelas_edit.copy()
-                        df_save["Valor"] = pd.to_numeric(df_save["Valor"], errors="coerce").fillna(0.0)
-                        if "Paga" not in df_save.columns:
-                            df_save["Paga"] = False
-                        df_save["Paga"] = df_save["Paga"].fillna(False).astype(bool)
-                        if "Data Pagamento" not in df_save.columns:
-                            df_save["Data Pagamento"] = pd.NaT
-                        df_save["Data Pagamento"] = pd.to_datetime(df_save["Data Pagamento"], errors="coerce").dt.date
-                        hoje_pag = date.today()
-                        mask_paga_sem_data = df_save["Paga"] & df_save["Data Pagamento"].isna()
-                        if mask_paga_sem_data.any():
-                            df_save.loc[mask_paga_sem_data, "Data Pagamento"] = hoje_pag
-                        if df_save["Vencimento"].isna().any():
-                            st.warning("Preencha a data de todas as parcelas.")
-                            df_save = None
-                        else:
-                            datas_parcelas = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_save["Vencimento"].tolist()]
-                            valores_parcelas = [float(v) for v in df_save["Valor"].tolist()]
-                            detalhes_parcelas = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_parcelas, valores_parcelas))])
-                            mapa_pagamentos_salvar = {}
-                            for idx_row, row in df_save.reset_index(drop=True).iterrows():
-                                if bool(row.get("Paga")):
-                                    mapa_pagamentos_salvar[idx_row + 1] = row.get("Data Pagamento")
-                            parcelas_pagas_salvar = _cp_serializar_parcelas_pagas_detalhe(mapa_pagamentos_salvar)
-                            valor_medio_parcela = (sum(valores_parcelas) / len(valores_parcelas)) if valores_parcelas else 0.0
-                            qtd_parcelas_salvar = int(qtd_parc_cp)
-                    else:
-                        df_save = pd.DataFrame([{"ok": 1}])
-
-                    if df_save is not None:
-                        nf_salvar = n_nf_cp if n_nf_cp else "RECORRENTE"
-                        with conn() as c:
-                            c.execute(
-                                """INSERT INTO contas_pagar
-                                   (fornecedor_id, n_nf, data_entrada, valor_total_nf, obrigacao_id, dados_nf, quantidade_parcelas, vencimentos_parcelas, valor_parcela, tipo_lancamento, dia_vencimento_mensal, data_vencimento_base, competencia_paga_mensal, parcelas_pagas, dias_alerta)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (
-                                    mapa_forn[sel_forn],
-                                    nf_salvar,
-                                    dt_ent_cp.isoformat(),
-                                    float(valor_total_nf_cp),
-                                    mapa_obr[sel_obr],
-                                    dados_nf_cp,
-                                    int(qtd_parcelas_salvar),
-                                    detalhes_parcelas,
-                                    float(valor_medio_parcela),
-                                    tipo_lancamento_cp,
-                                    dia_venc_salvar,
-                                    data_venc_base_salvar,
-                                    None,
-                                    parcelas_pagas_salvar if tipo_lancamento_cp == "NAO_MENSAL" else None,
-                                    int(dias_alerta_cp),
-                                ),
-                            )
-                        alerta_gravado()
-                        st.rerun()
+with aba17:
+    if st.session_state.get("cp_flash_msg"):
+        st.success(st.session_state.pop("cp_flash_msg"))
 
     with conn() as c:
         df_cp = pd.read_sql(
-            """SELECT cp.id,
-                      f.codigo AS codigo_fornecedor,
-                      f.nome AS fornecedor,
-                      cp.n_nf,
-                      cp.data_entrada,
-                      cp.valor_total_nf,
-                      o.descricao_obrigacao,
-                      cp.dados_nf,
-                      cp.quantidade_parcelas,
-                      cp.vencimentos_parcelas,
-                      cp.valor_parcela,
-                      cp.tipo_lancamento,
-                      cp.dia_vencimento_mensal,
-                      cp.data_vencimento_base,
-                      cp.competencia_paga_mensal,
-                      cp.parcelas_pagas,
-                      cp.dias_alerta
-               FROM contas_pagar cp
-               LEFT JOIN fornecedores f ON f.id = cp.fornecedor_id
-               LEFT JOIN obrigacoes o ON o.id = cp.obrigacao_id
-               ORDER BY cp.data_entrada DESC, cp.id DESC""",
-            c,
+            "SELECT * FROM contas_pagar ORDER BY data_vencimento ASC, id DESC", c
         )
+
+    df_cp["data_vencimento"] = pd.to_datetime(df_cp["data_vencimento"], errors="coerce").dt.date
+    df_cp["data_emissao"] = pd.to_datetime(df_cp["data_emissao"], errors="coerce").dt.date
+    df_cp["data_pagamento"] = pd.to_datetime(df_cp["data_pagamento"], errors="coerce").dt.date
+    df_cp["valor"] = pd.to_numeric(df_cp["valor"], errors="coerce").fillna(0.0)
+    df_cp = _add_status_cp(df_cp)
+
     if not df_cp.empty:
-        df_cp["tipo_lancamento"] = df_cp["tipo_lancamento"].fillna("NAO_MENSAL")
-        df_cp["dias_alerta"] = pd.to_numeric(df_cp["dias_alerta"], errors="coerce").fillna(7).astype(int)
-        df_cp["dia_vencimento_mensal"] = pd.to_numeric(df_cp["dia_vencimento_mensal"], errors="coerce").fillna(0).astype(int)
-        df_cp["data_vencimento_base"] = pd.to_datetime(df_cp["data_vencimento_base"], errors="coerce").dt.date
+        hoje_cp = date.today()
+        df_pend_cp = df_cp[df_cp["status"].isin(["PENDENTE", "VENCIDO"])]
+        df_venc_cp = df_cp[df_cp["status"] == "VENCIDO"]
+        df_pago_cp = df_cp[df_cp["status"] == "PAGO"]
+        df_7d_cp = df_cp[
+            (df_cp["status"] == "PENDENTE")
+            & df_cp["data_vencimento"].notna()
+            & df_cp["data_vencimento"].apply(lambda d: 0 <= (d - hoje_cp).days <= 7 if pd.notna(d) else False)
+        ]
 
-        df_alertas_cp = _cp_montar_alertas(df_cp)
-        st.markdown("##### 🔔 Alertas de Vencimento")
-        if not df_alertas_cp.empty:
-            total_alertas_cp = len(df_alertas_cp)
-            vencem_hoje_cp = int((df_alertas_cp["Dias"] == 0).sum())
-            ate_7_cp = int((df_alertas_cp["Dias"] <= 7).sum())
-            a1, a2, a3 = st.columns(3)
-            a1.metric("Alertas Ativos", total_alertas_cp)
-            a2.metric("Vencem Hoje", vencem_hoje_cp)
-            a3.metric("Vencem até 7 dias", ate_7_cp)
-            st.warning("Existem parcelas/lançamentos próximos do vencimento.")
-            st.dataframe(
-                df_alertas_cp,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
-                    "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f"),
-                    "Dias": st.column_config.NumberColumn("Dias", format="%d"),
-                },
+        st.markdown("### 📊 Resumo — Contas a Pagar")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("💰 Total a Pagar", brl(df_pend_cp["valor"].sum()), help="Pendentes + Vencidas")
+        k2.metric("🔴 Vencidas", brl(df_venc_cp["valor"].sum()), delta=f"{len(df_venc_cp)} lançamento(s)", delta_color="inverse")
+        k3.metric("✅ Total Pago", brl(df_pago_cp["valor"].sum()))
+        k4.metric("⏰ Vence em 7 dias", brl(df_7d_cp["valor"].sum()), delta=f"{len(df_7d_cp)} lançamento(s)", delta_color="off")
+
+        if not df_venc_cp.empty:
+            st.error(f"⚠️ Você tem **{len(df_venc_cp)} conta(s) vencida(s)** totalizando **{brl(df_venc_cp['valor'].sum())}**. Regularize o quanto antes!")
+
+    st.markdown("---")
+    with st.expander("➕ Nova Conta a Pagar", expanded=df_cp.empty if not df_cp.empty else True):
+        with st.form("form_nova_cp", clear_on_submit=True):
+            st.markdown("**Dados da Conta**")
+            fa1, fa2 = st.columns(2)
+            cp_descricao = fa1.text_input("Descrição *", placeholder="Ex: Pagamento seguro caminhão").strip()
+            cp_fornecedor = fa2.text_input("Fornecedor / Beneficiário", placeholder="Ex: Seguradora XYZ").strip()
+
+            fb1, fb2, fb3 = st.columns(3)
+            cp_categoria = fb1.selectbox("Categoria", CATEGORIAS_CP)
+            cp_n_doc = fb2.text_input("N. Documento / Boleto / NF", placeholder="Ex: 00123").strip()
+            cp_forma = fb3.selectbox("Forma de Pagamento", FORMAS_PAGAMENTO_CP)
+
+            fc1, fc2, fc3 = st.columns(3)
+            cp_dt_emissao = fc1.date_input("Data Emissão", value=date.today(), format="DD/MM/YYYY", key="cp_dt_emissao_form")
+            cp_dt_venc = fc2.date_input("Data Vencimento *", value=date.today() + timedelta(days=30), format="DD/MM/YYYY", key="cp_dt_venc_form")
+            cp_valor = fc3.number_input("Valor (R$) *", min_value=0.01, step=0.01, format="%.2f", key="cp_valor_form")
+
+            cp_obs = st.text_area("Observação", height=60, key="cp_obs_form")
+
+            cp_ja_pago = st.checkbox("Já foi pago?", key="cp_ja_pago_form")
+            cp_dt_pagamento_form = None
+            if cp_ja_pago:
+                cp_dt_pagamento_form = st.date_input("Data do Pagamento", value=date.today(), format="DD/MM/YYYY", key="cp_dt_pagamento_check")
+
+            sub_cp = st.form_submit_button("💾 Salvar Conta a Pagar", type="primary", use_container_width=True)
+            if sub_cp:
+                if not cp_descricao:
+                    st.warning("⚠️ Preencha a Descrição.")
+                elif cp_valor <= 0:
+                    st.warning("⚠️ Informe um valor maior que zero.")
+                else:
+                    with conn() as c:
+                        c.execute(
+                            """INSERT INTO contas_pagar
+                               (descricao, fornecedor, categoria, n_documento, data_emissao,
+                                data_vencimento, valor, data_pagamento, forma_pagamento, observacao, data_cadastro)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                cp_descricao,
+                                cp_fornecedor or None,
+                                cp_categoria,
+                                cp_n_doc or None,
+                                cp_dt_emissao.isoformat(),
+                                cp_dt_venc.isoformat(),
+                                float(cp_valor),
+                                cp_dt_pagamento_form.isoformat() if cp_dt_pagamento_form else None,
+                                cp_forma,
+                                cp_obs.strip() or None,
+                                datetime.now().isoformat(),
+                            ),
+                        )
+                    limpar_cache_app()
+                    st.session_state["cp_flash_msg"] = "✅ Conta a pagar salva com sucesso!"
+                    st.rerun()
+
+    if not df_cp.empty:
+        st.markdown("---")
+        st.markdown("### 📋 Lançamentos")
+
+        fil1, fil2, fil3, fil4 = st.columns([2, 2, 2, 2])
+        cp_filtro_status = fil1.radio(
+            "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Pagas"],
+            horizontal=False, key="cp_fil_status"
+        )
+        cp_fil_ini = fil2.date_input("Vencimento de:", value=date(date.today().year, 1, 1), format="DD/MM/YYYY", key="cp_fil_ini")
+        cp_fil_fim = fil3.date_input("Vencimento até:", value=date(date.today().year, 12, 31), format="DD/MM/YYYY", key="cp_fil_fim")
+        cp_cats_disp = ["Todas"] + sorted(df_cp["categoria"].dropna().unique().tolist())
+        cp_filtro_cat = fil4.selectbox("Categoria", cp_cats_disp, key="cp_fil_cat")
+
+        df_cp_f = df_cp.copy()
+        if "Pendentes" in cp_filtro_status:
+            df_cp_f = df_cp_f[df_cp_f["status"] == "PENDENTE"]
+        elif "Vencidas" in cp_filtro_status:
+            df_cp_f = df_cp_f[df_cp_f["status"] == "VENCIDO"]
+        elif "Pagas" in cp_filtro_status:
+            df_cp_f = df_cp_f[df_cp_f["status"] == "PAGO"]
+        if cp_filtro_cat != "Todas":
+            df_cp_f = df_cp_f[df_cp_f["categoria"] == cp_filtro_cat]
+        df_cp_f = df_cp_f[
+            df_cp_f["data_vencimento"].apply(
+                lambda d: cp_fil_ini <= d <= cp_fil_fim if pd.notna(d) else True
             )
-            df_alertas_baixa = df_alertas_cp[
-                (df_alertas_cp["Tipo"] == "Não mensal")
-                & (df_alertas_cp["Parcela"].astype(str) != "-")
-            ].copy()
-            if not df_alertas_baixa.empty:
-                df_alertas_baixa["Parcela"] = pd.to_numeric(df_alertas_baixa["Parcela"], errors="coerce").fillna(0).astype(int)
-                opcoes_baixa_alerta = []
-                mapa_baixa_alerta = {}
-                for _, rb in df_alertas_baixa.iterrows():
-                    label_baixa = (
-                        f"ID {int(rb['ID'])} | Parcela {int(rb['Parcela'])} | "
-                        f"{str(rb['Fornecedor'])} | Venc {rb['Vencimento'].strftime('%d/%m/%Y') if pd.notna(rb['Vencimento']) else '-'} | "
-                        f"{brl(float(rb['Valor (R$)'] or 0.0))}"
-                    )
-                    opcoes_baixa_alerta.append(label_baixa)
-                    mapa_baixa_alerta[label_baixa] = (int(rb["ID"]), int(rb["Parcela"]))
+        ]
 
-                selecionadas_baixa = st.multiselect(
-                    "Marcar como pagas (baixa rápida)",
-                    options=opcoes_baixa_alerta,
-                    key="cp_alerta_baixa_multiselect",
-                    help="Selecione parcelas em alerta que já foram pagas antecipadamente para removê-las do alerta.",
-                )
-                if st.button("✅ Baixar parcelas selecionadas", key="cp_alerta_baixar_btn", use_container_width=True):
-                    if not selecionadas_baixa:
-                        st.warning("Selecione ao menos uma parcela para baixar.")
-                    else:
-                        mapa_ids_parcelas = {}
-                        for sel in selecionadas_baixa:
-                            id_cp, parcela_cp = mapa_baixa_alerta[sel]
-                            if id_cp not in mapa_ids_parcelas:
-                                mapa_ids_parcelas[id_cp] = set()
-                            mapa_ids_parcelas[id_cp].add(parcela_cp)
-                        with conn() as c:
-                            for id_cp, novas_parcelas in mapa_ids_parcelas.items():
-                                row_cp = c.execute(
-                                    "SELECT parcelas_pagas FROM contas_pagar WHERE id=?",
-                                    (int(id_cp),),
-                                ).fetchone()
-                                atuais = _cp_parse_parcelas_pagas(row_cp["parcelas_pagas"] if row_cp else "")
-                                atualizadas = atuais.union(novas_parcelas)
-                                c.execute(
-                                    "UPDATE contas_pagar SET parcelas_pagas=? WHERE id=?",
-                                    (_cp_serializar_parcelas_pagas(sorted(atualizadas)), int(id_cp)),
-                                )
-                        alerta_gravado("✅ Parcelas baixadas e alertas atualizados.")
-                        st.rerun()
-            df_alertas_mensal = df_alertas_cp[df_alertas_cp["Tipo"] == "Mensal Fixa"].copy()
-            if not df_alertas_mensal.empty:
-                opcoes_baixa_mensal = []
-                mapa_baixa_mensal = {}
-                for _, rm in df_alertas_mensal.iterrows():
-                    comp_mensal = _cp_competencia_ref(rm["Vencimento"])
-                    comp_mensal_label = pd.to_datetime(rm["Vencimento"], errors="coerce")
-                    comp_mensal_label = comp_mensal_label.strftime("%m/%Y") if pd.notna(comp_mensal_label) else comp_mensal
-                    label_mensal = (
-                        f"ID {int(rm['ID'])} | {str(rm['Fornecedor'])} | "
-                        f"Competência {comp_mensal_label} | Venc {rm['Vencimento'].strftime('%d/%m/%Y') if pd.notna(rm['Vencimento']) else '-'}"
-                    )
-                    opcoes_baixa_mensal.append(label_mensal)
-                    mapa_baixa_mensal[label_mensal] = (int(rm["ID"]), comp_mensal)
+        _CP_STATUS_ICON = {"PENDENTE": "🟡 Pendente", "VENCIDO": "🔴 Vencida", "PAGO": "🟢 Paga"}
+        _cp_n_filtrado = len(df_cp_f)
+        _cp_total_filtrado = pd.to_numeric(df_cp_f["valor"], errors="coerce").sum() if "valor" in df_cp_f.columns else 0.0
+        _cp_show_data = df_cp_f.copy(deep=True)
+        _st_cp = _cp_show_data["status"] if "status" in _cp_show_data.columns else pd.Series(["PENDENTE"] * len(_cp_show_data), index=_cp_show_data.index)
+        _cp_show_data["Status"] = _st_cp.map(_CP_STATUS_ICON).fillna("🟡 Pendente")
+        _cp_show_data = _cp_show_data.rename(columns={
+            "id": "ID", "descricao": "Descrição", "fornecedor": "Fornecedor",
+            "categoria": "Categoria", "n_documento": "Documento",
+            "data_vencimento": "Vencimento", "valor": "Valor (R$)",
+            "data_pagamento": "Data Pgto", "forma_pagamento": "Forma Pgto",
+        })
+        colunas_cp_grid = ["ID", "Status", "Descrição", "Fornecedor", "Categoria", "Documento", "Vencimento", "Valor (R$)", "Data Pgto", "Forma Pgto"]
+        st.dataframe(
+            _cp_show_data[[c for c in colunas_cp_grid if c in _cp_show_data.columns]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "ID": st.column_config.NumberColumn("ID", format="%d", width="small"),
+                "Status": st.column_config.TextColumn("Status"),
+                "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
+                "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f"),
+                "Data Pgto": st.column_config.DateColumn("Data Pgto", format="DD/MM/YYYY"),
+            },
+        )
+        st.caption(f"Exibindo **{_cp_n_filtrado}** de **{len(df_cp)}** lançamentos | Total filtrado: **{brl(_cp_total_filtrado)}**")
 
-                selecionadas_mensal = st.multiselect(
-                    "Marcar mensal fixa como paga (competência)",
-                    options=opcoes_baixa_mensal,
-                    key="cp_alerta_baixa_mensal_multiselect",
-                    help="Baixa apenas a competência selecionada (mês/ano). No próximo mês, o alerta volta normalmente.",
-                )
-                if st.button("✅ Baixar mensal selecionada", key="cp_alerta_baixar_mensal_btn", use_container_width=True):
-                    if not selecionadas_mensal:
-                        st.warning("Selecione ao menos um lançamento mensal para baixar.")
-                    else:
-                        with conn() as c:
-                            for sel in selecionadas_mensal:
-                                id_cp, competencia = mapa_baixa_mensal[sel]
-                                c.execute(
-                                    "UPDATE contas_pagar SET competencia_paga_mensal=? WHERE id=?",
-                                    (str(competencia or "").strip(), int(id_cp)),
-                                )
-                        alerta_gravado("✅ Mensal fixa baixada para a competência selecionada.")
-                        st.rerun()
-        else:
-            st.success("Sem vencimentos próximos dentro da antecedência configurada.")
-
-        st.markdown("##### Lançamentos de Contas a Pagar")
+        st.markdown("#### ⚡ Gerenciar Lançamento")
         if "cp_editando_id" not in st.session_state:
             st.session_state.cp_editando_id = None
 
-        df_cp_grid = df_cp.copy()
-        df_cp_grid["data_entrada"] = pd.to_datetime(df_cp_grid["data_entrada"], errors="coerce").dt.date
-        df_cp_grid["data_vencimento_base"] = pd.to_datetime(df_cp_grid["data_vencimento_base"], errors="coerce").dt.date
-        df_cp_grid["quantidade_parcelas"] = pd.to_numeric(df_cp_grid["quantidade_parcelas"], errors="coerce").fillna(1).astype(int)
-        df_cp_grid["proximo_vencimento"] = df_cp_grid.apply(_cp_proximo_vencimento_grade, axis=1)
-        hoje_grid_cp = date.today()
-        df_cp_grid["dias_para_vencer"] = df_cp_grid["proximo_vencimento"].apply(
-            lambda d: (d - hoje_grid_cp).days if pd.notna(d) else None
+        opcoes_cp_sel = {
+            f"ID {int(r['id'])} | {_CP_STATUS_ICON.get(r['status'], r['status'])} | {str(r.get('descricao') or '')} | Venc. {r['data_vencimento'].strftime('%d/%m/%Y') if pd.notna(r['data_vencimento']) else '-'} | {brl(float(r.get('valor') or 0))}": int(r["id"])
+            for _, r in df_cp_f.iterrows()
+        }
+        cp_sel_label = st.selectbox(
+            "Selecione um lançamento:",
+            options=[None] + list(opcoes_cp_sel.keys()),
+            format_func=lambda x: "— Selecione para gerenciar —" if x is None else x,
+            key="cp_sel_acao",
         )
-        df_cp_grid["Tipo"] = df_cp_grid["tipo_lancamento"].map(
-            {"MENSAL_FIXO": "Mensal fixa", "NAO_MENSAL": "Não mensal"}
-        ).fillna("Não mensal")
-        def _cp_resumo_pagamento_grade(row):
-            tipo = str(row.get("tipo_lancamento") or "NAO_MENSAL")
-            if tipo == "MENSAL_FIXO":
-                comp = str(row.get("competencia_paga_mensal") or "").strip()
-                prox = row.get("proximo_vencimento")
-                comp_prox = _cp_competencia_ref(prox)
-                if comp and comp == comp_prox:
-                    return pd.Series({"Pagas": 1, "Pendentes": 0, "Ultimo Pgto": "Competência paga"})
-                return pd.Series({"Pagas": 0, "Pendentes": 1, "Ultimo Pgto": "Pendente"})
-            parcelas = _cp_extrair_parcelas(row.get("vencimentos_parcelas"))
-            total = len(parcelas)
-            pagas_det = _cp_parse_parcelas_pagas_detalhe(row.get("parcelas_pagas"))
-            qtd_pagas = len(pagas_det)
-            qtd_pend = max(0, total - qtd_pagas)
-            ultimo_status = "Pendente"
-            if pagas_det and parcelas:
-                mapa_venc = {int(p["parcela"]): p.get("data") for p in parcelas if p.get("parcela") is not None}
-                ultimo_num = max(pagas_det.keys())
-                dt_pag = pagas_det.get(ultimo_num)
-                dt_venc = mapa_venc.get(ultimo_num)
-                st_pg = _cp_status_pagamento(dt_venc, dt_pag)
-                ultimo_status = f"Parc {ultimo_num}: {st_pg}" if st_pg != "-" else f"Parc {ultimo_num}: paga"
-            return pd.Series({"Pagas": int(qtd_pagas), "Pendentes": int(qtd_pend), "Ultimo Pgto": ultimo_status})
 
-        resumo_pg_grid = df_cp_grid.apply(_cp_resumo_pagamento_grade, axis=1)
-        df_cp_grid["Pagas"] = pd.to_numeric(resumo_pg_grid["Pagas"], errors="coerce").fillna(0).astype(int)
-        df_cp_grid["Pendentes"] = pd.to_numeric(resumo_pg_grid["Pendentes"], errors="coerce").fillna(0).astype(int)
-        df_cp_grid["Ultimo Pgto"] = resumo_pg_grid["Ultimo Pgto"].fillna("-").astype(str)
-        df_cp_grid["Ultimo Pgto"] = df_cp_grid["Ultimo Pgto"].apply(
-            lambda v: "OK - Competência paga" if str(v).strip() == "Competência paga" else v
-        )
-        df_cp_grid["Comp. Paga"] = df_cp_grid["Ultimo Pgto"].astype(str).str.contains("Competência paga", na=False)
-        modo_exibicao_cp = st.radio(
-            "Exibição do grid",
-            options=["Todos os dados", "Somente os que vão vencer"],
-            horizontal=True,
-            key="cp_grid_modo_exibicao",
-        )
-        if modo_exibicao_cp == "Somente os que vão vencer":
-            total_futuras_abertas = int(
-                (
-                    df_cp_grid["dias_para_vencer"].notna()
-                    & (pd.to_numeric(df_cp_grid["dias_para_vencer"], errors="coerce") > 0)
-                ).sum()
-            )
-            mask_vencer = (
-                df_cp_grid["dias_para_vencer"].notna()
-                & (pd.to_numeric(df_cp_grid["dias_para_vencer"], errors="coerce") >= 0)
-                & (pd.to_numeric(df_cp_grid["dias_para_vencer"], errors="coerce") <= pd.to_numeric(df_cp_grid["dias_alerta"], errors="coerce").fillna(7))
-            )
-            total_no_alerta = int(mask_vencer.sum())
-            total_fora_alerta = max(0, total_futuras_abertas - total_no_alerta)
-            df_cp_grid = df_cp_grid[mask_vencer].copy()
-            if total_fora_alerta > 0:
-                st.caption(f"Existem {total_fora_alerta} parcela(s) com mais de 7 dias que vão vencer.")
-        df_cp_grid["Alterar"] = False
-        df_cp_grid["Excluir"] = False
-        df_cp_grid = df_cp_grid[
-            [
-                "id",
-                "Alterar",
-                "dados_nf",
-                "Excluir",
-                "data_entrada",
-                "fornecedor",
-                "descricao_obrigacao",
-                "n_nf",
-                "valor_total_nf",
-                "Tipo",
-                "quantidade_parcelas",
-                "Pagas",
-                "Pendentes",
-                "Comp. Paga",
-                "Ultimo Pgto",
-                "proximo_vencimento",
-                "dias_alerta",
-            ]
-        ]
+        if cp_sel_label:
+            cp_id_sel = opcoes_cp_sel[cp_sel_label]
+            with conn() as c:
+                cp_row_raw = c.execute("SELECT * FROM contas_pagar WHERE id=?", (cp_id_sel,)).fetchone()
+            cp_row = dict(cp_row_raw)
+            _cp_tmp = pd.DataFrame([cp_row])
+            _cp_tmp["data_vencimento"] = pd.to_datetime(_cp_tmp["data_vencimento"], errors="coerce").dt.date
+            _cp_tmp["data_pagamento"] = pd.to_datetime(_cp_tmp["data_pagamento"], errors="coerce").dt.date
+            cp_status_atual = _add_status_cp(_cp_tmp)["status"].iloc[0]
 
-        with st.form("form_excluir_contas_pagar"):
-            df_cp_ed = st.data_editor(
-                df_cp_grid,
-                use_container_width=True,
-                hide_index=True,
-                key="editor_contas_pagar",
-                column_config={
-                    "id": st.column_config.NumberColumn("ID", format="%d"),
-                    "Alterar": st.column_config.CheckboxColumn("✏️ Alterar", default=False),
-                    "Excluir": st.column_config.CheckboxColumn("🗑️ Excluir", default=False),
-                    "data_entrada": st.column_config.DateColumn("Entrada", format="DD/MM/YYYY"),
-                    "fornecedor": st.column_config.TextColumn("Fornecedor"),
-                    "descricao_obrigacao": st.column_config.TextColumn("Obrigação"),
-                    "n_nf": st.column_config.TextColumn("NF"),
-                    "dados_nf": st.column_config.TextColumn("Dados da NF"),
-                    "Tipo": st.column_config.TextColumn("Tipo"),
-                    "quantidade_parcelas": st.column_config.NumberColumn("Parcelas", format="%d"),
-                    "Pagas": st.column_config.NumberColumn("Pagas", format="%d"),
-                    "Pendentes": st.column_config.NumberColumn("Pendentes", format="%d"),
-                    "Comp. Paga": st.column_config.CheckboxColumn("Comp. Paga"),
-                    "Ultimo Pgto": st.column_config.TextColumn("Último Pgto"),
-                    "proximo_vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
-                    "valor_total_nf": st.column_config.NumberColumn("Valor Total", format="R$ %.2f"),
-                    "dias_alerta": st.column_config.NumberColumn("Alerta (dias)", format="%d"),
-                },
-                disabled=["Comp. Paga"],
-            )
-
-            bcp1, bcp2 = st.columns(2)
-            btn_alterar_cp = bcp1.form_submit_button("✏️ Alterar Selecionado", use_container_width=True)
-            btn_excluir_cp = bcp2.form_submit_button("🔴 Excluir Selecionados", type="primary", use_container_width=True)
-
-        if btn_alterar_cp:
-            ids_alterar = df_cp_ed.loc[(df_cp_ed["Alterar"] == True) & (df_cp_ed["Excluir"] != True), "id"].tolist()
-            if len(ids_alterar) == 1:
-                st.session_state.cp_editando_id = int(ids_alterar[0])
-                st.rerun()
-            elif len(ids_alterar) == 0:
-                st.warning("Marque um registro na coluna Alterar.")
-            else:
-                st.warning("Selecione apenas um registro para alterar.")
-
-        if btn_excluir_cp:
-            ids_excluir = df_cp_ed.loc[df_cp_ed["Excluir"] == True, "id"].tolist()
-            if ids_excluir:
-                with conn() as c:
-                    c.executemany("DELETE FROM contas_pagar WHERE id=?", [(int(i),) for i in ids_excluir])
-                st.success(f"{len(ids_excluir)} conta(s) excluída(s) com sucesso.")
-                st.rerun()
-            else:
-                st.warning("Marque pelo menos um registro para excluir.")
-
-        if st.session_state.cp_editando_id is not None:
-            with st.expander("📝 Formulário de Alteração (mesmo padrão do cadastro)", expanded=True):
-                row_edit_cp = df_cp[df_cp["id"] == st.session_state.cp_editando_id]
-                if row_edit_cp.empty:
+            bt1, bt2, bt3 = st.columns(3)
+            if cp_status_atual != "PAGO":
+                if bt1.button("✅ Dar Baixa (Marcar como Pago)", key=f"cp_baixa_{cp_id_sel}", use_container_width=True, type="primary"):
+                    st.session_state[f"cp_show_baixa_{cp_id_sel}"] = True
                     st.session_state.cp_editando_id = None
-                else:
-                    reg_cp = row_edit_cp.iloc[0]
-
+            else:
+                if bt1.button("↩️ Estornar Pagamento", key=f"cp_estornar_{cp_id_sel}", use_container_width=True):
                     with conn() as c:
-                        fornecedores_edit_cp = c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()
-                        obrigacoes_edit_cp = c.execute("SELECT id, descricao_obrigacao FROM obrigacoes ORDER BY descricao_obrigacao ASC").fetchall()
+                        c.execute("UPDATE contas_pagar SET data_pagamento=NULL WHERE id=?", (cp_id_sel,))
+                    limpar_cache_app()
+                    st.session_state["cp_flash_msg"] = "↩️ Pagamento estornado."
+                    st.rerun()
 
-                    mapa_forn_edit = {f"{f['codigo']} - {f['nome']}": int(f["id"]) for f in fornecedores_edit_cp}
-                    mapa_obr_edit = {o["descricao_obrigacao"]: int(o["id"]) for o in obrigacoes_edit_cp}
-                    opcoes_forn_edit = list(mapa_forn_edit.keys())
-                    opcoes_obr_edit = list(mapa_obr_edit.keys())
+            if bt2.button("✏️ Editar", key=f"cp_editar_{cp_id_sel}", use_container_width=True):
+                st.session_state.cp_editando_id = cp_id_sel
+                st.session_state.pop(f"cp_show_baixa_{cp_id_sel}", None)
 
-                    fornecedor_label_atual = f"{reg_cp['codigo_fornecedor']} - {reg_cp['fornecedor']}"
-                    idx_forn_edit = opcoes_forn_edit.index(fornecedor_label_atual) if fornecedor_label_atual in opcoes_forn_edit else 0
-                    obr_atual = reg_cp["descricao_obrigacao"]
-                    idx_obr_edit = opcoes_obr_edit.index(obr_atual) if obr_atual in opcoes_obr_edit else 0
+            if bt3.button("🗑️ Excluir", key=f"cp_excluir_{cp_id_sel}", use_container_width=True):
+                st.session_state[f"cp_confirmar_del_{cp_id_sel}"] = True
 
-                    data_entrada_edit = pd.to_datetime(reg_cp["data_entrada"], errors="coerce")
-                    data_entrada_edit = data_entrada_edit.date() if pd.notna(data_entrada_edit) else date.today()
-                    tipo_edit_atual = str(reg_cp.get("tipo_lancamento") or "NAO_MENSAL")
-                    dias_alerta_edit_atual = int(reg_cp.get("dias_alerta") or 7)
-                    dia_venc_mensal_atual = int(reg_cp.get("dia_vencimento_mensal") or 10)
-                    data_venc_base_edit_atual = pd.to_datetime(reg_cp.get("data_vencimento_base"), errors="coerce")
-                    data_venc_base_edit_atual = data_venc_base_edit_atual.date() if pd.notna(data_venc_base_edit_atual) else (data_entrada_edit + timedelta(days=30))
-
-                    st.markdown("##### ✏️ Alterar Conta a Pagar")
-                    e1, e2, e3 = st.columns(3)
-                    forn_edit = e1.selectbox(
-                        "Código Fornecedor",
-                        options=opcoes_forn_edit,
-                        index=idx_forn_edit if opcoes_forn_edit else None,
-                        placeholder="Selecione um fornecedor",
-                    )
-                    nf_edit = e2.text_input("N.NF", value=str(reg_cp["n_nf"] or "")).strip()
-                    dt_entrada_edit = e3.date_input("Data Entrada", value=data_entrada_edit, format="DD/MM/YYYY")
-
-                    e4, e5, e6 = st.columns(3)
-                    valor_total_edit = e4.number_input(
-                        "Valor Total da NF",
-                        min_value=0.0,
-                        step=0.01,
-                        value=float(reg_cp["valor_total_nf"] or 0.0),
-                    )
-                    obr_edit = e5.selectbox(
-                        "Obrigação",
-                        options=opcoes_obr_edit,
-                        index=idx_obr_edit if opcoes_obr_edit else None,
-                        placeholder="Selecione uma obrigação",
-                    )
-                    tipo_edit_label = e6.selectbox(
-                        "Tipo de Lançamento",
-                        options=["Não mensal (único/parcelado)", "Mensal fixa (todo mês)"],
-                        index=1 if tipo_edit_atual == "MENSAL_FIXO" else 0,
-                    )
-                    tipo_edit = "MENSAL_FIXO" if "Mensal fixa" in tipo_edit_label else "NAO_MENSAL"
-
-                    ec1, ec2, ec3 = st.columns(3)
-                    dias_alerta_edit = int(
-                        ec1.number_input(
-                            "Avisar com antecedência (dias)",
-                            min_value=0,
-                            max_value=90,
-                            step=1,
-                            value=dias_alerta_edit_atual,
+            if st.session_state.get(f"cp_show_baixa_{cp_id_sel}"):
+                st.markdown("**💳 Confirmar Pagamento**")
+                b1, b2 = st.columns(2)
+                cp_dt_baixa = b1.date_input("Data do Pagamento", value=date.today(), format="DD/MM/YYYY", key=f"cp_dt_baixa_{cp_id_sel}")
+                cp_forma_baixa = b2.selectbox("Forma de Pagamento", FORMAS_PAGAMENTO_CP, key=f"cp_forma_baixa_{cp_id_sel}")
+                bc1, bc2 = st.columns(2)
+                if bc1.button("✅ Confirmar Pagamento", key=f"cp_conf_baixa_{cp_id_sel}", type="primary", use_container_width=True):
+                    with conn() as c:
+                        c.execute(
+                            "UPDATE contas_pagar SET data_pagamento=?, forma_pagamento=? WHERE id=?",
+                            (cp_dt_baixa.isoformat(), cp_forma_baixa, cp_id_sel),
                         )
-                    )
-                    dia_venc_mensal_edit = None
-                    data_venc_base_edit = None
-                    qtd_parcelas_edit = int(reg_cp["quantidade_parcelas"] or 1)
-                    if tipo_edit == "MENSAL_FIXO":
-                        data_venc_base_edit = ec2.date_input(
-                            "Data de Vencimento",
-                            value=data_venc_base_edit_atual,
-                            format="DD/MM/YYYY",
-                        )
-                        dia_venc_mensal_edit = int(data_venc_base_edit.day)
-                        ec3.info("A recorrência usará a data de vencimento como referência.")
-                    else:
-                        qtd_parcelas_edit = int(
-                            ec2.number_input(
-                                "Quantidade Parcelas",
-                                min_value=1,
-                                step=1,
-                                value=int(reg_cp["quantidade_parcelas"] or 1),
-                            )
-                        )
-                        ec3.info("Lançamento não mensal.")
+                    st.session_state.pop(f"cp_show_baixa_{cp_id_sel}", None)
+                    limpar_cache_app()
+                    st.session_state["cp_flash_msg"] = f"✅ Pagamento registrado em {cp_dt_baixa.strftime('%d/%m/%Y')}."
+                    st.rerun()
+                if bc2.button("❌ Cancelar", key=f"cp_canc_baixa_{cp_id_sel}", use_container_width=True):
+                    st.session_state.pop(f"cp_show_baixa_{cp_id_sel}", None)
+                    st.rerun()
 
-                    dados_nf_edit = st.text_input("Dados da NF", value=str(reg_cp["dados_nf"] or "")).strip()
-                    vencimentos_edit = ""
-                    parcelas_pagas_edit = ""
-                    valor_parcela_edit = float(reg_cp["valor_parcela"] or 0.0)
-                    df_parcelas_edit_atual = pd.DataFrame()
-                    if tipo_edit == "NAO_MENSAL":
-                        st.markdown("###### Parcelas (edição automática)")
-                        id_edit_cp = int(st.session_state.cp_editando_id)
-                        key_df = f"cp_edit_parcelas_df_{id_edit_cp}"
-                        key_qtd = f"cp_edit_qtd_prev_{id_edit_cp}"
-                        key_total = f"cp_edit_total_prev_{id_edit_cp}"
+            if st.session_state.get(f"cp_confirmar_del_{cp_id_sel}"):
+                st.warning(f"⚠️ Confirma a exclusão de **{cp_row.get('descricao')}**?")
+                cd1, cd2 = st.columns(2)
+                if cd1.button("✅ Sim, Excluir", key=f"cp_del_sim_{cp_id_sel}", use_container_width=True):
+                    with conn() as c:
+                        c.execute("DELETE FROM contas_pagar WHERE id=?", (cp_id_sel,))
+                    st.session_state.pop(f"cp_confirmar_del_{cp_id_sel}", None)
+                    st.session_state.cp_editando_id = None
+                    limpar_cache_app()
+                    st.session_state["cp_flash_msg"] = "🗑️ Lançamento excluído."
+                    st.rerun()
+                if cd2.button("❌ Cancelar", key=f"cp_del_nao_{cp_id_sel}", use_container_width=True):
+                    st.session_state.pop(f"cp_confirmar_del_{cp_id_sel}", None)
+                    st.rerun()
 
-                        if key_df not in st.session_state:
-                            parcelas_existentes = _cp_extrair_parcelas(reg_cp.get("vencimentos_parcelas"))
-                            parcelas_pagas_existentes = _cp_parse_parcelas_pagas(reg_cp.get("parcelas_pagas"))
-                            parcelas_pagas_detalhe_existentes = _cp_parse_parcelas_pagas_detalhe(reg_cp.get("parcelas_pagas"))
-                            valores_ini = _cp_distribuir_valor(float(valor_total_edit), int(qtd_parcelas_edit))
-                            linhas_ini = []
-                            for i in range(int(qtd_parcelas_edit)):
-                                data_default = dt_entrada_edit + timedelta(days=30 * (i + 1))
-                                data_parcela = parcelas_existentes[i]["data"] if i < len(parcelas_existentes) else data_default
-                                linhas_ini.append(
-                                    {
-                                        "Parcela": i + 1,
-                                        "Vencimento": data_parcela,
-                                        "Valor": valores_ini[i],
-                                        "Paga": (i + 1) in parcelas_pagas_existentes,
-                                        "Data Pagamento": parcelas_pagas_detalhe_existentes.get(i + 1),
-                                    }
-                                )
-                            st.session_state[key_df] = pd.DataFrame(linhas_ini)
-                            st.session_state[key_qtd] = int(qtd_parcelas_edit)
-                            st.session_state[key_total] = float(valor_total_edit)
+            if st.session_state.get("cp_editando_id") == cp_id_sel:
+                st.markdown(f"**✏️ Editando — ID {cp_id_sel}**")
+                with st.form(f"form_edit_cp_{cp_id_sel}"):
+                    e1, e2 = st.columns(2)
+                    cp_e_desc = e1.text_input("Descrição", value=cp_row.get("descricao") or "").strip()
+                    cp_e_forn = e2.text_input("Fornecedor", value=cp_row.get("fornecedor") or "").strip()
 
-                        qtd_prev = int(st.session_state.get(key_qtd, int(qtd_parcelas_edit)))
-                        total_prev = float(st.session_state.get(key_total, float(valor_total_edit)))
-                        df_prev = st.session_state[key_df].copy()
-                        if "Paga" not in df_prev.columns:
-                            df_prev["Paga"] = False
-                            st.session_state[key_df] = df_prev
-                        if "Data Pagamento" not in df_prev.columns:
-                            df_prev["Data Pagamento"] = pd.NaT
-                            st.session_state[key_df] = df_prev
-                        qtd_atual = int(qtd_parcelas_edit)
-                        total_atual = float(valor_total_edit)
-                        mudou_qtd = qtd_atual != qtd_prev
-                        mudou_total = abs(total_atual - total_prev) > 0.000001
+                    e3, e4, e5 = st.columns(3)
+                    _cat_idx = CATEGORIAS_CP.index(cp_row.get("categoria")) if cp_row.get("categoria") in CATEGORIAS_CP else 0
+                    cp_e_cat = e3.selectbox("Categoria", CATEGORIAS_CP, index=_cat_idx)
+                    cp_e_ndoc = e4.text_input("Documento", value=cp_row.get("n_documento") or "").strip()
+                    _forma_idx = FORMAS_PAGAMENTO_CP.index(cp_row.get("forma_pagamento")) if cp_row.get("forma_pagamento") in FORMAS_PAGAMENTO_CP else 0
+                    cp_e_forma = e5.selectbox("Forma Pagamento", FORMAS_PAGAMENTO_CP, index=_forma_idx)
 
-                        if mudou_qtd:
-                            novas_datas = []
-                            for i in range(qtd_atual):
-                                if i < len(df_prev):
-                                    novas_datas.append(df_prev.iloc[i]["Vencimento"])
-                                else:
-                                    novas_datas.append(dt_entrada_edit + timedelta(days=30 * (i + 1)))
-                            novos_valores = _cp_distribuir_valor(total_atual, qtd_atual)
-                            st.session_state[key_df] = pd.DataFrame(
-                                [
-                                    {
-                                        "Parcela": i + 1,
-                                        "Vencimento": novas_datas[i],
-                                        "Valor": novos_valores[i],
-                                        "Paga": bool(df_prev.iloc[i]["Paga"]) if (i < len(df_prev) and "Paga" in df_prev.columns) else False,
-                                        "Data Pagamento": df_prev.iloc[i]["Data Pagamento"] if (i < len(df_prev) and "Data Pagamento" in df_prev.columns) else None,
-                                    }
-                                    for i in range(qtd_atual)
-                                ]
-                            )
-                        elif mudou_total:
-                            df_recalc = df_prev.copy()
-                            novos_valores = _cp_distribuir_valor(total_atual, len(df_recalc))
-                            df_recalc["Valor"] = novos_valores
-                            st.session_state[key_df] = df_recalc
+                    e6, e7, e8 = st.columns(3)
+                    _dt_em = pd.to_datetime(cp_row.get("data_emissao"), errors="coerce")
+                    cp_e_dt_em = e6.date_input("Data Emissão", value=_dt_em.date() if pd.notna(_dt_em) else date.today(), format="DD/MM/YYYY")
+                    _dt_vn = pd.to_datetime(cp_row.get("data_vencimento"), errors="coerce")
+                    cp_e_dt_vn = e7.date_input("Data Vencimento", value=_dt_vn.date() if pd.notna(_dt_vn) else date.today(), format="DD/MM/YYYY")
+                    cp_e_val = e8.number_input("Valor (R$)", min_value=0.01, step=0.01, value=float(cp_row.get("valor") or 0.0), format="%.2f")
 
-                        st.session_state[key_qtd] = qtd_atual
-                        st.session_state[key_total] = total_atual
+                    cp_e_obs = st.text_area("Observação", value=cp_row.get("observacao") or "", height=60)
 
-                        if qtd_atual == 1:
-                            st.session_state.pop(f"cp_editor_parcelas_edit_{id_edit_cp}", None)
-                            linha_unica = st.session_state[key_df].iloc[0] if not st.session_state[key_df].empty else {"Vencimento": dt_entrada_edit + timedelta(days=30), "Valor": float(valor_total_edit)}
-                            venc_unico_default = pd.to_datetime(linha_unica.get("Vencimento"), errors="coerce")
-                            venc_unico_default = venc_unico_default.date() if pd.notna(venc_unico_default) else (dt_entrada_edit + timedelta(days=30))
-                            valor_unico_default = float(pd.to_numeric(linha_unica.get("Valor"), errors="coerce") if linha_unica.get("Valor") is not None else float(valor_total_edit))
-                            u1, u2 = st.columns(2)
-                            venc_unico_edit = u1.date_input(
-                                "Data Parcela",
-                                value=venc_unico_default,
-                                format="DD/MM/YYYY",
-                                key=f"cp_venc_unico_edit_{id_edit_cp}",
-                            )
-                            paga_unico_default = bool(linha_unica.get("Paga")) if linha_unica is not None else False
-                            data_pag_unico_default = pd.to_datetime(linha_unica.get("Data Pagamento"), errors="coerce")
-                            data_pag_unico_default = data_pag_unico_default.date() if pd.notna(data_pag_unico_default) else None
-                            valor_unico_edit = u2.number_input(
-                                "Valor Parcela (R$)",
-                                min_value=0.0,
-                                step=0.01,
-                                value=valor_unico_default,
-                                key=f"cp_valor_unico_edit_{id_edit_cp}",
-                            )
-                            paga_unico_edit = st.checkbox("Parcela paga", value=paga_unico_default, key=f"cp_paga_unico_edit_{id_edit_cp}")
-                            data_pag_unico_edit = st.date_input(
-                                "Data Pagamento",
-                                value=data_pag_unico_default if data_pag_unico_default is not None else date.today(),
-                                format="DD/MM/YYYY",
-                                key=f"cp_data_pag_unico_edit_{id_edit_cp}",
-                                disabled=not bool(paga_unico_edit),
-                            )
-                            df_parcelas_edit = pd.DataFrame(
-                                [{
-                                    "Parcela": 1,
-                                    "Vencimento": venc_unico_edit,
-                                    "Valor": float(valor_unico_edit),
-                                    "Paga": bool(paga_unico_edit),
-                                    "Data Pagamento": (data_pag_unico_edit if bool(paga_unico_edit) else None),
-                                }]
-                            )
-                        else:
-                            c_ed_p1, c_ed_p2 = st.columns([1, 1])
-                            if c_ed_p1.button("🔄 Recalcular Parcelas Iguais", use_container_width=True):
-                                df_tmp = st.session_state[key_df].copy()
-                                novos_valores = _cp_distribuir_valor(float(valor_total_edit), len(df_tmp))
-                                df_tmp["Valor"] = novos_valores
-                                st.session_state[key_df] = df_tmp
-                                st.rerun()
-                            c_ed_p2.caption("As parcelas são recalculadas automaticamente ao mudar o valor total.")
+                    ef1, ef2 = st.columns(2)
+                    gravar_e_cp = ef1.form_submit_button("💾 Gravar Alterações", use_container_width=True, type="primary")
+                    cancelar_e_cp = ef2.form_submit_button("❌ Cancelar", use_container_width=True)
 
-                            df_parcelas_edit = st.data_editor(
-                                st.session_state[key_df],
-                                hide_index=True,
-                                use_container_width=True,
-                                num_rows="fixed",
-                                disabled=["Parcela"],
-                                key=f"cp_editor_parcelas_edit_{id_edit_cp}",
-                                column_config={
-                                    "Parcela": st.column_config.NumberColumn("Parcela", format="%d"),
-                                    "Vencimento": st.column_config.DateColumn("Data Parcela", format="DD/MM/YYYY"),
-                                    "Valor": st.column_config.NumberColumn("Valor Parcela (R$)", format="R$ %.2f", min_value=0.0, step=0.01),
-                                    "Paga": st.column_config.CheckboxColumn("Paga", default=False),
-                                    "Data Pagamento": st.column_config.DateColumn("Data Pagamento", format="DD/MM/YYYY"),
-                                },
-                            )
-                        df_parcelas_edit_atual = df_parcelas_edit.copy()
-                        st.session_state[key_df] = df_parcelas_edit
-
-                        soma_edit = float(pd.to_numeric(df_parcelas_edit["Valor"], errors="coerce").fillna(0.0).sum()) if not df_parcelas_edit.empty else 0.0
-                        diff_edit = float(valor_total_edit) - soma_edit
-                        se1, se2, se3 = st.columns(3)
-                        se1.metric("Total NF", brl(valor_total_edit))
-                        se2.metric("Soma Parcelas", brl(soma_edit))
-                        se3.metric("Diferença", brl(diff_edit))
-                        if not df_parcelas_edit.empty:
-                            df_pag_view_ed = df_parcelas_edit.copy()
-                            df_pag_view_ed["Vencimento"] = pd.to_datetime(df_pag_view_ed["Vencimento"], errors="coerce").dt.date
-                            df_pag_view_ed["Data Pagamento"] = pd.to_datetime(df_pag_view_ed.get("Data Pagamento"), errors="coerce").dt.date
-                            df_pag_view_ed = df_pag_view_ed[df_pag_view_ed["Paga"] == True].copy()
-                            if not df_pag_view_ed.empty:
-                                df_pag_view_ed["Status Pagamento"] = df_pag_view_ed.apply(
-                                    lambda rr: _cp_status_pagamento(rr.get("Vencimento"), rr.get("Data Pagamento")),
-                                    axis=1,
-                                )
-                                st.dataframe(
-                                    df_pag_view_ed[["Parcela", "Vencimento", "Data Pagamento", "Status Pagamento"]],
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
-
-                        if not df_parcelas_edit.empty and not df_parcelas_edit["Vencimento"].isna().any():
-                            datas_edit = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_parcelas_edit["Vencimento"].tolist()]
-                            valores_edit = [float(v) for v in pd.to_numeric(df_parcelas_edit["Valor"], errors="coerce").fillna(0.0).tolist()]
-                            vencimentos_edit = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_edit, valores_edit))])
-                            valor_parcela_edit = (sum(valores_edit) / len(valores_edit)) if valores_edit else 0.0
-                        else:
-                            vencimentos_edit = ""
-                            valor_parcela_edit = 0.0
-                    else:
-                        valor_parcela_edit = st.number_input(
-                            "Valor Parcela (médio)",
-                            min_value=0.0,
-                            step=0.01,
-                            value=float(reg_cp["valor_parcela"] or 0.0),
-                        )
-
-                    ac1, ac2 = st.columns(2)
-                    salvar_edit_cp = ac1.button("💾 Gravar Alterações", type="primary", use_container_width=True)
-                    cancelar_edit_cp = ac2.button("❌ Cancelar", use_container_width=True)
-
-                    if cancelar_edit_cp:
-                        id_clear = int(st.session_state.cp_editando_id)
-                        st.session_state.pop(f"cp_edit_parcelas_df_{id_clear}", None)
-                        st.session_state.pop(f"cp_edit_qtd_prev_{id_clear}", None)
-                        st.session_state.pop(f"cp_edit_total_prev_{id_clear}", None)
-                        st.session_state.pop(f"cp_editor_parcelas_edit_{id_clear}", None)
+                    if cancelar_e_cp:
                         st.session_state.cp_editando_id = None
                         st.rerun()
-
-                    if salvar_edit_cp:
-                        if not nf_edit:
-                            st.warning("Informe o número da NF.")
-                        elif not opcoes_forn_edit:
-                            st.warning("Cadastre fornecedores para continuar.")
-                        elif not opcoes_obr_edit:
-                            st.warning("Cadastre obrigações para continuar.")
-                        elif tipo_edit == "NAO_MENSAL" and not vencimentos_edit:
-                            st.warning("Preencha as parcelas antes de gravar.")
+                    if gravar_e_cp:
+                        if not cp_e_desc:
+                            st.warning("Preencha a Descrição.")
                         else:
-                            if tipo_edit == "NAO_MENSAL":
-                                id_edit_cp = int(st.session_state.cp_editando_id)
-                                key_df = f"cp_edit_parcelas_df_{id_edit_cp}"
-                                key_editor = f"cp_editor_parcelas_edit_{id_edit_cp}"
-                                if isinstance(df_parcelas_edit_atual, pd.DataFrame) and not df_parcelas_edit_atual.empty:
-                                    df_parcelas_salvar = df_parcelas_edit_atual.copy()
-                                else:
-                                    df_base_salvar = st.session_state.get(key_df, pd.DataFrame())
-                                    if not isinstance(df_base_salvar, pd.DataFrame):
-                                        df_base_salvar = pd.DataFrame(df_base_salvar)
-                                    df_parcelas_salvar = df_base_salvar.copy()
-
-                                estado_editor = st.session_state.get(key_editor)
-                                if int(qtd_parcelas_edit) == 1:
-                                    estado_editor = None
-                                if isinstance(estado_editor, pd.DataFrame):
-                                    df_parcelas_salvar = estado_editor.copy()
-                                elif isinstance(estado_editor, list):
-                                    df_parcelas_salvar = pd.DataFrame(estado_editor)
-                                elif isinstance(estado_editor, dict):
-                                    edited_rows = estado_editor.get("edited_rows", {}) or {}
-                                    for idx_row, mudancas in edited_rows.items():
-                                        try:
-                                            pos = int(idx_row)
-                                        except Exception:
-                                            continue
-                                        if 0 <= pos < len(df_parcelas_salvar) and isinstance(mudancas, dict):
-                                            idx_real = df_parcelas_salvar.index[pos]
-                                            for col_name, val in mudancas.items():
-                                                if col_name in df_parcelas_salvar.columns:
-                                                    df_parcelas_salvar.at[idx_real, col_name] = val
-
-                                    added_rows = estado_editor.get("added_rows", []) or []
-                                    if added_rows:
-                                        df_parcelas_salvar = pd.concat(
-                                            [df_parcelas_salvar, pd.DataFrame(added_rows)],
-                                            ignore_index=True,
-                                        )
-
-                                    deleted_rows = estado_editor.get("deleted_rows", []) or []
-                                    if deleted_rows:
-                                        posicoes_drop = []
-                                        for idx_del in deleted_rows:
-                                            try:
-                                                pos_del = int(idx_del)
-                                            except Exception:
-                                                continue
-                                            if 0 <= pos_del < len(df_parcelas_salvar):
-                                                posicoes_drop.append(pos_del)
-                                        if posicoes_drop:
-                                            labels_drop = [df_parcelas_salvar.index[p] for p in sorted(set(posicoes_drop), reverse=True)]
-                                            df_parcelas_salvar = df_parcelas_salvar.drop(index=labels_drop).reset_index(drop=True)
-
-                                if df_parcelas_salvar.empty:
-                                    st.warning("Preencha as parcelas antes de gravar.")
-                                    st.stop()
-                                df_parcelas_salvar["Valor"] = pd.to_numeric(df_parcelas_salvar["Valor"], errors="coerce").fillna(0.0)
-                                if "Paga" not in df_parcelas_salvar.columns:
-                                    df_parcelas_salvar["Paga"] = False
-                                df_parcelas_salvar["Paga"] = df_parcelas_salvar["Paga"].fillna(False).astype(bool)
-                                if "Data Pagamento" not in df_parcelas_salvar.columns:
-                                    df_parcelas_salvar["Data Pagamento"] = pd.NaT
-                                df_parcelas_salvar["Data Pagamento"] = pd.to_datetime(df_parcelas_salvar["Data Pagamento"], errors="coerce").dt.date
-                                hoje_pag_edit = date.today()
-                                mask_paga_sem_data_edit = df_parcelas_salvar["Paga"] & df_parcelas_salvar["Data Pagamento"].isna()
-                                if mask_paga_sem_data_edit.any():
-                                    df_parcelas_salvar.loc[mask_paga_sem_data_edit, "Data Pagamento"] = hoje_pag_edit
-                                df_parcelas_salvar["Vencimento"] = pd.to_datetime(df_parcelas_salvar["Vencimento"], errors="coerce").dt.date
-                                if df_parcelas_salvar["Vencimento"].isna().any():
-                                    st.warning("Preencha a data de vencimento de todas as parcelas.")
-                                    st.stop()
-                                datas_edit = [pd.to_datetime(d).strftime("%d/%m/%Y") for d in df_parcelas_salvar["Vencimento"].tolist()]
-                                valores_edit = [float(v) for v in df_parcelas_salvar["Valor"].tolist()]
-                                vencimentos_edit = "; ".join([f"{idx+1}:{d}|{format_br(v)}" for idx, (d, v) in enumerate(zip(datas_edit, valores_edit))])
-                                mapa_pagamentos_edit = {}
-                                for idx_row, row in df_parcelas_salvar.reset_index(drop=True).iterrows():
-                                    if bool(row.get("Paga")):
-                                        mapa_pagamentos_edit[idx_row + 1] = row.get("Data Pagamento")
-                                parcelas_pagas_edit = _cp_serializar_parcelas_pagas_detalhe(mapa_pagamentos_edit)
-                                valor_parcela_edit = (sum(valores_edit) / len(valores_edit)) if valores_edit else 0.0
-
                             with conn() as c:
                                 c.execute(
-                                    """UPDATE contas_pagar
-                                       SET fornecedor_id=?,
-                                           n_nf=?,
-                                           data_entrada=?,
-                                           valor_total_nf=?,
-                                           obrigacao_id=?,
-                                           dados_nf=?,
-                                           quantidade_parcelas=?,
-                                           vencimentos_parcelas=?,
-                                           valor_parcela=?,
-                                           tipo_lancamento=?,
-                                           dia_vencimento_mensal=?,
-                                           data_vencimento_base=?,
-                                           parcelas_pagas=?,
-                                           dias_alerta=?
-                                       WHERE id=?""",
-                                    (
-                                        mapa_forn_edit[forn_edit],
-                                        nf_edit,
-                                        dt_entrada_edit.isoformat(),
-                                        float(valor_total_edit),
-                                        mapa_obr_edit[obr_edit],
-                                        dados_nf_edit,
-                                        int(qtd_parcelas_edit),
-                                        vencimentos_edit,
-                                        float(valor_parcela_edit),
-                                        tipo_edit,
-                                        int(dia_venc_mensal_edit) if tipo_edit == "MENSAL_FIXO" else None,
-                                        data_venc_base_edit.isoformat() if (tipo_edit == "MENSAL_FIXO" and data_venc_base_edit) else None,
-                                        parcelas_pagas_edit if tipo_edit == "NAO_MENSAL" else None,
-                                        int(dias_alerta_edit),
-                                        int(st.session_state.cp_editando_id),
-                                    ),
+                                    """UPDATE contas_pagar SET descricao=?, fornecedor=?, categoria=?,
+                                       n_documento=?, data_emissao=?, data_vencimento=?, valor=?,
+                                       forma_pagamento=?, observacao=? WHERE id=?""",
+                                    (cp_e_desc, cp_e_forn or None, cp_e_cat, cp_e_ndoc or None,
+                                     cp_e_dt_em.isoformat(), cp_e_dt_vn.isoformat(), float(cp_e_val),
+                                     cp_e_forma, cp_e_obs.strip() or None, cp_id_sel),
                                 )
-                            id_clear = int(st.session_state.cp_editando_id)
-                            st.session_state.pop(f"cp_edit_parcelas_df_{id_clear}", None)
-                            st.session_state.pop(f"cp_edit_qtd_prev_{id_clear}", None)
-                            st.session_state.pop(f"cp_edit_total_prev_{id_clear}", None)
-                            st.session_state.pop(f"cp_editor_parcelas_edit_{id_clear}", None)
                             st.session_state.cp_editando_id = None
-                            st.session_state["cp_flash_msg"] = "✅ Gravado com sucesso!"
+                            limpar_cache_app()
+                            st.session_state["cp_flash_msg"] = "✅ Lançamento atualizado."
                             st.rerun()
-    else:
-        st.info("Nenhuma conta a pagar cadastrada.")
 
 # =========================
-# ABA 18 - ME LEMBRA
+# ABA CONTAS A RECEBER
 # =========================
+with aba_cr:
+    if st.session_state.get("cr_flash_msg"):
+        st.success(st.session_state.pop("cr_flash_msg"))
+
+    with conn() as c:
+        df_cr = pd.read_sql(
+            "SELECT * FROM contas_receber ORDER BY data_vencimento ASC, id DESC", c
+        )
+
+    df_cr["data_vencimento"] = pd.to_datetime(df_cr["data_vencimento"], errors="coerce").dt.date
+    df_cr["data_emissao"] = pd.to_datetime(df_cr["data_emissao"], errors="coerce").dt.date
+    df_cr["data_recebimento"] = pd.to_datetime(df_cr["data_recebimento"], errors="coerce").dt.date
+    df_cr["valor"] = pd.to_numeric(df_cr["valor"], errors="coerce").fillna(0.0)
+    df_cr = _add_status_cr(df_cr)
+
+    if not df_cr.empty:
+        hoje_cr = date.today()
+        df_pend_cr = df_cr[df_cr["status"].isin(["PENDENTE", "VENCIDO"])]
+        df_venc_cr = df_cr[df_cr["status"] == "VENCIDO"]
+        df_rec_cr = df_cr[df_cr["status"] == "RECEBIDO"]
+        df_7d_cr = df_cr[
+            (df_cr["status"] == "PENDENTE")
+            & df_cr["data_vencimento"].notna()
+            & df_cr["data_vencimento"].apply(lambda d: 0 <= (d - hoje_cr).days <= 7 if pd.notna(d) else False)
+        ]
+
+        st.markdown("### 📊 Resumo — Contas a Receber")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("💰 Total a Receber", brl(df_pend_cr["valor"].sum()), help="Pendentes + Vencidas")
+        k2.metric("🔴 Vencidas (não recebidas)", brl(df_venc_cr["valor"].sum()), delta=f"{len(df_venc_cr)} lançamento(s)", delta_color="inverse")
+        k3.metric("✅ Total Recebido", brl(df_rec_cr["valor"].sum()))
+        k4.metric("⏰ Vence em 7 dias", brl(df_7d_cr["valor"].sum()), delta=f"{len(df_7d_cr)} lançamento(s)", delta_color="off")
+
+        if not df_venc_cr.empty:
+            st.error(f"⚠️ Você tem **{len(df_venc_cr)} conta(s) vencida(s)** não recebida(s), totalizando **{brl(df_venc_cr['valor'].sum())}**. Entre em contato com o cliente!")
+
+    st.markdown("---")
+    with st.expander("➕ Nova Conta a Receber", expanded=df_cr.empty if not df_cr.empty else True):
+        with st.form("form_nova_cr", clear_on_submit=True):
+            st.markdown("**Dados da Conta**")
+            ga1, ga2 = st.columns(2)
+            cr_descricao = ga1.text_input("Descrição *", placeholder="Ex: Frete entrega cliente ABC").strip()
+            cr_cliente = ga2.text_input("Cliente *", placeholder="Ex: Empresa ABC Ltda").strip()
+
+            gb1, gb2, gb3 = st.columns(3)
+            cr_categoria = gb1.selectbox("Categoria", CATEGORIAS_CR)
+            cr_n_doc = gb2.text_input("N. NF / Documento", placeholder="Ex: NF-00456").strip()
+            cr_forma = gb3.selectbox("Forma de Recebimento", FORMAS_RECEBIMENTO_CR)
+
+            gc1, gc2, gc3 = st.columns(3)
+            cr_dt_emissao = gc1.date_input("Data Emissão", value=date.today(), format="DD/MM/YYYY", key="cr_dt_emissao_form")
+            cr_dt_venc = gc2.date_input("Data Vencimento *", value=date.today() + timedelta(days=30), format="DD/MM/YYYY", key="cr_dt_venc_form")
+            cr_valor = gc3.number_input("Valor (R$) *", min_value=0.01, step=0.01, format="%.2f", key="cr_valor_form")
+
+            cr_obs = st.text_area("Observação", height=60, key="cr_obs_form")
+
+            cr_ja_recebido = st.checkbox("Já foi recebido?", key="cr_ja_rec_form")
+            cr_dt_recebimento_form = None
+            if cr_ja_recebido:
+                cr_dt_recebimento_form = st.date_input("Data do Recebimento", value=date.today(), format="DD/MM/YYYY", key="cr_dt_rec_check")
+
+            sub_cr = st.form_submit_button("💾 Salvar Conta a Receber", type="primary", use_container_width=True)
+            if sub_cr:
+                if not cr_descricao:
+                    st.warning("⚠️ Preencha a Descrição.")
+                elif not cr_cliente:
+                    st.warning("⚠️ Preencha o nome do Cliente.")
+                elif cr_valor <= 0:
+                    st.warning("⚠️ Informe um valor maior que zero.")
+                else:
+                    with conn() as c:
+                        c.execute(
+                            """INSERT INTO contas_receber
+                               (descricao, cliente, categoria, n_documento, data_emissao,
+                                data_vencimento, valor, data_recebimento, forma_recebimento, observacao, data_cadastro)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                cr_descricao,
+                                cr_cliente,
+                                cr_categoria,
+                                cr_n_doc or None,
+                                cr_dt_emissao.isoformat(),
+                                cr_dt_venc.isoformat(),
+                                float(cr_valor),
+                                cr_dt_recebimento_form.isoformat() if cr_dt_recebimento_form else None,
+                                cr_forma,
+                                cr_obs.strip() or None,
+                                datetime.now().isoformat(),
+                            ),
+                        )
+                    limpar_cache_app()
+                    st.session_state["cr_flash_msg"] = "✅ Conta a receber salva com sucesso!"
+                    st.rerun()
+
+    if not df_cr.empty:
+        st.markdown("---")
+        st.markdown("### 📋 Lançamentos")
+
+        gf1, gf2, gf3, gf4 = st.columns([2, 2, 2, 2])
+        cr_filtro_status = gf1.radio(
+            "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Recebidas"],
+            horizontal=False, key="cr_fil_status"
+        )
+        cr_fil_ini = gf2.date_input("Vencimento de:", value=date(date.today().year, 1, 1), format="DD/MM/YYYY", key="cr_fil_ini")
+        cr_fil_fim = gf3.date_input("Vencimento até:", value=date(date.today().year, 12, 31), format="DD/MM/YYYY", key="cr_fil_fim")
+        cr_cats_disp = ["Todas"] + sorted(df_cr["categoria"].dropna().unique().tolist())
+        cr_filtro_cat = gf4.selectbox("Categoria", cr_cats_disp, key="cr_fil_cat")
+
+        df_cr_f = df_cr.copy()
+        if "Pendentes" in cr_filtro_status:
+            df_cr_f = df_cr_f[df_cr_f["status"] == "PENDENTE"]
+        elif "Vencidas" in cr_filtro_status:
+            df_cr_f = df_cr_f[df_cr_f["status"] == "VENCIDO"]
+        elif "Recebidas" in cr_filtro_status:
+            df_cr_f = df_cr_f[df_cr_f["status"] == "RECEBIDO"]
+        if cr_filtro_cat != "Todas":
+            df_cr_f = df_cr_f[df_cr_f["categoria"] == cr_filtro_cat]
+        df_cr_f = df_cr_f[
+            df_cr_f["data_vencimento"].apply(
+                lambda d: cr_fil_ini <= d <= cr_fil_fim if pd.notna(d) else True
+            )
+        ]
+
+        _CR_STATUS_ICON = {"PENDENTE": "🟡 Pendente", "VENCIDO": "🔴 Vencida", "RECEBIDO": "🟢 Recebida"}
+        _cr_n_filtrado = len(df_cr_f)
+        _cr_total_filtrado = pd.to_numeric(df_cr_f["valor"], errors="coerce").sum() if "valor" in df_cr_f.columns else 0.0
+        _cr_show_data = df_cr_f.copy(deep=True)
+        _st_cr = _cr_show_data["status"] if "status" in _cr_show_data.columns else pd.Series(["PENDENTE"] * len(_cr_show_data), index=_cr_show_data.index)
+        _cr_show_data["Status"] = _st_cr.map(_CR_STATUS_ICON).fillna("🟡 Pendente")
+        _cr_show_data = _cr_show_data.rename(columns={
+            "id": "ID", "descricao": "Descrição", "cliente": "Cliente",
+            "categoria": "Categoria", "n_documento": "Documento",
+            "data_vencimento": "Vencimento", "valor": "Valor (R$)",
+            "data_recebimento": "Data Rec.", "forma_recebimento": "Forma Rec.",
+        })
+        colunas_cr_grid = ["ID", "Status", "Descrição", "Cliente", "Categoria", "Documento", "Vencimento", "Valor (R$)", "Data Rec.", "Forma Rec."]
+        st.dataframe(
+            _cr_show_data[[c for c in colunas_cr_grid if c in _cr_show_data.columns]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "ID": st.column_config.NumberColumn("ID", format="%d", width="small"),
+                "Status": st.column_config.TextColumn("Status"),
+                "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
+                "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f"),
+                "Data Rec.": st.column_config.DateColumn("Data Rec.", format="DD/MM/YYYY"),
+            },
+        )
+        st.caption(f"Exibindo **{_cr_n_filtrado}** de **{len(df_cr)}** lançamentos | Total filtrado: **{brl(_cr_total_filtrado)}**")
+
+        st.markdown("#### ⚡ Gerenciar Lançamento")
+        if "cr_editando_id" not in st.session_state:
+            st.session_state.cr_editando_id = None
+
+        opcoes_cr_sel = {
+            f"ID {int(r['id'])} | {_CR_STATUS_ICON.get(r['status'], r['status'])} | {str(r.get('cliente') or '')} | {str(r.get('descricao') or '')} | Venc. {r['data_vencimento'].strftime('%d/%m/%Y') if pd.notna(r['data_vencimento']) else '-'} | {brl(float(r.get('valor') or 0))}": int(r["id"])
+            for _, r in df_cr_f.iterrows()
+        }
+        cr_sel_label = st.selectbox(
+            "Selecione um lançamento:",
+            options=[None] + list(opcoes_cr_sel.keys()),
+            format_func=lambda x: "— Selecione para gerenciar —" if x is None else x,
+            key="cr_sel_acao",
+        )
+
+        if cr_sel_label:
+            cr_id_sel = opcoes_cr_sel[cr_sel_label]
+            with conn() as c:
+                cr_row_raw = c.execute("SELECT * FROM contas_receber WHERE id=?", (cr_id_sel,)).fetchone()
+            cr_row = dict(cr_row_raw)
+            _cr_tmp = pd.DataFrame([cr_row])
+            _cr_tmp["data_vencimento"] = pd.to_datetime(_cr_tmp["data_vencimento"], errors="coerce").dt.date
+            _cr_tmp["data_recebimento"] = pd.to_datetime(_cr_tmp["data_recebimento"], errors="coerce").dt.date
+            cr_status_atual = _add_status_cr(_cr_tmp)["status"].iloc[0]
+
+            rb1, rb2, rb3 = st.columns(3)
+            if cr_status_atual != "RECEBIDO":
+                if rb1.button("✅ Confirmar Recebimento", key=f"cr_baixa_{cr_id_sel}", use_container_width=True, type="primary"):
+                    st.session_state[f"cr_show_baixa_{cr_id_sel}"] = True
+                    st.session_state.cr_editando_id = None
+            else:
+                if rb1.button("↩️ Estornar Recebimento", key=f"cr_estornar_{cr_id_sel}", use_container_width=True):
+                    with conn() as c:
+                        c.execute("UPDATE contas_receber SET data_recebimento=NULL WHERE id=?", (cr_id_sel,))
+                    limpar_cache_app()
+                    st.session_state["cr_flash_msg"] = "↩️ Recebimento estornado."
+                    st.rerun()
+
+            if rb2.button("✏️ Editar", key=f"cr_editar_{cr_id_sel}", use_container_width=True):
+                st.session_state.cr_editando_id = cr_id_sel
+                st.session_state.pop(f"cr_show_baixa_{cr_id_sel}", None)
+
+            if rb3.button("🗑️ Excluir", key=f"cr_excluir_{cr_id_sel}", use_container_width=True):
+                st.session_state[f"cr_confirmar_del_{cr_id_sel}"] = True
+
+            if st.session_state.get(f"cr_show_baixa_{cr_id_sel}"):
+                st.markdown("**💳 Confirmar Recebimento**")
+                r1, r2 = st.columns(2)
+                cr_dt_baixa = r1.date_input("Data do Recebimento", value=date.today(), format="DD/MM/YYYY", key=f"cr_dt_baixa_{cr_id_sel}")
+                cr_forma_baixa = r2.selectbox("Forma de Recebimento", FORMAS_RECEBIMENTO_CR, key=f"cr_forma_baixa_{cr_id_sel}")
+                rc1, rc2 = st.columns(2)
+                if rc1.button("✅ Confirmar Recebimento", key=f"cr_conf_baixa_{cr_id_sel}", type="primary", use_container_width=True):
+                    with conn() as c:
+                        c.execute(
+                            "UPDATE contas_receber SET data_recebimento=?, forma_recebimento=? WHERE id=?",
+                            (cr_dt_baixa.isoformat(), cr_forma_baixa, cr_id_sel),
+                        )
+                    st.session_state.pop(f"cr_show_baixa_{cr_id_sel}", None)
+                    limpar_cache_app()
+                    st.session_state["cr_flash_msg"] = f"✅ Recebimento registrado em {cr_dt_baixa.strftime('%d/%m/%Y')}."
+                    st.rerun()
+                if rc2.button("❌ Cancelar", key=f"cr_canc_baixa_{cr_id_sel}", use_container_width=True):
+                    st.session_state.pop(f"cr_show_baixa_{cr_id_sel}", None)
+                    st.rerun()
+
+            if st.session_state.get(f"cr_confirmar_del_{cr_id_sel}"):
+                st.warning(f"⚠️ Confirma a exclusão de **{cr_row.get('descricao')}**?")
+                rd1, rd2 = st.columns(2)
+                if rd1.button("✅ Sim, Excluir", key=f"cr_del_sim_{cr_id_sel}", use_container_width=True):
+                    with conn() as c:
+                        c.execute("DELETE FROM contas_receber WHERE id=?", (cr_id_sel,))
+                    st.session_state.pop(f"cr_confirmar_del_{cr_id_sel}", None)
+                    st.session_state.cr_editando_id = None
+                    limpar_cache_app()
+                    st.session_state["cr_flash_msg"] = "🗑️ Lançamento excluído."
+                    st.rerun()
+                if rd2.button("❌ Cancelar", key=f"cr_del_nao_{cr_id_sel}", use_container_width=True):
+                    st.session_state.pop(f"cr_confirmar_del_{cr_id_sel}", None)
+                    st.rerun()
+
+            if st.session_state.get("cr_editando_id") == cr_id_sel:
+                st.markdown(f"**✏️ Editando — ID {cr_id_sel}**")
+                with st.form(f"form_edit_cr_{cr_id_sel}"):
+                    re1, re2 = st.columns(2)
+                    cr_e_desc = re1.text_input("Descrição", value=cr_row.get("descricao") or "").strip()
+                    cr_e_cli = re2.text_input("Cliente", value=cr_row.get("cliente") or "").strip()
+
+                    re3, re4, re5 = st.columns(3)
+                    _cr_cat_idx = CATEGORIAS_CR.index(cr_row.get("categoria")) if cr_row.get("categoria") in CATEGORIAS_CR else 0
+                    cr_e_cat = re3.selectbox("Categoria", CATEGORIAS_CR, index=_cr_cat_idx)
+                    cr_e_ndoc = re4.text_input("Documento", value=cr_row.get("n_documento") or "").strip()
+                    _cr_forma_idx = FORMAS_RECEBIMENTO_CR.index(cr_row.get("forma_recebimento")) if cr_row.get("forma_recebimento") in FORMAS_RECEBIMENTO_CR else 0
+                    cr_e_forma = re5.selectbox("Forma Recebimento", FORMAS_RECEBIMENTO_CR, index=_cr_forma_idx)
+
+                    re6, re7, re8 = st.columns(3)
+                    _cr_dt_em = pd.to_datetime(cr_row.get("data_emissao"), errors="coerce")
+                    cr_e_dt_em = re6.date_input("Data Emissão", value=_cr_dt_em.date() if pd.notna(_cr_dt_em) else date.today(), format="DD/MM/YYYY")
+                    _cr_dt_vn = pd.to_datetime(cr_row.get("data_vencimento"), errors="coerce")
+                    cr_e_dt_vn = re7.date_input("Data Vencimento", value=_cr_dt_vn.date() if pd.notna(_cr_dt_vn) else date.today(), format="DD/MM/YYYY")
+                    cr_e_val = re8.number_input("Valor (R$)", min_value=0.01, step=0.01, value=float(cr_row.get("valor") or 0.0), format="%.2f")
+
+                    cr_e_obs = st.text_area("Observação", value=cr_row.get("observacao") or "", height=60)
+
+                    rg1, rg2 = st.columns(2)
+                    gravar_e_cr = rg1.form_submit_button("💾 Gravar Alterações", use_container_width=True, type="primary")
+                    cancelar_e_cr = rg2.form_submit_button("❌ Cancelar", use_container_width=True)
+
+                    if cancelar_e_cr:
+                        st.session_state.cr_editando_id = None
+                        st.rerun()
+                    if gravar_e_cr:
+                        if not cr_e_desc or not cr_e_cli:
+                            st.warning("Preencha Descrição e Cliente.")
+                        else:
+                            with conn() as c:
+                                c.execute(
+                                    """UPDATE contas_receber SET descricao=?, cliente=?, categoria=?,
+                                       n_documento=?, data_emissao=?, data_vencimento=?, valor=?,
+                                       forma_recebimento=?, observacao=? WHERE id=?""",
+                                    (cr_e_desc, cr_e_cli, cr_e_cat, cr_e_ndoc or None,
+                                     cr_e_dt_em.isoformat(), cr_e_dt_vn.isoformat(), float(cr_e_val),
+                                     cr_e_forma, cr_e_obs.strip() or None, cr_id_sel),
+                                )
+                            st.session_state.cr_editando_id = None
+                            limpar_cache_app()
+                            st.session_state["cr_flash_msg"] = "✅ Lançamento atualizado."
+                            st.rerun()
+
 with aba18:
     st.subheader("🔔 ME LEMBRA")
     st.caption("Cadastro de lembretes com prazo de alerta definido por lançamento.")
@@ -9921,4 +9676,187 @@ with aba20:
                             st.session_state.anot_editando_id = None
                             alerta_gravado()
                             st.rerun()
+
+# =========================
+# ABA CÁLCULO RÁPIDO
+# =========================
+with aba_calc:
+    st.markdown(
+        """
+        <style>
+        .cmp-header {
+            border-radius: 12px; padding: 12px 18px; text-align: center;
+            margin-bottom: 10px; font-weight: 800; font-size: 1rem; letter-spacing: 0.2px;
+        }
+        .cmp-km-header   { background: linear-gradient(120deg,#1b6ca8,#00a6a6); color:#fff; }
+        .cmp-ton-header  { background: linear-gradient(120deg,#0b3c5d,#1b6ca8); color:#fff; }
+        .cmp-row {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 7px 14px; border-bottom: 1px solid #eef4fb; font-size: 0.88rem;
+        }
+        .cmp-row:last-child { border-bottom: none; }
+        .cmp-row-label { color: #627d98; font-weight: 600; }
+        .cmp-row-value { color: #102a43; font-weight: 700; }
+        .cmp-card {
+            background: #ffffff; border: 1px solid #cfdce9; border-radius: 14px;
+            overflow: hidden; box-shadow: 0 3px 12px rgba(11,60,93,0.08);
+        }
+        .cmp-liquido-km {
+            background: linear-gradient(120deg,#1b6ca8,#00a6a6);
+            padding: 16px; text-align: center;
+        }
+        .cmp-liquido-ton {
+            background: linear-gradient(120deg,#0b3c5d,#1b6ca8);
+            padding: 16px; text-align: center;
+        }
+        .cmp-liquido-label { font-size:0.70rem; font-weight:700; text-transform:uppercase;
+            letter-spacing:0.8px; color:rgba(255,255,255,0.78); margin-bottom:5px; }
+        .cmp-liquido-value { font-size:1.9rem; font-weight:900; color:#fff; line-height:1.15; }
+        .cmp-liquido-value.neg { color:#fca5a5; }
+        .cmp-liquido-sub { font-size:0.75rem; color:rgba(255,255,255,0.72); margin-top:4px; }
+        .cmp-shared-title {
+            font-size:0.70rem; font-weight:700; text-transform:uppercase;
+            letter-spacing:0.8px; color:#627d98; padding-bottom:4px;
+            border-bottom: 2px solid #cfdce9; margin-bottom:8px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("#### 🧮 Cálculo Rápido — Comparativo KM × Tonelada")
+    st.caption("Preencha os dados comuns e os específicos de cada modalidade. Os resultados atualizam em tempo real.")
+
+    # ── DADOS COMUNS ────────────────────────────────────────────────────────
+    st.markdown('<div class="cmp-shared-title">📦 Dados Comuns da Viagem</div>', unsafe_allow_html=True)
+
+    sh1, sh2, sh3, sh4, sh5, sh6 = st.columns(6)
+    cr_km = sh1.number_input(
+        "Distância (KM)", min_value=0.0, value=0.0, step=10.0, format="%.0f", key="cr_km_shared",
+    )
+    cr_diesel_vl = sh2.number_input(
+        "Valor Litro Diesel (R$)", min_value=0.0, value=float(v_diesel_sug or 0.0),
+        step=0.01, format="%.2f", key="cr_diesel_vl2",
+    )
+    cr_cons_diesel = sh3.number_input(
+        "Consumo Diesel (km/L)", min_value=0.0, value=float(v_cons_sug or 2.5),
+        step=0.10, format="%.2f", key="cr_cons_diesel2",
+    )
+    cr_arla_vl = sh4.number_input(
+        "Valor Litro Arla (R$)", min_value=0.0, value=float(v_arla_sug or 0.0),
+        step=0.01, format="%.2f", key="cr_arla_vl2",
+    )
+    cr_cons_arla = sh5.number_input(
+        "Consumo Arla (km/L)", min_value=0.0, value=float(v_cons_arla_sug or 0.0),
+        step=0.10, format="%.2f", key="cr_cons_arla2",
+    )
+    cr_pedagio = sh6.number_input(
+        "Total Pedágio (R$)", min_value=0.0, value=0.0,
+        step=1.0, format="%.2f", key="cr_pedagio2",
+    )
+
+    # ── CÁLCULOS COMPARTILHADOS ─────────────────────────────────────────────
+    lit_diesel = (cr_km / cr_cons_diesel) if cr_cons_diesel > 0 else 0.0
+    custo_diesel = lit_diesel * cr_diesel_vl
+    lit_arla = (cr_km / cr_cons_arla) if cr_cons_arla > 0 else 0.0
+    custo_arla = lit_arla * cr_arla_vl
+    custos_comuns = custo_diesel + custo_arla + cr_pedagio
+
+    st.markdown("---")
+
+    # ── INPUTS ESPECÍFICOS ───────────────────────────────────────────────────
+    col_km_in, col_sep, col_ton_in = st.columns([5, 1, 5])
+
+    with col_km_in:
+        st.markdown('<div class="cmp-shared-title">📏 Cobrança por KM</div>', unsafe_allow_html=True)
+        ci1, ci2 = st.columns(2)
+        cr_val_km = ci1.number_input(
+            "Valor por KM (R$/km)", min_value=0.0, value=0.0,
+            step=0.0100, format="%.4f", key="cr_val_km2",
+        )
+
+    with col_sep:
+        st.markdown("<div style='text-align:center;padding-top:32px;font-size:1.4rem;color:#cfdce9;font-weight:900;'>VS</div>", unsafe_allow_html=True)
+
+    with col_ton_in:
+        st.markdown('<div class="cmp-shared-title">🏋️ Cobrança por Tonelada</div>', unsafe_allow_html=True)
+        ci3, ci4 = st.columns(2)
+        cr_val_ton = ci3.number_input(
+            "Valor por Tonelada (R$/ton)", min_value=0.0, value=0.0,
+            step=0.50, format="%.2f", key="cr_val_ton2",
+        )
+        cr_qtde_ton = ci4.number_input(
+            "Qtde Toneladas (ton)", min_value=0.0, value=0.0,
+            step=0.100, format="%.3f", key="cr_qtde_ton2",
+        )
+
+    # ── CÁLCULOS POR MODALIDADE ──────────────────────────────────────────────
+    frete_bruto_km  = cr_val_km  * cr_km
+    frete_bruto_ton = cr_val_ton * cr_qtde_ton
+
+    liquido_km  = frete_bruto_km  - custos_comuns
+    liquido_ton = frete_bruto_ton - custos_comuns
+
+    margem_km  = (liquido_km  / frete_bruto_km  * 100) if frete_bruto_km  > 0 else 0.0
+    margem_ton = (liquido_ton / frete_bruto_ton * 100) if frete_bruto_ton > 0 else 0.0
+
+    # ── CARDS COMPARATIVOS ───────────────────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    card_km, sp2, card_ton = st.columns([5, 1, 5])
+
+    def _cmp_row(label, value, sub=""):
+        sub_html = f'<span style="color:#aac0d4;font-size:0.76rem;"> ({sub})</span>' if sub else ""
+        return (
+            f'<div class="cmp-row">'
+            f'  <span class="cmp-row-label">{label}</span>'
+            f'  <span class="cmp-row-value">{value}{sub_html}</span>'
+            f'</div>'
+        )
+
+    def _build_card(frete_bruto, liquido, margem, header_class, liquido_class_name, modalidade_txt):
+        neg_class = " neg" if liquido < 0 else ""
+        margem_txt = f"{margem:.1f}% de margem" if frete_bruto > 0 else "—"
+        liquido_por_km = liquido / cr_km if cr_km > 0 else 0.0
+        liq_km_txt = f"{brl(liquido_por_km)}/km" if cr_km > 0 else "—"
+        rows = (
+            _cmp_row("Frete Bruto",    brl(frete_bruto))
+            + _cmp_row("Custo Diesel", brl(custo_diesel), f"{lit_diesel:.1f} L")
+            + _cmp_row("Custo Arla",   brl(custo_arla),   f"{lit_arla:.1f} L")
+            + _cmp_row("Pedágio",      brl(cr_pedagio))
+            + _cmp_row("Total Custos", brl(custos_comuns))
+        )
+        return f"""
+        <div class="cmp-card">
+            <div class="cmp-header {header_class}">{modalidade_txt}</div>
+            {rows}
+            <div class="{liquido_class_name}">
+                <div class="cmp-liquido-label">💰 Frete Líquido</div>
+                <div class="cmp-liquido-value{neg_class}">{brl(liquido)}</div>
+                <div class="cmp-liquido-sub">{margem_txt} &nbsp;·&nbsp; <strong>{liq_km_txt}</strong> líquido/km</div>
+            </div>
+        </div>
+        """
+
+    with card_km:
+        st.markdown(
+            _build_card(frete_bruto_km, liquido_km, margem_km,
+                        "cmp-km-header", "cmp-liquido-km",
+                        f"📏 Por KM &nbsp;·&nbsp; {format_br(cr_km, casas_decimais=0)} km × {brl(cr_val_km)}/km"),
+            unsafe_allow_html=True,
+        )
+
+    with sp2:
+        st.markdown(
+            "<div style='text-align:center;padding-top:80px;font-size:1.2rem;"
+            "color:#cfdce9;font-weight:900;'>VS</div>",
+            unsafe_allow_html=True,
+        )
+
+    with card_ton:
+        st.markdown(
+            _build_card(frete_bruto_ton, liquido_ton, margem_ton,
+                        "cmp-ton-header", "cmp-liquido-ton",
+                        f"🏋️ Por Tonelada &nbsp;·&nbsp; {format_br(cr_qtde_ton, casas_decimais=3)} ton × {brl(cr_val_ton)}/ton"),
+            unsafe_allow_html=True,
+        )
 
