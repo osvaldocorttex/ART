@@ -1108,6 +1108,7 @@ v_cons_arla_sug = float(last_v["consumo_arla"]) if last_v else 0.0
 st.markdown(
     """
     <style>
+    html { color-scheme: light only; }
     /* ===== DESIGN SYSTEM ===== */
     :root {
         --navy:      #0b3c5d;
@@ -1325,6 +1326,8 @@ st.markdown(
         border-color: var(--border) !important;
         font-size: 0.88rem !important;
         background: var(--surface) !important;
+        color: var(--text) !important;
+        -webkit-text-fill-color: var(--text) !important;
         transition: border-color 0.15s, box-shadow 0.15s !important;
     }
     div[data-testid="stTextInput"] input:focus,
@@ -9730,29 +9733,32 @@ with aba_calc:
     # ── DADOS COMUNS ────────────────────────────────────────────────────────
     st.markdown('<div class="cmp-shared-title">📦 Dados Comuns da Viagem</div>', unsafe_allow_html=True)
 
+    def _cr_num(txt, default=0.0):
+        txt = str(txt or "").strip().replace(" ", "").replace(",", ".")
+        try:
+            v = float(txt)
+        except ValueError:
+            return default
+        return v if v >= 0 else default
+
     sh1, sh2, sh3, sh4, sh5, sh6 = st.columns(6)
-    cr_km = sh1.number_input(
-        "Distância (KM)", min_value=0.0, value=0.0, step=10.0, format="%.0f", key="cr_km_shared",
+    cr_km = _cr_num(
+        sh1.text_input("Distância (KM)", value="0", key="cr_km_shared"),
     )
-    cr_diesel_vl = sh2.number_input(
-        "Valor Litro Diesel (R$)", min_value=0.0, value=float(v_diesel_sug or 0.0),
-        step=0.01, format="%.2f", key="cr_diesel_vl2",
+    cr_diesel_vl = _cr_num(
+        sh2.text_input("Valor Litro Diesel (R$)", value=f"{float(v_diesel_sug or 0.0):.2f}", key="cr_diesel_vl2"),
     )
-    cr_cons_diesel = sh3.number_input(
-        "Consumo Diesel (km/L)", min_value=0.0, value=float(v_cons_sug or 2.5),
-        step=0.10, format="%.2f", key="cr_cons_diesel2",
+    cr_cons_diesel = _cr_num(
+        sh3.text_input("Consumo Diesel (km/L)", value=f"{float(v_cons_sug or 2.5):.2f}", key="cr_cons_diesel2"),
     )
-    cr_arla_vl = sh4.number_input(
-        "Valor Litro Arla (R$)", min_value=0.0, value=float(v_arla_sug or 0.0),
-        step=0.01, format="%.2f", key="cr_arla_vl2",
+    cr_arla_vl = _cr_num(
+        sh4.text_input("Valor Litro Arla (R$)", value=f"{float(v_arla_sug or 0.0):.2f}", key="cr_arla_vl2"),
     )
-    cr_cons_arla = sh5.number_input(
-        "Consumo Arla (km/L)", min_value=0.0, value=float(v_cons_arla_sug or 0.0),
-        step=0.10, format="%.2f", key="cr_cons_arla2",
+    cr_cons_arla = _cr_num(
+        sh5.text_input("Consumo Arla (km/L)", value=f"{float(v_cons_arla_sug or 0.0):.2f}", key="cr_cons_arla2"),
     )
-    cr_pedagio = sh6.number_input(
-        "Total Pedágio (R$)", min_value=0.0, value=0.0,
-        step=1.0, format="%.2f", key="cr_pedagio2",
+    cr_pedagio = _cr_num(
+        sh6.text_input("Total Pedágio (R$)", value="0.00", key="cr_pedagio2"),
     )
 
     # ── CÁLCULOS COMPARTILHADOS ─────────────────────────────────────────────
@@ -9770,9 +9776,8 @@ with aba_calc:
     with col_km_in:
         st.markdown('<div class="cmp-shared-title">📏 Cobrança por KM</div>', unsafe_allow_html=True)
         ci1, ci2 = st.columns(2)
-        cr_val_km = ci1.number_input(
-            "Valor por KM (R$/km)", min_value=0.0, value=0.0,
-            step=0.0100, format="%.4f", key="cr_val_km2",
+        cr_val_km = _cr_num(
+            ci1.text_input("Valor por KM (R$/km)", value="0.0000", key="cr_val_km2"),
         )
 
     with col_sep:
@@ -9781,13 +9786,11 @@ with aba_calc:
     with col_ton_in:
         st.markdown('<div class="cmp-shared-title">🏋️ Cobrança por Tonelada</div>', unsafe_allow_html=True)
         ci3, ci4 = st.columns(2)
-        cr_val_ton = ci3.number_input(
-            "Valor por Tonelada (R$/ton)", min_value=0.0, value=0.0,
-            step=0.50, format="%.2f", key="cr_val_ton2",
+        cr_val_ton = _cr_num(
+            ci3.text_input("Valor por Tonelada (R$/ton)", value="0.00", key="cr_val_ton2"),
         )
-        cr_qtde_ton = ci4.number_input(
-            "Qtde Toneladas (ton)", min_value=0.0, value=0.0,
-            step=0.100, format="%.3f", key="cr_qtde_ton2",
+        cr_qtde_ton = _cr_num(
+            ci4.text_input("Qtde Toneladas (ton)", value="0.000", key="cr_qtde_ton2"),
         )
 
     # ── CÁLCULOS POR MODALIDADE ──────────────────────────────────────────────
