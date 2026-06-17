@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import date, datetime, timedelta
+from html import escape
 from pathlib import Path
 import streamlit as st
 import pandas as pd
@@ -574,6 +575,7 @@ def init_db():
             descricao TEXT NOT NULL,
             fornecedor TEXT,
             categoria TEXT,
+            veiculo_placa TEXT,
             n_documento TEXT,
             data_emissao TEXT,
             data_vencimento TEXT NOT NULL,
@@ -588,6 +590,7 @@ def init_db():
             descricao TEXT NOT NULL,
             cliente TEXT,
             categoria TEXT,
+            veiculo_placa TEXT,
             n_documento TEXT,
             data_emissao TEXT,
             data_vencimento TEXT NOT NULL,
@@ -883,6 +886,8 @@ def init_db():
 
         cursor_cp = c.execute("PRAGMA table_info(contas_pagar)")
         colunas_cp = [coluna[1] for coluna in cursor_cp.fetchall()]
+        if "veiculo_placa" not in colunas_cp:
+            c.execute("ALTER TABLE contas_pagar ADD COLUMN veiculo_placa TEXT")
         if "tipo_lancamento" not in colunas_cp:
             c.execute("ALTER TABLE contas_pagar ADD COLUMN tipo_lancamento TEXT DEFAULT 'NAO_MENSAL'")
         if "dia_vencimento_mensal" not in colunas_cp:
@@ -895,6 +900,11 @@ def init_db():
             c.execute("ALTER TABLE contas_pagar ADD COLUMN parcelas_pagas TEXT")
         if "dias_alerta" not in colunas_cp:
             c.execute("ALTER TABLE contas_pagar ADD COLUMN dias_alerta INTEGER DEFAULT 7")
+
+        cursor_cr = c.execute("PRAGMA table_info(contas_receber)")
+        colunas_cr = [coluna[1] for coluna in cursor_cr.fetchall()]
+        if "veiculo_placa" not in colunas_cr:
+            c.execute("ALTER TABLE contas_receber ADD COLUMN veiculo_placa TEXT")
 
         cursor_forn = c.execute("PRAGMA table_info(fornecedores)")
         colunas_forn = [coluna[1] for coluna in cursor_forn.fetchall()]
@@ -1089,6 +1099,11 @@ def rotulo_placa_com_descricao(placa):
         return placa_txt
     descricao = descricao_por_placa.get(placa_txt.upper(), "")
     return f"{placa_txt} - {descricao}" if descricao else placa_txt
+
+def placa_de_opcao_veiculo(opcao):
+    if not opcao:
+        return None
+    return str(opcao).split(" - ")[0].strip().upper() or None
 
 oficinas_db = bootstrap["oficinas_db"]
 dict_oficinas = {o["nome"]: o["id"] for o in oficinas_db}
@@ -4492,139 +4507,140 @@ with aba3:
 with aba4:
     st.subheader("🛠️ Gestão de Manutenção")
     
-    if not apenas_placas or not fornecedores_db:
-        st.warning("⚠️ Cadastre veículos e fornecedores primeiro.")
-    else:
-        col_ent, col_con = st.columns(2)
-        
-        # --- 1. ENTRADA (ABERTURA) ---
-        with col_ent:
-            st.markdown("### 1️⃣ Abrir Ordem (Entrada)")
-            with st.form("f_manut_entrada_v10", clear_on_submit=True):
-                c_e1, c_e2 = st.columns(2)
-                d_e = c_e1.date_input("Data de Entrada", format="DD/MM/YYYY")
-                num_os = c_e2.text_input("Nº O.S.")
-
-                opcoes_veiculo_manut = (
-                    [f"{str(v.get('descricao') or '').strip()} - {str(v.get('placa') or '').strip()}" for v in veiculos_db]
-                    if veiculos_db else apenas_placas
-                )
-                veic_sel_manut = st.selectbox("Veículo", opcoes_veiculo_manut)
-                if " - " in str(veic_sel_manut):
-                    v_m = str(veic_sel_manut).rsplit(" - ", 1)[1].strip()
-                else:
-                    v_m = str(veic_sel_manut).strip()
-                k_m = st.number_input("KM Entrada", step=1.0)
-                o_m = st.selectbox("Fornecedor", list(dict_fornecedores_manutencao.keys()))
-                def_m = st.text_area("Relato do Defeito")
-                
-                if st.form_submit_button("💾 Gravar", key="btn_manut_entrada_gravar"):
-                    with conn() as c:
-                        c.execute("""INSERT INTO manutencoes (data_entrada, veiculo_placa, oficina_id, defeito, km_servico, num_os) 
-                                     VALUES (?,?,?,?,?,?)""", (d_e.isoformat(), v_m, dict_fornecedores_manutencao[o_m], def_m, k_m, num_os))
-                    alerta_gravado()
-                    st.rerun()
-
-        # --- 2. CONCLUSÃO (FINALIZAÇÃO) ---
-        with col_con:
-            with conn() as c:
-                abertas = c.execute(
-                    """SELECT m.id, m.veiculo_placa, f.nome, m.data_entrada
-                       FROM manutencoes m
-                       JOIN fornecedores f ON m.oficina_id = f.id
-                       WHERE (m.data_fim IS NULL OR TRIM(m.data_fim) = '')
-                         AND (m.servico IS NULL OR TRIM(m.servico) = '')
-                       ORDER BY m.data_entrada DESC, m.id DESC"""
-                ).fetchall()
+    with st.expander("➕ Cadastro de Manutenção", expanded=False):
+        if not apenas_placas or not fornecedores_db:
+            st.warning("⚠️ Cadastre veículos e fornecedores primeiro.")
+        else:
+            col_ent, col_con = st.columns(2)
             
-            if abertas:
-                st.markdown("### 2️⃣ Finalizar Serviço")
-                opc_ab = {f"{a['veiculo_placa']} | {a['nome']} ({datetime.strptime(a['data_entrada'], '%Y-%m-%d').strftime('%d/%m/%Y')})": a['id'] for a in abertas}
-                sel_ab = st.selectbox("Selecionar Ordem Aberta", list(opc_ab.keys()))
-                fornecedores_pecas, mapa_fornecedores_pecas = carregar_fornecedores_para_pecas()
-                # Botão para excluir ordem aberta (com confirmação)
-                if "excluir_manut_confirm" not in st.session_state:
-                    st.session_state.excluir_manut_confirm = None
-
-                if st.button("🗑️ EXCLUIR ORDEM", key=f"btn_excluir_ordem_{sel_ab}"):
-                    st.session_state.excluir_manut_confirm = opc_ab[sel_ab]
-
-                if st.session_state.excluir_manut_confirm == opc_ab[sel_ab]:
-                    st.warning("Confirma exclusão desta ordem? Esta ação é irreversível.")
-                    c_ex1, c_ex2 = st.columns(2)
-                    if c_ex1.button("Confirmar exclusão", key=f"btn_confirm_excluir_{sel_ab}"):
-                        excluir_manutencao_completa(int(opc_ab[sel_ab]))
-                        st.success("Ordem excluída com sucesso.")
-                        st.session_state.excluir_manut_confirm = None
-                        st.rerun()
-                    if c_ex2.button("Cancelar", key=f"btn_cancel_excluir_{sel_ab}"):
-                        st.session_state.excluir_manut_confirm = None
-                        st.rerun()
-                
-                with st.form("f_manut_concl_v10"):
-                    c_s1, c_s2 = st.columns(2)
-                    d_f = c_s1.date_input("Data Saída", format="DD/MM/YYYY")
-                    num_nf = c_s2.text_input("Nº Nota Fiscal (N.F.)")
-                    
-                    serv_f = st.text_area("Serviço Realizado")
-                    
-                    c1, c3, c4, c5 = st.columns(4)
-                    v_mo = c1.number_input("Mão de Obra (R$)", min_value=0.0, step=10.0)
-                    v_ct_ida = c3.number_input("Custo Transp Ida (R$)", min_value=0.0, step=10.0)
-                    v_ct_ret = c4.number_input("Custo Transporte Retorno (R$)", min_value=0.0, step=10.0)
-                    dt_gar = c5.date_input("Vencimento Garantia", format="DD/MM/YYYY")
-
-                    st.markdown("**Peças compradas de fornecedores**")
-                    if not fornecedores_pecas:
-                        st.warning("Cadastre fornecedores na aba Fornecedores para lançar peças.")
-                    df_pecas_finalizar = st.data_editor(
-                        dataframe_pecas_vazio(),
-                        key=f"editor_pecas_finalizar_{opc_ab[sel_ab]}",
-                        hide_index=True,
-                        use_container_width=True,
-                        num_rows="dynamic",
-                        column_config={
-                            "Fornecedor": st.column_config.SelectboxColumn("Nome do Fornecedor", options=fornecedores_pecas),
-                            "Data Compra": st.column_config.DateColumn("Data Compra", format="DD/MM/YYYY"),
-                            "N. NF": st.column_config.TextColumn("N. NF"),
-                            "Descricao da Peca": st.column_config.TextColumn("Descrição da Peça"),
-                            "Valor da Peca": st.column_config.NumberColumn("Valor da Peça", min_value=0.0, step=0.01, format="R$ %.2f"),
-                            "Excluir": st.column_config.CheckboxColumn("🗑️ Excluir"),
-                        },
+            # --- 1. ENTRADA (ABERTURA) ---
+            with col_ent:
+                st.markdown("### 1️⃣ Abrir Ordem (Entrada)")
+                with st.form("f_manut_entrada_v10", clear_on_submit=True):
+                    c_e1, c_e2 = st.columns(2)
+                    d_e = c_e1.date_input("Data de Entrada", format="DD/MM/YYYY")
+                    num_os = c_e2.text_input("Nº O.S.")
+    
+                    opcoes_veiculo_manut = (
+                        [f"{str(v.get('descricao') or '').strip()} - {str(v.get('placa') or '').strip()}" for v in veiculos_db]
+                        if veiculos_db else apenas_placas
                     )
-                    itens_pecas_finalizar, v_pe, erro_pecas_finalizar = preparar_pecas_manutencao(df_pecas_finalizar, mapa_fornecedores_pecas)
+                    veic_sel_manut = st.selectbox("Veículo", opcoes_veiculo_manut)
+                    if " - " in str(veic_sel_manut):
+                        v_m = str(veic_sel_manut).rsplit(" - ", 1)[1].strip()
+                    else:
+                        v_m = str(veic_sel_manut).strip()
+                    k_m = st.number_input("KM Entrada", step=1.0)
+                    o_m = st.selectbox("Fornecedor", list(dict_fornecedores_manutencao.keys()))
+                    def_m = st.text_area("Relato do Defeito")
                     
-                    # Campo Visual do Total
-                    st.info(f"💰 **Total do Serviço: {brl(v_mo + v_pe + v_ct_ida + v_ct_ret)}**")
-                    
-                    obs_f = st.text_area("Observações Adicionais")
-                    pedido_fornecedor_files = st.file_uploader(
-                        "Anexar Pedido(s) do Fornecedor",
-                        type=["pdf", "png", "jpg", "jpeg", "webp", "doc", "docx", "xls", "xlsx"],
-                        accept_multiple_files=True,
-                        key="manut_pedido_fornecedor_upload",
-                    )
-                    
-                    if st.form_submit_button("💾 Gravar", key="btn_manut_conclusao_gravar"):
-                        if erro_pecas_finalizar:
-                            st.warning(erro_pecas_finalizar)
-                            st.stop()
-                        pedido_fornecedor_anexos = salvar_anexos_pedido_fornecedor(pedido_fornecedor_files)
-                        manut_id = int(opc_ab[sel_ab])
+                    if st.form_submit_button("💾 Gravar", key="btn_manut_entrada_gravar"):
                         with conn() as c:
-                            c.execute("""UPDATE manutencoes SET data_fim=?, servico=?, valor_mo=?, valor_pecas=?, custo_transporte_ida=?, custo_transporte_retorno=?, num_nf=?, 
-                                         data_vencimento_garantia=?, observacao_adicional=?, pedido_fornecedor_arquivo=? 
-                                         WHERE id=?""", (d_f.isoformat(), serv_f, v_mo, v_pe, v_ct_ida, v_ct_ret, num_nf, dt_gar.isoformat(), obs_f, (pedido_fornecedor_anexos[0]["caminho_arquivo"] if pedido_fornecedor_anexos else None), manut_id))
-                            salvar_pecas_manutencao(c, manut_id, itens_pecas_finalizar)
-                            for anexo in pedido_fornecedor_anexos:
-                                c.execute(
-                                    """INSERT INTO manutencoes_anexos (manutencao_id, nome_arquivo, caminho_arquivo, data_inclusao)
-                                       VALUES (?, ?, ?, ?)""",
-                                    (manut_id, anexo["nome_arquivo"], anexo["caminho_arquivo"], datetime.now().isoformat()),
-                                )
+                            c.execute("""INSERT INTO manutencoes (data_entrada, veiculo_placa, oficina_id, defeito, km_servico, num_os) 
+                                         VALUES (?,?,?,?,?,?)""", (d_e.isoformat(), v_m, dict_fornecedores_manutencao[o_m], def_m, k_m, num_os))
                         alerta_gravado()
                         st.rerun()
-
+    
+            # --- 2. CONCLUSÃO (FINALIZAÇÃO) ---
+            with col_con:
+                with conn() as c:
+                    abertas = c.execute(
+                        """SELECT m.id, m.veiculo_placa, f.nome, m.data_entrada
+                           FROM manutencoes m
+                           JOIN fornecedores f ON m.oficina_id = f.id
+                           WHERE (m.data_fim IS NULL OR TRIM(m.data_fim) = '')
+                             AND (m.servico IS NULL OR TRIM(m.servico) = '')
+                           ORDER BY m.data_entrada DESC, m.id DESC"""
+                    ).fetchall()
+                
+                if abertas:
+                    st.markdown("### 2️⃣ Finalizar Serviço")
+                    opc_ab = {f"{a['veiculo_placa']} | {a['nome']} ({datetime.strptime(a['data_entrada'], '%Y-%m-%d').strftime('%d/%m/%Y')})": a['id'] for a in abertas}
+                    sel_ab = st.selectbox("Selecionar Ordem Aberta", list(opc_ab.keys()))
+                    fornecedores_pecas, mapa_fornecedores_pecas = carregar_fornecedores_para_pecas()
+                    # Botão para excluir ordem aberta (com confirmação)
+                    if "excluir_manut_confirm" not in st.session_state:
+                        st.session_state.excluir_manut_confirm = None
+    
+                    if st.button("🗑️ EXCLUIR ORDEM", key=f"btn_excluir_ordem_{sel_ab}"):
+                        st.session_state.excluir_manut_confirm = opc_ab[sel_ab]
+    
+                    if st.session_state.excluir_manut_confirm == opc_ab[sel_ab]:
+                        st.warning("Confirma exclusão desta ordem? Esta ação é irreversível.")
+                        c_ex1, c_ex2 = st.columns(2)
+                        if c_ex1.button("Confirmar exclusão", key=f"btn_confirm_excluir_{sel_ab}"):
+                            excluir_manutencao_completa(int(opc_ab[sel_ab]))
+                            st.success("Ordem excluída com sucesso.")
+                            st.session_state.excluir_manut_confirm = None
+                            st.rerun()
+                        if c_ex2.button("Cancelar", key=f"btn_cancel_excluir_{sel_ab}"):
+                            st.session_state.excluir_manut_confirm = None
+                            st.rerun()
+                    
+                    with st.form("f_manut_concl_v10"):
+                        c_s1, c_s2 = st.columns(2)
+                        d_f = c_s1.date_input("Data Saída", format="DD/MM/YYYY")
+                        num_nf = c_s2.text_input("Nº Nota Fiscal (N.F.)")
+                        
+                        serv_f = st.text_area("Serviço Realizado")
+                        
+                        c1, c3, c4, c5 = st.columns(4)
+                        v_mo = c1.number_input("Mão de Obra (R$)", min_value=0.0, step=10.0)
+                        v_ct_ida = c3.number_input("Custo Transp Ida (R$)", min_value=0.0, step=10.0)
+                        v_ct_ret = c4.number_input("Custo Transporte Retorno (R$)", min_value=0.0, step=10.0)
+                        dt_gar = c5.date_input("Vencimento Garantia", format="DD/MM/YYYY")
+    
+                        st.markdown("**Peças compradas de fornecedores**")
+                        if not fornecedores_pecas:
+                            st.warning("Cadastre fornecedores na aba Fornecedores para lançar peças.")
+                        df_pecas_finalizar = st.data_editor(
+                            dataframe_pecas_vazio(),
+                            key=f"editor_pecas_finalizar_{opc_ab[sel_ab]}",
+                            hide_index=True,
+                            use_container_width=True,
+                            num_rows="dynamic",
+                            column_config={
+                                "Fornecedor": st.column_config.SelectboxColumn("Nome do Fornecedor", options=fornecedores_pecas),
+                                "Data Compra": st.column_config.DateColumn("Data Compra", format="DD/MM/YYYY"),
+                                "N. NF": st.column_config.TextColumn("N. NF"),
+                                "Descricao da Peca": st.column_config.TextColumn("Descrição da Peça"),
+                                "Valor da Peca": st.column_config.NumberColumn("Valor da Peça", min_value=0.0, step=0.01, format="R$ %.2f"),
+                                "Excluir": st.column_config.CheckboxColumn("🗑️ Excluir"),
+                            },
+                        )
+                        itens_pecas_finalizar, v_pe, erro_pecas_finalizar = preparar_pecas_manutencao(df_pecas_finalizar, mapa_fornecedores_pecas)
+                        
+                        # Campo Visual do Total
+                        st.info(f"💰 **Total do Serviço: {brl(v_mo + v_pe + v_ct_ida + v_ct_ret)}**")
+                        
+                        obs_f = st.text_area("Observações Adicionais")
+                        pedido_fornecedor_files = st.file_uploader(
+                            "Anexar Pedido(s) do Fornecedor",
+                            type=["pdf", "png", "jpg", "jpeg", "webp", "doc", "docx", "xls", "xlsx"],
+                            accept_multiple_files=True,
+                            key="manut_pedido_fornecedor_upload",
+                        )
+                        
+                        if st.form_submit_button("💾 Gravar", key="btn_manut_conclusao_gravar"):
+                            if erro_pecas_finalizar:
+                                st.warning(erro_pecas_finalizar)
+                                st.stop()
+                            pedido_fornecedor_anexos = salvar_anexos_pedido_fornecedor(pedido_fornecedor_files)
+                            manut_id = int(opc_ab[sel_ab])
+                            with conn() as c:
+                                c.execute("""UPDATE manutencoes SET data_fim=?, servico=?, valor_mo=?, valor_pecas=?, custo_transporte_ida=?, custo_transporte_retorno=?, num_nf=?, 
+                                             data_vencimento_garantia=?, observacao_adicional=?, pedido_fornecedor_arquivo=? 
+                                             WHERE id=?""", (d_f.isoformat(), serv_f, v_mo, v_pe, v_ct_ida, v_ct_ret, num_nf, dt_gar.isoformat(), obs_f, (pedido_fornecedor_anexos[0]["caminho_arquivo"] if pedido_fornecedor_anexos else None), manut_id))
+                                salvar_pecas_manutencao(c, manut_id, itens_pecas_finalizar)
+                                for anexo in pedido_fornecedor_anexos:
+                                    c.execute(
+                                        """INSERT INTO manutencoes_anexos (manutencao_id, nome_arquivo, caminho_arquivo, data_inclusao)
+                                           VALUES (?, ?, ?, ?)""",
+                                        (manut_id, anexo["nome_arquivo"], anexo["caminho_arquivo"], datetime.now().isoformat()),
+                                    )
+                            alerta_gravado()
+                            st.rerun()
+    
     # --- 3. HISTÓRICO COM EDIÇÃO TOTAL ---
     st.markdown("---")
     st.subheader("📋 Histórico e Auditoria")
@@ -4649,7 +4665,12 @@ with aba4:
     filtro_cols = st.columns(2)
     fornecedores_manut_opcoes = ["Todos os fornecedores"] + list(dict_fornecedores_manutencao.keys())
     fornecedor_manut_selecionado = filtro_cols[0].selectbox("Filtrar por Fornecedor", fornecedores_manut_opcoes, key="filtro_fornecedor_manutencao")
-    label_placa_selecionada = filtro_cols[1].selectbox("Filtrar por Placa", ["Todas as placas"] + list(mapa_placa_manut.keys()), key="filtro_placa_manutencao")
+    labels_placas_selecionadas = filtro_cols[1].multiselect(
+        "Filtrar por Placa",
+        list(mapa_placa_manut.keys()),
+        placeholder="Todas as placas",
+        key="filtro_placa_manutencao",
+    )
 
     with conn() as c:
         # Construir query com filtros opcionais de fornecedor e placa
@@ -4663,10 +4684,15 @@ with aba4:
             query_base += " AND m.oficina_id = ?"
             params.append(fornecedor_id)
 
-        if label_placa_selecionada != "Todas as placas":
-            placa_manut_selecionada = mapa_placa_manut[label_placa_selecionada]
-            query_base += " AND UPPER(TRIM(m.veiculo_placa)) = ?"
-            params.append(placa_manut_selecionada)
+        placas_manut_selecionadas = [
+            mapa_placa_manut[label]
+            for label in labels_placas_selecionadas
+            if label in mapa_placa_manut
+        ]
+        if placas_manut_selecionadas:
+            placeholders_placas = ",".join(["?"] * len(placas_manut_selecionadas))
+            query_base += f" AND UPPER(TRIM(m.veiculo_placa)) IN ({placeholders_placas})"
+            params.extend(placas_manut_selecionadas)
 
         query_base += " ORDER BY m.data_entrada DESC"
         df_m = pd.read_sql(query_base, c, params=params)
@@ -4743,6 +4769,10 @@ with aba4:
             total_ida = 0.0
             total_ret = 0.0
             total_servicos = 0.0
+            placas_rel_manut = (
+                ", ".join(placas_manut_selecionadas)
+                if placas_manut_selecionadas else "Todas as placas"
+            )
             pecas_por_manutencao = {}
             ids_manutencao_rel = [int(x) for x in df_m["id"].tolist()]
             if ids_manutencao_rel:
@@ -4790,6 +4820,7 @@ with aba4:
                     <h1 style="margin:0;">ART TRANSPORTES</h1>
                     <p style="margin:5px 0;">RELATÓRIO DE MANUTENÇÃO</p>
                     <p>Período: <b>{filtro_ini.strftime('%d/%m/%Y')}</b> até <b>{filtro_fim.strftime('%d/%m/%Y')}</b></p>
+                    <p style="margin:5px 0;">Placa(s): <b>{placas_rel_manut}</b></p>
                     <p style="margin:5px 0;">Registros: <b>{len(df_m)}</b></p>
                 </header>
                 <table>
@@ -5806,19 +5837,34 @@ with aba9:
         df_abs["desconto"] = pd.to_numeric(df_abs["desconto"], errors="coerce").fillna(0.0)
         df_abs["total_gasto"] = pd.to_numeric(df_abs["total_gasto"], errors="coerce").fillna(0.0)
         df_abs["tipo_combustivel"] = df_abs["tipo_combustivel"].apply(normalizar_tipo_combustivel)
+        df_abs["local_filtro"] = df_abs["local"].fillna("").astype(str).str.strip()
         tipos_filtro_abs = sorted([t for t in df_abs["tipo_combustivel"].dropna().unique().tolist() if t])
-        filtro_tipos_abs = st.multiselect(
+        locais_filtro_abs = sorted([l for l in df_abs["local_filtro"].dropna().unique().tolist() if l])
+        f_abs_tipo, f_abs_local = st.columns(2)
+        filtro_tipos_abs = f_abs_tipo.multiselect(
             "Filtrar por tipo de combustível",
             options=tipos_filtro_abs,
             default=tipos_filtro_abs,
-            help="Selecione um ou mais tipos para visualizar no resumo e no histórico.",
+            help="Selecione um ou mais tipos para visualizar no resumo, histórico e impressão.",
+            key="filtro_tipos_abastecimento",
+        )
+        filtro_locais_abs = f_abs_local.multiselect(
+            "Filtrar por local/posto",
+            options=locais_filtro_abs,
+            default=locais_filtro_abs,
+            help="Selecione um ou mais locais para visualizar no resumo, histórico e impressão.",
+            key="filtro_locais_abastecimento",
         )
         if filtro_tipos_abs:
             df_abs = df_abs[df_abs["tipo_combustivel"].isin(filtro_tipos_abs)].copy()
         else:
             df_abs = df_abs.iloc[0:0].copy()
+        if filtro_locais_abs:
+            df_abs = df_abs[df_abs["local_filtro"].isin(filtro_locais_abs)].copy()
+        else:
+            df_abs = df_abs.iloc[0:0].copy()
         if df_abs.empty:
-            st.info("Sem abastecimentos para o(s) tipo(s) de combustível selecionado(s).")
+            st.info("Sem abastecimentos para o(s) filtro(s) selecionado(s).")
 
         if df_abs["km_inicial"].notna().sum() >= 2: # Precisamos de pelo menos 2 registros válidos para tentar calcular média
             st.markdown(f"### 📊 Resumo de Consumo Real ({filtro_ini.strftime('%d/%m/%Y')} - {filtro_fim.strftime('%d/%m/%Y')})")
@@ -5928,6 +5974,104 @@ with aba9:
                 use_container_width=True,
                 hide_index=True,
             )
+
+            if st.button("🖨️ Impressão", key="btn_abs_impressao", use_container_width=True):
+                st.session_state.mostrar_impressao_abastecimento = True
+
+            if st.session_state.get("mostrar_impressao_abastecimento"):
+                df_imp_abs = df_abs.copy().sort_values(["data_dt", "id"])
+                linhas_imp_abs = []
+                for _, r_imp in df_imp_abs.iterrows():
+                    data_txt = pd.to_datetime(r_imp.get("data_dt"), errors="coerce")
+                    data_txt = data_txt.strftime("%d/%m/%Y") if pd.notna(data_txt) else ""
+                    linhas_imp_abs.append(
+                        "<tr>"
+                        f"<td>{escape(data_txt)}</td>"
+                        f"<td>{escape(str(r_imp.get('veiculo_placa') or ''))}</td>"
+                        f"<td>{escape(str(r_imp.get('local') or ''))}</td>"
+                        f"<td>{escape(str(r_imp.get('doc_nf') or ''))}</td>"
+                        f"<td>{escape(str(r_imp.get('tipo_combustivel') or ''))}</td>"
+                        f"<td class='num'>{format_br(r_imp.get('qtde_litros') or 0)}</td>"
+                        f"<td class='num'>{brl(r_imp.get('valor_unit') or 0)}</td>"
+                        f"<td class='num'>{brl(r_imp.get('total_gasto') or 0)}</td>"
+                        "</tr>"
+                    )
+
+                total_litros_imp = pd.to_numeric(df_imp_abs["qtde_litros"], errors="coerce").fillna(0.0).sum()
+                total_gasto_imp = pd.to_numeric(df_imp_abs["total_gasto"], errors="coerce").fillna(0.0).sum()
+                periodo_imp = f"{filtro_ini.strftime('%d/%m/%Y')} a {filtro_fim.strftime('%d/%m/%Y')}"
+                placa_imp = rotulo_placa_com_descricao(placa_filtro_calculo) if placa_filtro_calculo else "Todas as placas"
+                tipos_imp = ", ".join(filtro_tipos_abs) if filtro_tipos_abs else "Todos"
+                locais_imp = ", ".join(filtro_locais_abs) if filtro_locais_abs else "Todos"
+
+                html_impressao_abs = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <style>
+                        body {{ font-family: sans-serif; margin: 30px; color: #333; }}
+                        header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+                        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
+                        th, td {{ border: 1px solid #999; padding: 8px; text-align: left; vertical-align: top; }}
+                        th {{ background-color: #f2f2f2; }}
+                        .num {{ text-align: right; white-space: nowrap; }}
+                        tfoot td {{ font-weight: bold; background: #fafafa; }}
+                        .resumo {{ margin-top: 20px; text-align: right; font-size: 14px; }}
+                        .btn-print {{ background: #007bff; color: white; padding: 15px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 5px; }}
+                        @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
+                    </style>
+                </head>
+                <body>
+                    <button class="btn-print" onclick="window.print()">🖨️ CLIQUE AQUI PARA IMPRIMIR ESTE RELATÓRIO</button>
+
+                    <header>
+                        <h1 style="margin:0;">ART TRANSPORTES</h1>
+                        <p style="margin:5px 0;">RELATÓRIO DE ABASTECIMENTO</p>
+                        <p>Período: <b>{escape(periodo_imp)}</b></p>
+                        <p style="margin:5px 0;">
+                            Placa: <b>{escape(placa_imp)}</b>
+                            | Tipo Comb.: <b>{escape(tipos_imp)}</b>
+                            | Local/Posto: <b>{escape(locais_imp)}</b>
+                        </p>
+                    </header>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>DATA</th>
+                                <th>PLACA</th>
+                                <th>LOCAL POSTO</th>
+                                <th>N.NF</th>
+                                <th>TIPO COMB</th>
+                                <th>QTDE LITROS</th>
+                                <th>VALOR UNITARIO</th>
+                                <th>TOTAL</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {''.join(linhas_imp_abs)}
+                        </tbody>
+                        <tfoot>
+                            <tr>
+                                <td colspan="5">TOTAL</td>
+                                <td class="num">{format_br(total_litros_imp)}</td>
+                                <td></td>
+                                <td class="num">{brl(total_gasto_imp)}</td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                    <div class="resumo">
+                        <p><strong>Registros:</strong> {len(df_imp_abs)}</p>
+                        <p><strong>Total Litros:</strong> {format_br(total_litros_imp)}</p>
+                        <p><strong>Total Geral:</strong> {brl(total_gasto_imp)}</p>
+                        <p><strong>Gerado em:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+                    </div>
+                    <script>setTimeout(function(){{ window.print(); }}, 700);</script>
+                </body>
+                </html>
+                """
+                components.html(html_impressao_abs, height=1000, scrolling=True)
 
             id_para_editar = st.selectbox(
                 "Escolha um abastecimento para editar",
@@ -8335,6 +8479,15 @@ with aba17:
             cp_n_doc = fb2.text_input("N. Documento / Boleto / NF", placeholder="Ex: 00123").strip()
             cp_forma = fb3.selectbox("Forma de Pagamento", FORMAS_PAGAMENTO_CP)
 
+            cp_veiculo = st.selectbox(
+                "Placa do Veículo",
+                lista_veiculos_full,
+                index=None,
+                placeholder="Selecione a placa do veículo",
+                key="cp_veiculo_form",
+            )
+            cp_veiculo_placa = placa_de_opcao_veiculo(cp_veiculo)
+
             fc1, fc2, fc3 = st.columns(3)
             cp_dt_emissao = fc1.date_input("Data Emissão", value=date.today(), format="DD/MM/YYYY", key="cp_dt_emissao_form")
             cp_dt_venc = fc2.date_input("Data Vencimento *", value=date.today() + timedelta(days=30), format="DD/MM/YYYY", key="cp_dt_venc_form")
@@ -8358,8 +8511,8 @@ with aba17:
                         c.execute(
                             """INSERT INTO contas_pagar
                                (descricao, fornecedor, categoria, n_documento, data_emissao,
-                                data_vencimento, valor, data_pagamento, forma_pagamento, observacao, data_cadastro)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                data_vencimento, valor, data_pagamento, forma_pagamento, observacao, data_cadastro, veiculo_placa)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
                                 cp_descricao,
                                 cp_fornecedor or None,
@@ -8372,6 +8525,7 @@ with aba17:
                                 cp_forma,
                                 cp_obs.strip() or None,
                                 datetime.now().isoformat(),
+                                cp_veiculo_placa,
                             ),
                         )
                     limpar_cache_app()
@@ -8382,7 +8536,7 @@ with aba17:
         st.markdown("---")
         st.markdown("### 📋 Lançamentos")
 
-        fil1, fil2, fil3, fil4 = st.columns([2, 2, 2, 2])
+        fil1, fil2, fil3, fil4, fil5 = st.columns([2, 2, 2, 2, 2])
         cp_filtro_status = fil1.radio(
             "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Pagas"],
             horizontal=False, key="cp_fil_status"
@@ -8391,6 +8545,16 @@ with aba17:
         cp_fil_fim = fil3.date_input("Vencimento até:", value=date(date.today().year, 12, 31), format="DD/MM/YYYY", key="cp_fil_fim")
         cp_cats_disp = ["Todas"] + sorted(df_cp["categoria"].dropna().unique().tolist())
         cp_filtro_cat = fil4.selectbox("Categoria", cp_cats_disp, key="cp_fil_cat")
+        cp_placas_disp = ["Todas"] + sorted([
+            p for p in df_cp["veiculo_placa"].fillna("").astype(str).str.strip().str.upper().unique().tolist()
+            if p
+        ])
+        cp_filtro_placa = fil5.selectbox(
+            "Placa",
+            cp_placas_disp,
+            key="cp_fil_placa",
+            format_func=lambda x: x if x == "Todas" else rotulo_placa_com_descricao(x),
+        )
 
         df_cp_f = df_cp.copy()
         if "Pendentes" in cp_filtro_status:
@@ -8401,6 +8565,10 @@ with aba17:
             df_cp_f = df_cp_f[df_cp_f["status"] == "PAGO"]
         if cp_filtro_cat != "Todas":
             df_cp_f = df_cp_f[df_cp_f["categoria"] == cp_filtro_cat]
+        if cp_filtro_placa != "Todas":
+            df_cp_f = df_cp_f[
+                df_cp_f["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == cp_filtro_placa
+            ]
         df_cp_f = df_cp_f[
             df_cp_f["data_vencimento"].apply(
                 lambda d: cp_fil_ini <= d <= cp_fil_fim if pd.notna(d) else True
@@ -8415,17 +8583,18 @@ with aba17:
         _cp_show_data["Status"] = _st_cp.map(_CP_STATUS_ICON).fillna("🟡 Pendente")
         _cp_show_data = _cp_show_data.rename(columns={
             "id": "ID", "descricao": "Descrição", "fornecedor": "Fornecedor",
-            "categoria": "Categoria", "n_documento": "Documento",
+            "categoria": "Categoria", "veiculo_placa": "Placa", "n_documento": "Documento",
             "data_vencimento": "Vencimento", "valor": "Valor (R$)",
             "data_pagamento": "Data Pgto", "forma_pagamento": "Forma Pgto",
         })
-        colunas_cp_grid = ["ID", "Status", "Descrição", "Fornecedor", "Categoria", "Documento", "Vencimento", "Valor (R$)", "Data Pgto", "Forma Pgto"]
+        colunas_cp_grid = ["ID", "Status", "Descrição", "Fornecedor", "Categoria", "Placa", "Documento", "Vencimento", "Valor (R$)", "Data Pgto", "Forma Pgto"]
         st.dataframe(
             _cp_show_data[[c for c in colunas_cp_grid if c in _cp_show_data.columns]],
             use_container_width=True, hide_index=True,
             column_config={
                 "ID": st.column_config.NumberColumn("ID", format="%d", width="small"),
                 "Status": st.column_config.TextColumn("Status"),
+                "Placa": st.column_config.TextColumn("Placa"),
                 "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
                 "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f"),
                 "Data Pgto": st.column_config.DateColumn("Data Pgto", format="DD/MM/YYYY"),
@@ -8436,6 +8605,8 @@ with aba17:
         st.markdown("#### ⚡ Gerenciar Lançamento")
         if "cp_editando_id" not in st.session_state:
             st.session_state.cp_editando_id = None
+        if "cp_duplicando_id" not in st.session_state:
+            st.session_state.cp_duplicando_id = None
 
         opcoes_cp_sel = {
             f"ID {int(r['id'])} | {_CP_STATUS_ICON.get(r['status'], r['status'])} | {str(r.get('descricao') or '')} | Venc. {r['data_vencimento'].strftime('%d/%m/%Y') if pd.notna(r['data_vencimento']) else '-'} | {brl(float(r.get('valor') or 0))}": int(r["id"])
@@ -8458,11 +8629,12 @@ with aba17:
             _cp_tmp["data_pagamento"] = pd.to_datetime(_cp_tmp["data_pagamento"], errors="coerce").dt.date
             cp_status_atual = _add_status_cp(_cp_tmp)["status"].iloc[0]
 
-            bt1, bt2, bt3 = st.columns(3)
+            bt1, bt2, bt3, bt4 = st.columns(4)
             if cp_status_atual != "PAGO":
                 if bt1.button("✅ Dar Baixa (Marcar como Pago)", key=f"cp_baixa_{cp_id_sel}", use_container_width=True, type="primary"):
                     st.session_state[f"cp_show_baixa_{cp_id_sel}"] = True
                     st.session_state.cp_editando_id = None
+                    st.session_state.cp_duplicando_id = None
             else:
                 if bt1.button("↩️ Estornar Pagamento", key=f"cp_estornar_{cp_id_sel}", use_container_width=True):
                     with conn() as c:
@@ -8473,9 +8645,15 @@ with aba17:
 
             if bt2.button("✏️ Editar", key=f"cp_editar_{cp_id_sel}", use_container_width=True):
                 st.session_state.cp_editando_id = cp_id_sel
+                st.session_state.cp_duplicando_id = None
                 st.session_state.pop(f"cp_show_baixa_{cp_id_sel}", None)
 
-            if bt3.button("🗑️ Excluir", key=f"cp_excluir_{cp_id_sel}", use_container_width=True):
+            if bt3.button("📄 Duplicar", key=f"cp_duplicar_{cp_id_sel}", use_container_width=True):
+                st.session_state.cp_duplicando_id = cp_id_sel
+                st.session_state.cp_editando_id = None
+                st.session_state.pop(f"cp_show_baixa_{cp_id_sel}", None)
+
+            if bt4.button("🗑️ Excluir", key=f"cp_excluir_{cp_id_sel}", use_container_width=True):
                 st.session_state[f"cp_confirmar_del_{cp_id_sel}"] = True
 
             if st.session_state.get(f"cp_show_baixa_{cp_id_sel}"):
@@ -8506,12 +8684,91 @@ with aba17:
                         c.execute("DELETE FROM contas_pagar WHERE id=?", (cp_id_sel,))
                     st.session_state.pop(f"cp_confirmar_del_{cp_id_sel}", None)
                     st.session_state.cp_editando_id = None
+                    st.session_state.cp_duplicando_id = None
                     limpar_cache_app()
                     st.session_state["cp_flash_msg"] = "🗑️ Lançamento excluído."
                     st.rerun()
                 if cd2.button("❌ Cancelar", key=f"cp_del_nao_{cp_id_sel}", use_container_width=True):
                     st.session_state.pop(f"cp_confirmar_del_{cp_id_sel}", None)
                     st.rerun()
+
+            if st.session_state.get("cp_duplicando_id") == cp_id_sel:
+                st.markdown(f"**📄 Duplicando — base ID {cp_id_sel}**")
+                with st.form(f"form_dup_cp_{cp_id_sel}"):
+                    d1, d2 = st.columns(2)
+                    cp_d_desc = d1.text_input("Descrição", value=cp_row.get("descricao") or "").strip()
+                    cp_d_forn = d2.text_input("Fornecedor", value=cp_row.get("fornecedor") or "").strip()
+
+                    d3, d4, d5 = st.columns(3)
+                    _dup_cat_idx = CATEGORIAS_CP.index(cp_row.get("categoria")) if cp_row.get("categoria") in CATEGORIAS_CP else 0
+                    cp_d_cat = d3.selectbox("Categoria", CATEGORIAS_CP, index=_dup_cat_idx)
+                    cp_d_ndoc = d4.text_input("Documento", value=cp_row.get("n_documento") or "").strip()
+                    _dup_forma_idx = FORMAS_PAGAMENTO_CP.index(cp_row.get("forma_pagamento")) if cp_row.get("forma_pagamento") in FORMAS_PAGAMENTO_CP else 0
+                    cp_d_forma = d5.selectbox("Forma Pagamento", FORMAS_PAGAMENTO_CP, index=_dup_forma_idx)
+
+                    cp_dup_placa_atual = str(cp_row.get("veiculo_placa") or "").strip().upper()
+                    opcoes_cp_veic_dup = list(lista_veiculos_full)
+                    if cp_dup_placa_atual and not any(placa_de_opcao_veiculo(opt) == cp_dup_placa_atual for opt in opcoes_cp_veic_dup):
+                        opcoes_cp_veic_dup = [f"{cp_dup_placa_atual} - (placa manual)"] + opcoes_cp_veic_dup
+                    cp_dup_veic_idx = None
+                    for i, opt in enumerate(opcoes_cp_veic_dup):
+                        if placa_de_opcao_veiculo(opt) == cp_dup_placa_atual:
+                            cp_dup_veic_idx = i
+                            break
+                    cp_d_veiculo = st.selectbox(
+                        "Placa do Veículo",
+                        opcoes_cp_veic_dup,
+                        index=cp_dup_veic_idx,
+                        placeholder="Selecione a placa do veículo",
+                        key=f"cp_veiculo_dup_{cp_id_sel}",
+                    )
+                    cp_d_veiculo_placa = placa_de_opcao_veiculo(cp_d_veiculo)
+
+                    d6, d7, d8 = st.columns(3)
+                    _dup_dt_em = pd.to_datetime(cp_row.get("data_emissao"), errors="coerce")
+                    cp_d_dt_em = d6.date_input("Data Emissão", value=_dup_dt_em.date() if pd.notna(_dup_dt_em) else date.today(), format="DD/MM/YYYY")
+                    _dup_dt_vn = pd.to_datetime(cp_row.get("data_vencimento"), errors="coerce")
+                    cp_d_dt_vn = d7.date_input("Data Vencimento", value=_dup_dt_vn.date() if pd.notna(_dup_dt_vn) else date.today(), format="DD/MM/YYYY")
+                    cp_d_val = d8.number_input("Valor (R$)", min_value=0.01, step=0.01, value=float(cp_row.get("valor") or 0.0), format="%.2f")
+
+                    cp_d_obs = st.text_area("Observação", value=cp_row.get("observacao") or "", height=60)
+
+                    df1, df2 = st.columns(2)
+                    gravar_d_cp = df1.form_submit_button("💾 Gravar Conta Duplicada", use_container_width=True, type="primary")
+                    cancelar_d_cp = df2.form_submit_button("❌ Cancelar", use_container_width=True)
+
+                    if cancelar_d_cp:
+                        st.session_state.cp_duplicando_id = None
+                        st.rerun()
+                    if gravar_d_cp:
+                        if not cp_d_desc:
+                            st.warning("Preencha a Descrição.")
+                        else:
+                            with conn() as c:
+                                c.execute(
+                                    """INSERT INTO contas_pagar
+                                       (descricao, fornecedor, categoria, n_documento, data_emissao,
+                                        data_vencimento, valor, data_pagamento, forma_pagamento, observacao, data_cadastro, veiculo_placa)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (
+                                        cp_d_desc,
+                                        cp_d_forn or None,
+                                        cp_d_cat,
+                                        cp_d_ndoc or None,
+                                        cp_d_dt_em.isoformat(),
+                                        cp_d_dt_vn.isoformat(),
+                                        float(cp_d_val),
+                                        None,
+                                        cp_d_forma,
+                                        cp_d_obs.strip() or None,
+                                        datetime.now().isoformat(),
+                                        cp_d_veiculo_placa,
+                                    ),
+                                )
+                            st.session_state.cp_duplicando_id = None
+                            limpar_cache_app()
+                            st.session_state["cp_flash_msg"] = "✅ Conta a pagar duplicada com sucesso!"
+                            st.rerun()
 
             if st.session_state.get("cp_editando_id") == cp_id_sel:
                 st.markdown(f"**✏️ Editando — ID {cp_id_sel}**")
@@ -8526,6 +8783,24 @@ with aba17:
                     cp_e_ndoc = e4.text_input("Documento", value=cp_row.get("n_documento") or "").strip()
                     _forma_idx = FORMAS_PAGAMENTO_CP.index(cp_row.get("forma_pagamento")) if cp_row.get("forma_pagamento") in FORMAS_PAGAMENTO_CP else 0
                     cp_e_forma = e5.selectbox("Forma Pagamento", FORMAS_PAGAMENTO_CP, index=_forma_idx)
+
+                    cp_placa_atual = str(cp_row.get("veiculo_placa") or "").strip().upper()
+                    opcoes_cp_veic_ed = list(lista_veiculos_full)
+                    if cp_placa_atual and not any(placa_de_opcao_veiculo(opt) == cp_placa_atual for opt in opcoes_cp_veic_ed):
+                        opcoes_cp_veic_ed = [f"{cp_placa_atual} - (placa manual)"] + opcoes_cp_veic_ed
+                    cp_veic_idx = None
+                    for i, opt in enumerate(opcoes_cp_veic_ed):
+                        if placa_de_opcao_veiculo(opt) == cp_placa_atual:
+                            cp_veic_idx = i
+                            break
+                    cp_e_veiculo = st.selectbox(
+                        "Placa do Veículo",
+                        opcoes_cp_veic_ed,
+                        index=cp_veic_idx,
+                        placeholder="Selecione a placa do veículo",
+                        key=f"cp_veiculo_edit_{cp_id_sel}",
+                    )
+                    cp_e_veiculo_placa = placa_de_opcao_veiculo(cp_e_veiculo)
 
                     e6, e7, e8 = st.columns(3)
                     _dt_em = pd.to_datetime(cp_row.get("data_emissao"), errors="coerce")
@@ -8551,10 +8826,10 @@ with aba17:
                                 c.execute(
                                     """UPDATE contas_pagar SET descricao=?, fornecedor=?, categoria=?,
                                        n_documento=?, data_emissao=?, data_vencimento=?, valor=?,
-                                       forma_pagamento=?, observacao=? WHERE id=?""",
+                                       forma_pagamento=?, observacao=?, veiculo_placa=? WHERE id=?""",
                                     (cp_e_desc, cp_e_forn or None, cp_e_cat, cp_e_ndoc or None,
                                      cp_e_dt_em.isoformat(), cp_e_dt_vn.isoformat(), float(cp_e_val),
-                                     cp_e_forma, cp_e_obs.strip() or None, cp_id_sel),
+                                     cp_e_forma, cp_e_obs.strip() or None, cp_e_veiculo_placa, cp_id_sel),
                                 )
                             st.session_state.cp_editando_id = None
                             limpar_cache_app()
@@ -8613,6 +8888,15 @@ with aba_cr:
             cr_n_doc = gb2.text_input("N. NF / Documento", placeholder="Ex: NF-00456").strip()
             cr_forma = gb3.selectbox("Forma de Recebimento", FORMAS_RECEBIMENTO_CR)
 
+            cr_veiculo = st.selectbox(
+                "Placa do Veículo",
+                lista_veiculos_full,
+                index=None,
+                placeholder="Selecione a placa do veículo",
+                key="cr_veiculo_form",
+            )
+            cr_veiculo_placa = placa_de_opcao_veiculo(cr_veiculo)
+
             gc1, gc2, gc3 = st.columns(3)
             cr_dt_emissao = gc1.date_input("Data Emissão", value=date.today(), format="DD/MM/YYYY", key="cr_dt_emissao_form")
             cr_dt_venc = gc2.date_input("Data Vencimento *", value=date.today() + timedelta(days=30), format="DD/MM/YYYY", key="cr_dt_venc_form")
@@ -8638,8 +8922,8 @@ with aba_cr:
                         c.execute(
                             """INSERT INTO contas_receber
                                (descricao, cliente, categoria, n_documento, data_emissao,
-                                data_vencimento, valor, data_recebimento, forma_recebimento, observacao, data_cadastro)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                data_vencimento, valor, data_recebimento, forma_recebimento, observacao, data_cadastro, veiculo_placa)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
                                 cr_descricao,
                                 cr_cliente,
@@ -8652,6 +8936,7 @@ with aba_cr:
                                 cr_forma,
                                 cr_obs.strip() or None,
                                 datetime.now().isoformat(),
+                                cr_veiculo_placa,
                             ),
                         )
                     limpar_cache_app()
@@ -8662,7 +8947,7 @@ with aba_cr:
         st.markdown("---")
         st.markdown("### 📋 Lançamentos")
 
-        gf1, gf2, gf3, gf4 = st.columns([2, 2, 2, 2])
+        gf1, gf2, gf3, gf4, gf5 = st.columns([2, 2, 2, 2, 2])
         cr_filtro_status = gf1.radio(
             "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Recebidas"],
             horizontal=False, key="cr_fil_status"
@@ -8671,6 +8956,16 @@ with aba_cr:
         cr_fil_fim = gf3.date_input("Vencimento até:", value=date(date.today().year, 12, 31), format="DD/MM/YYYY", key="cr_fil_fim")
         cr_cats_disp = ["Todas"] + sorted(df_cr["categoria"].dropna().unique().tolist())
         cr_filtro_cat = gf4.selectbox("Categoria", cr_cats_disp, key="cr_fil_cat")
+        cr_placas_disp = ["Todas"] + sorted([
+            p for p in df_cr["veiculo_placa"].fillna("").astype(str).str.strip().str.upper().unique().tolist()
+            if p
+        ])
+        cr_filtro_placa = gf5.selectbox(
+            "Placa",
+            cr_placas_disp,
+            key="cr_fil_placa",
+            format_func=lambda x: x if x == "Todas" else rotulo_placa_com_descricao(x),
+        )
 
         df_cr_f = df_cr.copy()
         if "Pendentes" in cr_filtro_status:
@@ -8681,6 +8976,10 @@ with aba_cr:
             df_cr_f = df_cr_f[df_cr_f["status"] == "RECEBIDO"]
         if cr_filtro_cat != "Todas":
             df_cr_f = df_cr_f[df_cr_f["categoria"] == cr_filtro_cat]
+        if cr_filtro_placa != "Todas":
+            df_cr_f = df_cr_f[
+                df_cr_f["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == cr_filtro_placa
+            ]
         df_cr_f = df_cr_f[
             df_cr_f["data_vencimento"].apply(
                 lambda d: cr_fil_ini <= d <= cr_fil_fim if pd.notna(d) else True
@@ -8695,17 +8994,18 @@ with aba_cr:
         _cr_show_data["Status"] = _st_cr.map(_CR_STATUS_ICON).fillna("🟡 Pendente")
         _cr_show_data = _cr_show_data.rename(columns={
             "id": "ID", "descricao": "Descrição", "cliente": "Cliente",
-            "categoria": "Categoria", "n_documento": "Documento",
+            "categoria": "Categoria", "veiculo_placa": "Placa", "n_documento": "Documento",
             "data_vencimento": "Vencimento", "valor": "Valor (R$)",
             "data_recebimento": "Data Rec.", "forma_recebimento": "Forma Rec.",
         })
-        colunas_cr_grid = ["ID", "Status", "Descrição", "Cliente", "Categoria", "Documento", "Vencimento", "Valor (R$)", "Data Rec.", "Forma Rec."]
+        colunas_cr_grid = ["ID", "Status", "Descrição", "Cliente", "Categoria", "Placa", "Documento", "Vencimento", "Valor (R$)", "Data Rec.", "Forma Rec."]
         st.dataframe(
             _cr_show_data[[c for c in colunas_cr_grid if c in _cr_show_data.columns]],
             use_container_width=True, hide_index=True,
             column_config={
                 "ID": st.column_config.NumberColumn("ID", format="%d", width="small"),
                 "Status": st.column_config.TextColumn("Status"),
+                "Placa": st.column_config.TextColumn("Placa"),
                 "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
                 "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f"),
                 "Data Rec.": st.column_config.DateColumn("Data Rec.", format="DD/MM/YYYY"),
@@ -8716,6 +9016,8 @@ with aba_cr:
         st.markdown("#### ⚡ Gerenciar Lançamento")
         if "cr_editando_id" not in st.session_state:
             st.session_state.cr_editando_id = None
+        if "cr_duplicando_id" not in st.session_state:
+            st.session_state.cr_duplicando_id = None
 
         opcoes_cr_sel = {
             f"ID {int(r['id'])} | {_CR_STATUS_ICON.get(r['status'], r['status'])} | {str(r.get('cliente') or '')} | {str(r.get('descricao') or '')} | Venc. {r['data_vencimento'].strftime('%d/%m/%Y') if pd.notna(r['data_vencimento']) else '-'} | {brl(float(r.get('valor') or 0))}": int(r["id"])
@@ -8738,11 +9040,12 @@ with aba_cr:
             _cr_tmp["data_recebimento"] = pd.to_datetime(_cr_tmp["data_recebimento"], errors="coerce").dt.date
             cr_status_atual = _add_status_cr(_cr_tmp)["status"].iloc[0]
 
-            rb1, rb2, rb3 = st.columns(3)
+            rb1, rb2, rb3, rb4 = st.columns(4)
             if cr_status_atual != "RECEBIDO":
                 if rb1.button("✅ Confirmar Recebimento", key=f"cr_baixa_{cr_id_sel}", use_container_width=True, type="primary"):
                     st.session_state[f"cr_show_baixa_{cr_id_sel}"] = True
                     st.session_state.cr_editando_id = None
+                    st.session_state.cr_duplicando_id = None
             else:
                 if rb1.button("↩️ Estornar Recebimento", key=f"cr_estornar_{cr_id_sel}", use_container_width=True):
                     with conn() as c:
@@ -8753,9 +9056,15 @@ with aba_cr:
 
             if rb2.button("✏️ Editar", key=f"cr_editar_{cr_id_sel}", use_container_width=True):
                 st.session_state.cr_editando_id = cr_id_sel
+                st.session_state.cr_duplicando_id = None
                 st.session_state.pop(f"cr_show_baixa_{cr_id_sel}", None)
 
-            if rb3.button("🗑️ Excluir", key=f"cr_excluir_{cr_id_sel}", use_container_width=True):
+            if rb3.button("📄 Duplicar", key=f"cr_duplicar_{cr_id_sel}", use_container_width=True):
+                st.session_state.cr_duplicando_id = cr_id_sel
+                st.session_state.cr_editando_id = None
+                st.session_state.pop(f"cr_show_baixa_{cr_id_sel}", None)
+
+            if rb4.button("🗑️ Excluir", key=f"cr_excluir_{cr_id_sel}", use_container_width=True):
                 st.session_state[f"cr_confirmar_del_{cr_id_sel}"] = True
 
             if st.session_state.get(f"cr_show_baixa_{cr_id_sel}"):
@@ -8786,12 +9095,91 @@ with aba_cr:
                         c.execute("DELETE FROM contas_receber WHERE id=?", (cr_id_sel,))
                     st.session_state.pop(f"cr_confirmar_del_{cr_id_sel}", None)
                     st.session_state.cr_editando_id = None
+                    st.session_state.cr_duplicando_id = None
                     limpar_cache_app()
                     st.session_state["cr_flash_msg"] = "🗑️ Lançamento excluído."
                     st.rerun()
                 if rd2.button("❌ Cancelar", key=f"cr_del_nao_{cr_id_sel}", use_container_width=True):
                     st.session_state.pop(f"cr_confirmar_del_{cr_id_sel}", None)
                     st.rerun()
+
+            if st.session_state.get("cr_duplicando_id") == cr_id_sel:
+                st.markdown(f"**📄 Duplicando — base ID {cr_id_sel}**")
+                with st.form(f"form_dup_cr_{cr_id_sel}"):
+                    dr1, dr2 = st.columns(2)
+                    cr_d_desc = dr1.text_input("Descrição", value=cr_row.get("descricao") or "").strip()
+                    cr_d_cli = dr2.text_input("Cliente", value=cr_row.get("cliente") or "").strip()
+
+                    dr3, dr4, dr5 = st.columns(3)
+                    _cr_dup_cat_idx = CATEGORIAS_CR.index(cr_row.get("categoria")) if cr_row.get("categoria") in CATEGORIAS_CR else 0
+                    cr_d_cat = dr3.selectbox("Categoria", CATEGORIAS_CR, index=_cr_dup_cat_idx)
+                    cr_d_ndoc = dr4.text_input("Documento", value=cr_row.get("n_documento") or "").strip()
+                    _cr_dup_forma_idx = FORMAS_RECEBIMENTO_CR.index(cr_row.get("forma_recebimento")) if cr_row.get("forma_recebimento") in FORMAS_RECEBIMENTO_CR else 0
+                    cr_d_forma = dr5.selectbox("Forma Recebimento", FORMAS_RECEBIMENTO_CR, index=_cr_dup_forma_idx)
+
+                    cr_dup_placa_atual = str(cr_row.get("veiculo_placa") or "").strip().upper()
+                    opcoes_cr_veic_dup = list(lista_veiculos_full)
+                    if cr_dup_placa_atual and not any(placa_de_opcao_veiculo(opt) == cr_dup_placa_atual for opt in opcoes_cr_veic_dup):
+                        opcoes_cr_veic_dup = [f"{cr_dup_placa_atual} - (placa manual)"] + opcoes_cr_veic_dup
+                    cr_dup_veic_idx = None
+                    for i, opt in enumerate(opcoes_cr_veic_dup):
+                        if placa_de_opcao_veiculo(opt) == cr_dup_placa_atual:
+                            cr_dup_veic_idx = i
+                            break
+                    cr_d_veiculo = st.selectbox(
+                        "Placa do Veículo",
+                        opcoes_cr_veic_dup,
+                        index=cr_dup_veic_idx,
+                        placeholder="Selecione a placa do veículo",
+                        key=f"cr_veiculo_dup_{cr_id_sel}",
+                    )
+                    cr_d_veiculo_placa = placa_de_opcao_veiculo(cr_d_veiculo)
+
+                    dr6, dr7, dr8 = st.columns(3)
+                    _cr_dup_dt_em = pd.to_datetime(cr_row.get("data_emissao"), errors="coerce")
+                    cr_d_dt_em = dr6.date_input("Data Emissão", value=_cr_dup_dt_em.date() if pd.notna(_cr_dup_dt_em) else date.today(), format="DD/MM/YYYY")
+                    _cr_dup_dt_vn = pd.to_datetime(cr_row.get("data_vencimento"), errors="coerce")
+                    cr_d_dt_vn = dr7.date_input("Data Vencimento", value=_cr_dup_dt_vn.date() if pd.notna(_cr_dup_dt_vn) else date.today(), format="DD/MM/YYYY")
+                    cr_d_val = dr8.number_input("Valor (R$)", min_value=0.01, step=0.01, value=float(cr_row.get("valor") or 0.0), format="%.2f")
+
+                    cr_d_obs = st.text_area("Observação", value=cr_row.get("observacao") or "", height=60)
+
+                    drf1, drf2 = st.columns(2)
+                    gravar_d_cr = drf1.form_submit_button("💾 Gravar Conta Duplicada", use_container_width=True, type="primary")
+                    cancelar_d_cr = drf2.form_submit_button("❌ Cancelar", use_container_width=True)
+
+                    if cancelar_d_cr:
+                        st.session_state.cr_duplicando_id = None
+                        st.rerun()
+                    if gravar_d_cr:
+                        if not cr_d_desc or not cr_d_cli:
+                            st.warning("Preencha Descrição e Cliente.")
+                        else:
+                            with conn() as c:
+                                c.execute(
+                                    """INSERT INTO contas_receber
+                                       (descricao, cliente, categoria, n_documento, data_emissao,
+                                        data_vencimento, valor, data_recebimento, forma_recebimento, observacao, data_cadastro, veiculo_placa)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (
+                                        cr_d_desc,
+                                        cr_d_cli,
+                                        cr_d_cat,
+                                        cr_d_ndoc or None,
+                                        cr_d_dt_em.isoformat(),
+                                        cr_d_dt_vn.isoformat(),
+                                        float(cr_d_val),
+                                        None,
+                                        cr_d_forma,
+                                        cr_d_obs.strip() or None,
+                                        datetime.now().isoformat(),
+                                        cr_d_veiculo_placa,
+                                    ),
+                                )
+                            st.session_state.cr_duplicando_id = None
+                            limpar_cache_app()
+                            st.session_state["cr_flash_msg"] = "✅ Conta a receber duplicada com sucesso!"
+                            st.rerun()
 
             if st.session_state.get("cr_editando_id") == cr_id_sel:
                 st.markdown(f"**✏️ Editando — ID {cr_id_sel}**")
@@ -8806,6 +9194,24 @@ with aba_cr:
                     cr_e_ndoc = re4.text_input("Documento", value=cr_row.get("n_documento") or "").strip()
                     _cr_forma_idx = FORMAS_RECEBIMENTO_CR.index(cr_row.get("forma_recebimento")) if cr_row.get("forma_recebimento") in FORMAS_RECEBIMENTO_CR else 0
                     cr_e_forma = re5.selectbox("Forma Recebimento", FORMAS_RECEBIMENTO_CR, index=_cr_forma_idx)
+
+                    cr_placa_atual = str(cr_row.get("veiculo_placa") or "").strip().upper()
+                    opcoes_cr_veic_ed = list(lista_veiculos_full)
+                    if cr_placa_atual and not any(placa_de_opcao_veiculo(opt) == cr_placa_atual for opt in opcoes_cr_veic_ed):
+                        opcoes_cr_veic_ed = [f"{cr_placa_atual} - (placa manual)"] + opcoes_cr_veic_ed
+                    cr_veic_idx = None
+                    for i, opt in enumerate(opcoes_cr_veic_ed):
+                        if placa_de_opcao_veiculo(opt) == cr_placa_atual:
+                            cr_veic_idx = i
+                            break
+                    cr_e_veiculo = st.selectbox(
+                        "Placa do Veículo",
+                        opcoes_cr_veic_ed,
+                        index=cr_veic_idx,
+                        placeholder="Selecione a placa do veículo",
+                        key=f"cr_veiculo_edit_{cr_id_sel}",
+                    )
+                    cr_e_veiculo_placa = placa_de_opcao_veiculo(cr_e_veiculo)
 
                     re6, re7, re8 = st.columns(3)
                     _cr_dt_em = pd.to_datetime(cr_row.get("data_emissao"), errors="coerce")
@@ -8831,10 +9237,10 @@ with aba_cr:
                                 c.execute(
                                     """UPDATE contas_receber SET descricao=?, cliente=?, categoria=?,
                                        n_documento=?, data_emissao=?, data_vencimento=?, valor=?,
-                                       forma_recebimento=?, observacao=? WHERE id=?""",
+                                       forma_recebimento=?, observacao=?, veiculo_placa=? WHERE id=?""",
                                     (cr_e_desc, cr_e_cli, cr_e_cat, cr_e_ndoc or None,
                                      cr_e_dt_em.isoformat(), cr_e_dt_vn.isoformat(), float(cr_e_val),
-                                     cr_e_forma, cr_e_obs.strip() or None, cr_id_sel),
+                                     cr_e_forma, cr_e_obs.strip() or None, cr_e_veiculo_placa, cr_id_sel),
                                 )
                             st.session_state.cr_editando_id = None
                             limpar_cache_app()
