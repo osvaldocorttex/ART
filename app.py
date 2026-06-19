@@ -19,7 +19,7 @@ def format_br(valor, prefixo="", casas_decimais=2):
     if valor is None or valor == "": return ""
     try:
         if casas_decimais == 0: return f"{int(float(valor)):,}".replace(",", ".")
-        s = f"{float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        s = f"{float(valor):,.{casas_decimais}f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"{prefixo}{s}"
     except: return valor
 
@@ -75,6 +75,29 @@ def normalizar_tipo_combustivel(valor):
 def alerta_gravado(mensagem="✅ Gravado com sucesso!"):
     limpar_cache_app()
     st.success(mensagem)
+
+def focar_campo_por_rotulo(rotulo):
+    rotulo_js = str(rotulo or "").replace("\\", "\\\\").replace("'", "\\'")
+    components.html(
+        f"""
+        <script>
+        setTimeout(function() {{
+            const doc = window.parent.document;
+            const labels = Array.from(doc.querySelectorAll('label'));
+            const alvo = labels.find((label) => (label.innerText || '').trim().includes('{rotulo_js}'));
+            if (!alvo) return;
+            const container = alvo.closest('[data-testid="stWidgetLabel"]')?.parentElement || alvo.parentElement;
+            const campo = container?.querySelector('input, textarea, select, [contenteditable="true"]');
+            if (campo) {{
+                campo.focus();
+                if (typeof campo.select === 'function') campo.select();
+            }}
+        }}, 350);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 def conn():
     c = sqlite3.connect(DB, check_same_thread=False)
@@ -5736,73 +5759,168 @@ with aba9:
             if str(opt_veic).split(" - ")[0].strip().upper() == str(placa_filtro_calculo).strip().upper():
                 index_veiculo_abastecimento = idx_opt
                 break
+    if "abs_form_nonce" not in st.session_state:
+        st.session_state["abs_form_nonce"] = 0
 
-    with st.form("form_inclusao_abastecimento", clear_on_submit=True):
-        col_a, col_b, col_c, col_d = st.columns(4)
-        data_abs = col_a.date_input("Data", value=date.today(), format="DD/MM/YYYY")
-        if opcoes_veiculos_abastecimento:
-            veic_abs = col_b.selectbox(
-                "Veículo/Placa",
-                options=opcoes_veiculos_abastecimento,
-                index=index_veiculo_abastecimento,
-                key="abastecimento_veiculo_incluir",
-            )
-            placa_abs = str(veic_abs).split(" - ")[0].strip()
-        else:
-            placa_abs = col_b.text_input("Placa").upper().strip()
-        local_abs = col_c.text_input("Local do Abastecimento")
-        doc_nf_abs = col_d.text_input("Documento / NF")
+    params_ultimo_abs = []
+    where_ultimo_abs = ""
+    if placa_filtro_calculo:
+        where_ultimo_abs = "WHERE UPPER(TRIM(veiculo_placa)) = ?"
+        params_ultimo_abs.append(str(placa_filtro_calculo).strip().upper())
+    with conn() as c:
+        ultimo_abastecimento = c.execute(
+            f"""SELECT *
+                FROM abastecimentos
+                {where_ultimo_abs}
+                ORDER BY date(data) DESC, id DESC
+                LIMIT 1""",
+            params_ultimo_abs,
+        ).fetchone()
 
-        col_e, col_f, col_g, col_h, col_i = st.columns(5)
-        km_inicial_abs = col_e.number_input("KM Inicial", min_value=0.0, value=0.0, step=1.0)
-        tipo_cadastrado_abs = col_f.selectbox(
-            "Tipo Cadastrado (opcional)",
-            options=[""] + tipos_combustivel_sugeridos,
-            index=0,
-            placeholder="Selecione um tipo já cadastrado",
-        )
-        tipo_comb_abs = col_f.text_input(
-            "Tipo de Combustível",
-            value=tipo_cadastrado_abs,
-            help="Você pode escolher um tipo já cadastrado acima ou digitar um novo aqui.",
-        ).strip()
-        qtde_litros_abs = col_g.number_input("Qtde Litros", min_value=0.0, value=0.0, step=1.0)
-        valor_unit_abs = col_h.number_input("Valor Unitário (R$)", min_value=0.0, value=0.0, step=0.01)
-        desconto_abs = col_i.number_input("Desconto (R$)", min_value=0.0, value=0.0, step=0.01)
+    if ultimo_abastecimento:
+        if st.button("📋 Replicar último cadastro", key="btn_replicar_ultimo_abastecimento", use_container_width=True):
+            ultimo_abs = dict(ultimo_abastecimento)
+            placa_ultimo_abs = str(ultimo_abs.get("veiculo_placa") or "").strip().upper()
+            try:
+                data_replicada_abs = pd.to_datetime(ultimo_abs.get("data"), errors="coerce").date()
+            except Exception:
+                data_replicada_abs = date.today()
+            if pd.isna(data_replicada_abs):
+                data_replicada_abs = date.today()
+            st.session_state["abs_form_defaults"] = {
+                "data": data_replicada_abs,
+                "placa": placa_ultimo_abs,
+                "local": str(ultimo_abs.get("local") or ""),
+                "doc_nf": str(ultimo_abs.get("doc_nf") or ""),
+                "km_inicial": float(ultimo_abs.get("km_inicial") or 0.0),
+                "tipo_combustivel": normalizar_tipo_combustivel(ultimo_abs.get("tipo_combustivel")),
+                "qtde_litros": float(ultimo_abs.get("qtde_litros") or 0.0),
+                "valor_unit": float(ultimo_abs.get("valor_unit") or 0.0),
+                "desconto": float(ultimo_abs.get("desconto") or 0.0),
+            }
+            st.session_state["abs_form_nonce"] += 1
+            st.session_state["abs_expandir_cadastro"] = True
+            st.session_state["abs_replicado_msg"] = "Último cadastro carregado no formulário. Altere o que precisar e clique em Gravar."
+            st.rerun()
+    else:
+        st.caption("Nenhum abastecimento anterior para replicar.")
 
-        total_bruto_abs = qtde_litros_abs * valor_unit_abs
-        total_gasto_abs = max(total_bruto_abs - desconto_abs, 0.0)
-        st.caption(f"Total calculado: {brl(total_bruto_abs)} - desconto {brl(desconto_abs)} = {brl(total_gasto_abs)}")
+    if st.session_state.get("abs_sucesso_msg"):
+        st.success(st.session_state.pop("abs_sucesso_msg"))
+    if st.session_state.get("abs_replicado_msg"):
+        st.info(st.session_state.pop("abs_replicado_msg"))
 
-        if st.form_submit_button("💾 Gravar", use_container_width=True, type="primary", key="btn_abastecimento_incluir_gravar"):
-            if not placa_abs.strip():
-                st.warning("Informe a placa do veículo para incluir o registro.")
-            elif not local_abs.strip():
-                st.warning("Informe o local do abastecimento para incluir o registro.")
-            elif not normalizar_tipo_combustivel(tipo_comb_abs):
-                st.warning("Informe o tipo de combustível para incluir o registro.")
-            elif qtde_litros_abs <= 0 or valor_unit_abs <= 0:
-                st.warning("Informe quantidade de litros e valor unitário maiores que zero.")
+    abs_form_defaults = st.session_state.get("abs_form_defaults", {})
+    abs_form_nonce = st.session_state.get("abs_form_nonce", 0)
+    abs_data_default = abs_form_defaults.get("data", date.today())
+    abs_placa_default = str(abs_form_defaults.get("placa") or "").strip().upper()
+    abs_tem_defaults = bool(abs_form_defaults)
+    index_veiculo_form = index_veiculo_abastecimento
+    if abs_placa_default and opcoes_veiculos_abastecimento:
+        for idx_opt, opt_veic in enumerate(opcoes_veiculos_abastecimento):
+            if str(opt_veic).split(" - ")[0].strip().upper() == abs_placa_default:
+                index_veiculo_form = idx_opt
+                break
+
+    expandir_cadastro_abs = st.session_state.pop("abs_expandir_cadastro", False)
+    with st.expander("➕ Cadastro de Abastecimento", expanded=expandir_cadastro_abs):
+        if st.session_state.get("abs_validacao_msg"):
+            st.warning(st.session_state.pop("abs_validacao_msg"))
+
+        with st.form("form_inclusao_abastecimento", clear_on_submit=False):
+            col_a, col_b, col_c, col_d = st.columns(4)
+            data_abs = col_a.date_input("Data", value=abs_data_default, format="DD/MM/YYYY", key=f"abs_data_incluir_{abs_form_nonce}")
+            if opcoes_veiculos_abastecimento:
+                veic_abs = col_b.selectbox(
+                    "Veículo/Placa",
+                    options=opcoes_veiculos_abastecimento,
+                    index=index_veiculo_form,
+                    key=f"abastecimento_veiculo_incluir_{abs_form_nonce}",
+                )
+                placa_abs = str(veic_abs).split(" - ")[0].strip()
             else:
-                with conn() as c:
-                    c.execute(
-                        """INSERT INTO abastecimentos
-                           (data, local, doc_nf, km_inicial, tipo_combustivel, qtde_litros, valor_unit, desconto, total_gasto, veiculo_placa)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            data_abs.isoformat(),
-                            local_abs.strip(),
-                            doc_nf_abs.strip(),
-                            km_inicial_abs,
-                            normalizar_tipo_combustivel(tipo_comb_abs),
-                            qtde_litros_abs,
-                            valor_unit_abs,
-                            desconto_abs,
-                            total_gasto_abs,
-                            placa_abs.strip().upper(),
-                        ),
-                    )
-                alerta_gravado()
+                placa_abs = col_b.text_input("Placa", value=abs_placa_default, key=f"abs_placa_manual_incluir_{abs_form_nonce}").upper().strip()
+            local_abs = col_c.text_input("Local do Abastecimento", value=str(abs_form_defaults.get("local") or ""), key=f"abs_local_incluir_{abs_form_nonce}")
+            doc_nf_abs = col_d.text_input("Documento / NF", value=str(abs_form_defaults.get("doc_nf") or ""), key=f"abs_doc_nf_incluir_{abs_form_nonce}")
+
+            col_e, col_f, col_g, col_h, col_i = st.columns(5)
+            km_inicial_abs = col_e.number_input("KM Inicial", min_value=0.0, value=(float(abs_form_defaults.get("km_inicial") or 0.0) if abs_tem_defaults else None), step=1.0, key=f"abs_km_inicial_incluir_{abs_form_nonce}")
+            tipo_default_abs = str(abs_form_defaults.get("tipo_combustivel") or "")
+            tipo_cadastrado_index_abs = tipos_combustivel_sugeridos.index(tipo_default_abs) + 1 if tipo_default_abs in tipos_combustivel_sugeridos else 0
+            tipo_cadastrado_abs = col_f.selectbox(
+                "Tipo Cadastrado (opcional)",
+                options=[""] + tipos_combustivel_sugeridos,
+                index=tipo_cadastrado_index_abs,
+                placeholder="Selecione um tipo já cadastrado",
+                key=f"abs_tipo_cadastrado_incluir_{abs_form_nonce}",
+            )
+            tipo_comb_abs = col_f.text_input(
+                "Tipo de Combustível",
+                value=tipo_default_abs or tipo_cadastrado_abs,
+                help="Você pode escolher um tipo já cadastrado acima ou digitar um novo aqui.",
+                key=f"abs_tipo_comb_incluir_{abs_form_nonce}",
+            ).strip()
+            tipo_comb_normalizado_abs = normalizar_tipo_combustivel(tipo_cadastrado_abs or tipo_comb_abs)
+            qtde_litros_abs = col_g.number_input("Qtde Litros", min_value=0.0, value=(float(abs_form_defaults.get("qtde_litros") or 0.0) if abs_tem_defaults else None), step=0.001, format="%.3f", key=f"abs_qtde_litros_incluir_{abs_form_nonce}")
+            valor_unit_abs = col_h.number_input("Valor Unitário (R$)", min_value=0.0, value=(float(abs_form_defaults.get("valor_unit") or 0.0) if abs_tem_defaults else None), step=0.001, format="%.3f", key=f"abs_valor_unit_incluir_{abs_form_nonce}")
+            desconto_abs = col_i.number_input("Desconto (R$)", min_value=0.0, value=(float(abs_form_defaults.get("desconto") or 0.0) if abs_tem_defaults else None), step=0.01, key=f"abs_desconto_incluir_{abs_form_nonce}")
+
+            qtde_litros_calc_abs = float(qtde_litros_abs or 0.0)
+            valor_unit_calc_abs = float(valor_unit_abs or 0.0)
+            desconto_calc_abs = float(desconto_abs or 0.0)
+            total_bruto_abs = qtde_litros_calc_abs * valor_unit_calc_abs
+            total_gasto_abs = max(total_bruto_abs - desconto_calc_abs, 0.0)
+            st.caption(f"Total calculado: {brl(total_bruto_abs)} - desconto {brl(desconto_abs)} = {brl(total_gasto_abs)}")
+
+            if st.form_submit_button("💾 Gravar", use_container_width=True, type="primary", key="btn_abastecimento_incluir_gravar"):
+                if not placa_abs.strip():
+                    st.session_state["abs_validacao_msg"] = "Informe a placa do veículo para incluir o registro."
+                    st.session_state["abs_focus_label"] = "Placa"
+                    st.session_state["abs_expandir_cadastro"] = True
+                    st.rerun()
+                elif not local_abs.strip():
+                    st.session_state["abs_validacao_msg"] = "Informe o local do abastecimento para incluir o registro."
+                    st.session_state["abs_focus_label"] = "Local do Abastecimento"
+                    st.session_state["abs_expandir_cadastro"] = True
+                    st.rerun()
+                elif not tipo_comb_normalizado_abs:
+                    st.session_state["abs_validacao_msg"] = "Informe o tipo de combustível para incluir o registro."
+                    st.session_state["abs_focus_label"] = "Tipo de Combustível"
+                    st.session_state["abs_expandir_cadastro"] = True
+                    st.rerun()
+                elif qtde_litros_calc_abs <= 0 or valor_unit_calc_abs <= 0:
+                    campo_foco_abs = "Qtde Litros" if qtde_litros_calc_abs <= 0 else "Valor Unitário"
+                    st.session_state["abs_validacao_msg"] = "Informe quantidade de litros e valor unitário maiores que zero."
+                    st.session_state["abs_focus_label"] = campo_foco_abs
+                    st.session_state["abs_expandir_cadastro"] = True
+                    st.rerun()
+                else:
+                    with conn() as c:
+                        c.execute(
+                            """INSERT INTO abastecimentos
+                               (data, local, doc_nf, km_inicial, tipo_combustivel, qtde_litros, valor_unit, desconto, total_gasto, veiculo_placa)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                data_abs.isoformat(),
+                                local_abs.strip(),
+                                doc_nf_abs.strip(),
+                                float(km_inicial_abs or 0.0),
+                                tipo_comb_normalizado_abs,
+                                qtde_litros_calc_abs,
+                                valor_unit_calc_abs,
+                                desconto_calc_abs,
+                                total_gasto_abs,
+                                placa_abs.strip().upper(),
+                            ),
+                        )
+                    limpar_cache_app()
+                    st.session_state["abs_form_defaults"] = {}
+                    st.session_state["abs_form_nonce"] += 1
+                    st.session_state["abs_sucesso_msg"] = "✅ Abastecimento gravado com sucesso!"
+                    st.rerun()
+
+        if st.session_state.get("abs_focus_label"):
+            focar_campo_por_rotulo(st.session_state.pop("abs_focus_label"))
 
     st.markdown("---")
     
@@ -5840,21 +5958,35 @@ with aba9:
         df_abs["local_filtro"] = df_abs["local"].fillna("").astype(str).str.strip()
         tipos_filtro_abs = sorted([t for t in df_abs["tipo_combustivel"].dropna().unique().tolist() if t])
         locais_filtro_abs = sorted([l for l in df_abs["local_filtro"].dropna().unique().tolist() if l])
+        if "filtro_tipos_abastecimento" not in st.session_state:
+            st.session_state["filtro_tipos_abastecimento"] = tipos_filtro_abs
+        else:
+            st.session_state["filtro_tipos_abastecimento"] = [
+                t for t in st.session_state["filtro_tipos_abastecimento"] if t in tipos_filtro_abs
+            ] or tipos_filtro_abs
+        if "filtro_locais_abastecimento" not in st.session_state:
+            st.session_state["filtro_locais_abastecimento"] = locais_filtro_abs
+        else:
+            st.session_state["filtro_locais_abastecimento"] = [
+                l for l in st.session_state["filtro_locais_abastecimento"] if l in locais_filtro_abs
+            ] or locais_filtro_abs
         f_abs_tipo, f_abs_local = st.columns(2)
         filtro_tipos_abs = f_abs_tipo.multiselect(
             "Filtrar por tipo de combustível",
             options=tipos_filtro_abs,
             default=tipos_filtro_abs,
-            help="Selecione um ou mais tipos para visualizar no resumo, histórico e impressão.",
+            help="Por padrão, todos os tipos ficam selecionados.",
             key="filtro_tipos_abastecimento",
         )
         filtro_locais_abs = f_abs_local.multiselect(
             "Filtrar por local/posto",
             options=locais_filtro_abs,
             default=locais_filtro_abs,
-            help="Selecione um ou mais locais para visualizar no resumo, histórico e impressão.",
+            help="Por padrão, todos os locais ficam selecionados.",
             key="filtro_locais_abastecimento",
         )
+        filtro_tipos_abs = filtro_tipos_abs or tipos_filtro_abs
+        filtro_locais_abs = filtro_locais_abs or locais_filtro_abs
         if filtro_tipos_abs:
             df_abs = df_abs[df_abs["tipo_combustivel"].isin(filtro_tipos_abs)].copy()
         else:
@@ -5973,6 +6105,10 @@ with aba9:
                 ),
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "Qtde Litros": st.column_config.NumberColumn("Qtde Litros", format="%.3f"),
+                    "Valor Unitário": st.column_config.NumberColumn("Valor Unitário", format="R$ %.3f"),
+                },
             )
 
             if st.button("🖨️ Impressão", key="btn_abs_impressao", use_container_width=True):
@@ -5991,8 +6127,8 @@ with aba9:
                         f"<td>{escape(str(r_imp.get('local') or ''))}</td>"
                         f"<td>{escape(str(r_imp.get('doc_nf') or ''))}</td>"
                         f"<td>{escape(str(r_imp.get('tipo_combustivel') or ''))}</td>"
-                        f"<td class='num'>{format_br(r_imp.get('qtde_litros') or 0)}</td>"
-                        f"<td class='num'>{brl(r_imp.get('valor_unit') or 0)}</td>"
+                        f"<td class='num'>{format_br(r_imp.get('qtde_litros') or 0, casas_decimais=3)}</td>"
+                        f"<td class='num'>R$ {format_br(r_imp.get('valor_unit') or 0, casas_decimais=3)}</td>"
                         f"<td class='num'>{brl(r_imp.get('total_gasto') or 0)}</td>"
                         "</tr>"
                     )
@@ -6055,7 +6191,7 @@ with aba9:
                         <tfoot>
                             <tr>
                                 <td colspan="5">TOTAL</td>
-                                <td class="num">{format_br(total_litros_imp)}</td>
+                                <td class="num">{format_br(total_litros_imp, casas_decimais=3)}</td>
                                 <td></td>
                                 <td class="num">{brl(total_gasto_imp)}</td>
                             </tr>
@@ -6063,7 +6199,7 @@ with aba9:
                     </table>
                     <div class="resumo">
                         <p><strong>Registros:</strong> {len(df_imp_abs)}</p>
-                        <p><strong>Total Litros:</strong> {format_br(total_litros_imp)}</p>
+                        <p><strong>Total Litros:</strong> {format_br(total_litros_imp, casas_decimais=3)}</p>
                         <p><strong>Total Geral:</strong> {brl(total_gasto_imp)}</p>
                         <p><strong>Gerado em:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
                     </div>
@@ -6126,19 +6262,29 @@ with aba9:
 
                         c5, c6, c7, c8, c9 = st.columns(5)
                         km_inicial_ed = c5.number_input("KM Inicial", min_value=0.0, value=float(r["km_inicial"] or 0.0), step=1.0)
+                        tipo_atual_ed_abs = normalizar_tipo_combustivel(r["tipo_combustivel"])
+                        tipo_cadastrado_key_ed = f"abs_tipo_cadastrado_ed_{int(st.session_state.abastecimento_id_editando)}"
+                        tipo_manual_key_ed = f"abs_tipo_comb_ed_{int(st.session_state.abastecimento_id_editando)}"
+                        tipo_cadastrado_index_ed = (
+                            tipos_combustivel_sugeridos.index(tipo_atual_ed_abs) + 1
+                            if tipo_atual_ed_abs in tipos_combustivel_sugeridos
+                            else 0
+                        )
                         tipo_cadastrado_ed = c6.selectbox(
                             "Tipo Cadastrado (opcional)",
                             options=[""] + tipos_combustivel_sugeridos,
-                            index=0,
+                            index=tipo_cadastrado_index_ed,
                             placeholder="Selecione um tipo já cadastrado",
+                            key=tipo_cadastrado_key_ed,
                         )
                         tipo_comb_ed = c6.text_input(
                             "Tipo de Combustível",
-                            value=str(r["tipo_combustivel"] or tipo_cadastrado_ed),
+                            value=tipo_atual_ed_abs,
                             help="Você pode escolher um tipo já cadastrado acima ou digitar um novo aqui.",
+                            key=tipo_manual_key_ed,
                         ).strip()
-                        qtde_litros_ed = c7.number_input("Qtde Litros", min_value=0.0, value=float(r["qtde_litros"] or 0.0), step=1.0)
-                        valor_unit_ed = c8.number_input("Valor Unitário (R$)", min_value=0.0, value=float(r["valor_unit"] or 0.0), step=0.01)
+                        qtde_litros_ed = c7.number_input("Qtde Litros", min_value=0.0, value=float(r["qtde_litros"] or 0.0), step=0.001, format="%.3f")
+                        valor_unit_ed = c8.number_input("Valor Unitário (R$)", min_value=0.0, value=float(r["valor_unit"] or 0.0), step=0.001, format="%.3f")
                         desconto_ed = c9.number_input("Desconto (R$)", min_value=0.0, value=float(r["desconto"] or 0.0), step=0.01)
 
                         total_bruto_ed = qtde_litros_ed * valor_unit_ed
@@ -6150,11 +6296,16 @@ with aba9:
                         btn_excluir = a2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
 
                     if btn_atualizar:
+                        tipo_cadastrado_submit_ed = st.session_state.get(tipo_cadastrado_key_ed, tipo_cadastrado_ed)
+                        tipo_manual_submit_ed = st.session_state.get(tipo_manual_key_ed, tipo_comb_ed)
+                        tipo_comb_normalizado_ed = normalizar_tipo_combustivel(
+                            tipo_cadastrado_submit_ed or tipo_manual_submit_ed
+                        )
                         if not placa_ed_abs.strip():
                             st.warning("Informe a placa do veículo para atualizar o registro.")
                         elif not local_ed.strip():
                             st.warning("Informe o local do abastecimento para atualizar o registro.")
-                        elif not normalizar_tipo_combustivel(tipo_comb_ed):
+                        elif not tipo_comb_normalizado_ed:
                             st.warning("Informe o tipo de combustível para atualizar o registro.")
                         elif qtde_litros_ed <= 0 or valor_unit_ed <= 0:
                             st.warning("Informe quantidade de litros e valor unitário maiores que zero.")
@@ -6169,7 +6320,7 @@ with aba9:
                                         local_ed.strip(),
                                         doc_nf_ed.strip(),
                                         km_inicial_ed,
-                                        normalizar_tipo_combustivel(tipo_comb_ed),
+                                        tipo_comb_normalizado_ed,
                                         qtde_litros_ed,
                                         valor_unit_ed,
                                         desconto_ed,
@@ -8444,6 +8595,11 @@ with aba17:
     df_cp["data_pagamento"] = pd.to_datetime(df_cp["data_pagamento"], errors="coerce").dt.date
     df_cp["valor"] = pd.to_numeric(df_cp["valor"], errors="coerce").fillna(0.0)
     df_cp = _add_status_cp(df_cp)
+    if placa_filtro_calculo and "veiculo_placa" in df_cp.columns:
+        placa_ref_cp = str(placa_filtro_calculo).strip().upper()
+        df_cp = df_cp[
+            df_cp["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_cp
+        ]
 
     if not df_cp.empty:
         hoje_cp = date.today()
@@ -8535,8 +8691,10 @@ with aba17:
     if not df_cp.empty:
         st.markdown("---")
         st.markdown("### 📋 Lançamentos")
+        if placa_filtro_calculo:
+            st.caption(f"Filtro por placa ativo: `{rotulo_placa_com_descricao(placa_filtro_calculo)}`")
 
-        fil1, fil2, fil3, fil4, fil5 = st.columns([2, 2, 2, 2, 2])
+        fil1, fil2, fil3, fil4 = st.columns([2, 2, 2, 2])
         cp_filtro_status = fil1.radio(
             "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Pagas"],
             horizontal=False, key="cp_fil_status"
@@ -8545,16 +8703,6 @@ with aba17:
         cp_fil_fim = fil3.date_input("Vencimento até:", value=date(date.today().year, 12, 31), format="DD/MM/YYYY", key="cp_fil_fim")
         cp_cats_disp = ["Todas"] + sorted(df_cp["categoria"].dropna().unique().tolist())
         cp_filtro_cat = fil4.selectbox("Categoria", cp_cats_disp, key="cp_fil_cat")
-        cp_placas_disp = ["Todas"] + sorted([
-            p for p in df_cp["veiculo_placa"].fillna("").astype(str).str.strip().str.upper().unique().tolist()
-            if p
-        ])
-        cp_filtro_placa = fil5.selectbox(
-            "Placa",
-            cp_placas_disp,
-            key="cp_fil_placa",
-            format_func=lambda x: x if x == "Todas" else rotulo_placa_com_descricao(x),
-        )
 
         df_cp_f = df_cp.copy()
         if "Pendentes" in cp_filtro_status:
@@ -8565,10 +8713,6 @@ with aba17:
             df_cp_f = df_cp_f[df_cp_f["status"] == "PAGO"]
         if cp_filtro_cat != "Todas":
             df_cp_f = df_cp_f[df_cp_f["categoria"] == cp_filtro_cat]
-        if cp_filtro_placa != "Todas":
-            df_cp_f = df_cp_f[
-                df_cp_f["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == cp_filtro_placa
-            ]
         df_cp_f = df_cp_f[
             df_cp_f["data_vencimento"].apply(
                 lambda d: cp_fil_ini <= d <= cp_fil_fim if pd.notna(d) else True
@@ -8853,6 +8997,11 @@ with aba_cr:
     df_cr["data_recebimento"] = pd.to_datetime(df_cr["data_recebimento"], errors="coerce").dt.date
     df_cr["valor"] = pd.to_numeric(df_cr["valor"], errors="coerce").fillna(0.0)
     df_cr = _add_status_cr(df_cr)
+    if placa_filtro_calculo and "veiculo_placa" in df_cr.columns:
+        placa_ref_cr = str(placa_filtro_calculo).strip().upper()
+        df_cr = df_cr[
+            df_cr["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_cr
+        ]
 
     if not df_cr.empty:
         hoje_cr = date.today()
@@ -8946,8 +9095,10 @@ with aba_cr:
     if not df_cr.empty:
         st.markdown("---")
         st.markdown("### 📋 Lançamentos")
+        if placa_filtro_calculo:
+            st.caption(f"Filtro por placa ativo: `{rotulo_placa_com_descricao(placa_filtro_calculo)}`")
 
-        gf1, gf2, gf3, gf4, gf5 = st.columns([2, 2, 2, 2, 2])
+        gf1, gf2, gf3, gf4 = st.columns([2, 2, 2, 2])
         cr_filtro_status = gf1.radio(
             "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Recebidas"],
             horizontal=False, key="cr_fil_status"
@@ -8956,16 +9107,6 @@ with aba_cr:
         cr_fil_fim = gf3.date_input("Vencimento até:", value=date(date.today().year, 12, 31), format="DD/MM/YYYY", key="cr_fil_fim")
         cr_cats_disp = ["Todas"] + sorted(df_cr["categoria"].dropna().unique().tolist())
         cr_filtro_cat = gf4.selectbox("Categoria", cr_cats_disp, key="cr_fil_cat")
-        cr_placas_disp = ["Todas"] + sorted([
-            p for p in df_cr["veiculo_placa"].fillna("").astype(str).str.strip().str.upper().unique().tolist()
-            if p
-        ])
-        cr_filtro_placa = gf5.selectbox(
-            "Placa",
-            cr_placas_disp,
-            key="cr_fil_placa",
-            format_func=lambda x: x if x == "Todas" else rotulo_placa_com_descricao(x),
-        )
 
         df_cr_f = df_cr.copy()
         if "Pendentes" in cr_filtro_status:
@@ -8976,10 +9117,6 @@ with aba_cr:
             df_cr_f = df_cr_f[df_cr_f["status"] == "RECEBIDO"]
         if cr_filtro_cat != "Todas":
             df_cr_f = df_cr_f[df_cr_f["categoria"] == cr_filtro_cat]
-        if cr_filtro_placa != "Todas":
-            df_cr_f = df_cr_f[
-                df_cr_f["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == cr_filtro_placa
-            ]
         df_cr_f = df_cr_f[
             df_cr_f["data_vencimento"].apply(
                 lambda d: cr_fil_ini <= d <= cr_fil_fim if pd.notna(d) else True
