@@ -1,14 +1,18 @@
 import sqlite3
 from datetime import date, datetime, timedelta
+import hashlib
+import hmac
 from html import escape
 from pathlib import Path
+import secrets
+import socket
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Controle ART Amaral Rota Transportes", layout="wide", page_icon="🚛")
+st.set_page_config(page_title="Controle ART", layout="wide", page_icon="🚛")
 
 DB = "controle_viagens.db"
 
@@ -108,6 +112,266 @@ def conn():
     c.execute("PRAGMA cache_size=-64000")
     c.execute("PRAGMA mmap_size=268435456")
     return c
+
+
+def normalizar_estacao(nome):
+    return " ".join(str(nome or "").strip().upper().split())
+
+
+def nome_estacao_padrao():
+    try:
+        nome = socket.gethostname()
+    except Exception:
+        nome = ""
+    return normalizar_estacao(nome) or "ESTACAO"
+
+
+def gerar_hash_senha(senha):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", str(senha).encode("utf-8"), salt.encode("utf-8"), 150000)
+    return f"{salt}${digest.hex()}"
+
+
+def conferir_senha(senha, senha_hash):
+    try:
+        salt, digest_salvo = str(senha_hash or "").split("$", 1)
+        digest = hashlib.pbkdf2_hmac("sha256", str(senha).encode("utf-8"), salt.encode("utf-8"), 150000).hex()
+        return hmac.compare_digest(digest, digest_salvo)
+    except Exception:
+        return False
+
+
+def existem_usuarios_sistema():
+    with conn() as c:
+        row = c.execute("SELECT COUNT(*) AS total FROM usuarios_sistema").fetchone()
+    return int(row["total"] or 0) > 0
+
+
+def estacao_cadastrada(nome_estacao):
+    estacao = normalizar_estacao(nome_estacao)
+    if not estacao:
+        return None
+    with conn() as c:
+        return c.execute(
+            """SELECT e.id, e.nome_estacao, e.usuario_id, u.usuario
+               FROM estacoes_trabalho e
+               LEFT JOIN usuarios_sistema u ON u.id = e.usuario_id
+               WHERE e.nome_estacao=? AND e.ativo=1""",
+            (estacao,),
+        ).fetchone()
+
+
+def cadastrar_estacao_trabalho(nome_estacao, usuario_id=None):
+    estacao = normalizar_estacao(nome_estacao)
+    if not estacao:
+        return
+    with conn() as c:
+        c.execute(
+            """INSERT INTO estacoes_trabalho (nome_estacao, usuario_id, data_cadastro, ativo)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(nome_estacao) DO UPDATE SET
+                   usuario_id=COALESCE(excluded.usuario_id, estacoes_trabalho.usuario_id),
+                   ativo=1""",
+            (estacao, usuario_id, datetime.now().isoformat(timespec="seconds")),
+        )
+
+
+def cadastrar_usuario_sistema(usuario, senha, nome_estacao=None, is_admin=False, liberar_estacao=False):
+    usuario_limpo = str(usuario or "").strip()
+    if not usuario_limpo or not senha:
+        return False, "Informe usuário e senha."
+    if len(str(senha)) < 4:
+        return False, "A senha deve ter pelo menos 4 caracteres."
+    estacao = normalizar_estacao(nome_estacao)
+    if liberar_estacao and not estacao:
+        return False, "Informe o nome da estação de trabalho."
+
+    try:
+        with conn() as c:
+            cur = c.execute(
+                """INSERT INTO usuarios_sistema (usuario, senha_hash, data_cadastro, ativo, is_admin)
+                   VALUES (?, ?, ?, 1, ?)""",
+                (
+                    usuario_limpo,
+                    gerar_hash_senha(senha),
+                    datetime.now().isoformat(timespec="seconds"),
+                    1 if is_admin else 0,
+                ),
+            )
+            usuario_id = int(cur.lastrowid)
+            if liberar_estacao:
+                c.execute(
+                    """INSERT INTO estacoes_trabalho (nome_estacao, usuario_id, data_cadastro, ativo)
+                       VALUES (?, ?, ?, 1)
+                       ON CONFLICT(nome_estacao) DO UPDATE SET usuario_id=excluded.usuario_id, ativo=1""",
+                    (estacao, usuario_id, datetime.now().isoformat(timespec="seconds")),
+                )
+        return True, "Usuário cadastrado com sucesso."
+    except sqlite3.IntegrityError:
+        return False, "Este usuário já está cadastrado."
+
+
+def validar_usuario_sistema(usuario, senha):
+    usuario_limpo = str(usuario or "").strip()
+    with conn() as c:
+        row = c.execute(
+            "SELECT id, usuario, senha_hash, is_admin FROM usuarios_sistema WHERE usuario=? AND ativo=1",
+            (usuario_limpo,),
+        ).fetchone()
+    if row and conferir_senha(senha, row["senha_hash"]):
+        return row
+    return None
+
+
+def alterar_senha_usuario_sistema(usuario_id, nova_senha):
+    if len(str(nova_senha or "")) < 4:
+        return False, "A senha deve ter pelo menos 4 caracteres."
+    with conn() as c:
+        c.execute(
+            "UPDATE usuarios_sistema SET senha_hash=? WHERE id=?",
+            (gerar_hash_senha(nova_senha), int(usuario_id)),
+        )
+    return True, "Senha alterada com sucesso."
+
+
+def contar_admins_ativos(exceto_usuario_id=None):
+    sql = "SELECT COUNT(*) AS total FROM usuarios_sistema WHERE ativo=1 AND is_admin=1"
+    params = []
+    if exceto_usuario_id is not None:
+        sql += " AND id<>?"
+        params.append(int(exceto_usuario_id))
+    with conn() as c:
+        row = c.execute(sql, params).fetchone()
+    return int(row["total"] or 0)
+
+
+def atualizar_usuario_sistema(usuario_id, usuario, nova_senha=None, is_admin=False, ativo=True):
+    usuario_limpo = str(usuario or "").strip()
+    if not usuario_limpo:
+        return False, "Informe o nome do usuário."
+    usuario_id = int(usuario_id)
+    ativo_int = 1 if ativo else 0
+    admin_int = 1 if is_admin else 0
+    if (ativo_int == 0 or admin_int == 0) and contar_admins_ativos(exceto_usuario_id=usuario_id) == 0:
+        return False, "Não é possível remover ou desativar o último administrador."
+    try:
+        with conn() as c:
+            if nova_senha:
+                if len(str(nova_senha)) < 4:
+                    return False, "A senha deve ter pelo menos 4 caracteres."
+                c.execute(
+                    "UPDATE usuarios_sistema SET usuario=?, senha_hash=?, is_admin=?, ativo=? WHERE id=?",
+                    (usuario_limpo, gerar_hash_senha(nova_senha), admin_int, ativo_int, usuario_id),
+                )
+            else:
+                c.execute(
+                    "UPDATE usuarios_sistema SET usuario=?, is_admin=?, ativo=? WHERE id=?",
+                    (usuario_limpo, admin_int, ativo_int, usuario_id),
+                )
+        return True, "Usuário alterado com sucesso."
+    except sqlite3.IntegrityError:
+        return False, "Este nome de usuário já está cadastrado."
+
+
+def deletar_usuario_sistema(usuario_id):
+    usuario_id = int(usuario_id)
+    if contar_admins_ativos(exceto_usuario_id=usuario_id) == 0:
+        return False, "Não é possível deletar o último administrador."
+    with conn() as c:
+        c.execute("DELETE FROM estacoes_trabalho WHERE usuario_id=?", (usuario_id,))
+        c.execute("DELETE FROM usuarios_sistema WHERE id=?", (usuario_id,))
+    return True, "Usuário deletado com sucesso."
+
+
+def listar_usuarios_sistema():
+    with conn() as c:
+        rows = c.execute(
+            """SELECT id, usuario, is_admin, ativo, data_cadastro
+               FROM usuarios_sistema
+               ORDER BY usuario"""
+        ).fetchall()
+    return rows
+
+
+def listar_estacoes_trabalho():
+    with conn() as c:
+        rows = c.execute(
+            """SELECT e.id, e.nome_estacao, COALESCE(u.usuario, '') AS usuario, e.ativo, e.data_cadastro
+               FROM estacoes_trabalho e
+               LEFT JOIN usuarios_sistema u ON u.id = e.usuario_id
+               ORDER BY e.nome_estacao"""
+        ).fetchall()
+    return rows
+
+
+def atualizar_estacao_trabalho(estacao_id, nome_estacao, usuario_id=None, ativo=True):
+    estacao = normalizar_estacao(nome_estacao)
+    if not estacao:
+        return False, "Informe o nome da estação."
+    try:
+        with conn() as c:
+            c.execute(
+                "UPDATE estacoes_trabalho SET nome_estacao=?, usuario_id=?, ativo=? WHERE id=?",
+                (estacao, usuario_id, 1 if ativo else 0, int(estacao_id)),
+            )
+        return True, "Estação alterada com sucesso."
+    except sqlite3.IntegrityError:
+        return False, "Esta estação já está cadastrada."
+
+
+def deletar_estacao_trabalho(estacao_id):
+    with conn() as c:
+        c.execute("DELETE FROM estacoes_trabalho WHERE id=?", (int(estacao_id),))
+    return True, "Estação deletada com sucesso."
+
+
+def proteger_abertura_sistema():
+    if st.session_state.get("acesso_liberado"):
+        return
+
+    primeiro_acesso = not existem_usuarios_sistema()
+
+    st.markdown("### Acesso ao sistema")
+
+    if primeiro_acesso:
+        st.caption("Crie o usuário administrador para acessar o sistema.")
+        with st.form("form_primeiro_acesso_sistema"):
+            usuario = st.text_input("Usuário administrador")
+            senha = st.text_input("Senha", type="password")
+            enviar = st.form_submit_button("Cadastrar e abrir sistema", type="primary")
+
+        if not enviar:
+            st.stop()
+
+        ok, msg = cadastrar_usuario_sistema(usuario, senha, is_admin=True, liberar_estacao=False)
+        if ok:
+            st.session_state.acesso_liberado = True
+            st.session_state.usuario_logado = str(usuario or "").strip()
+            st.session_state.usuario_admin = True
+            st.success(msg)
+            st.rerun()
+        st.error(msg)
+        st.stop()
+
+    st.caption("Informe usuário e senha para abrir o sistema.")
+    with st.form("form_acesso_sistema"):
+        usuario = st.text_input("Usuário")
+        senha = st.text_input("Senha", type="password")
+        enviar = st.form_submit_button("Abrir sistema", type="primary")
+
+    if not enviar:
+        st.stop()
+
+    row_usuario = validar_usuario_sistema(usuario, senha)
+    if not row_usuario:
+        st.error("Usuário ou senha inválidos.")
+        st.stop()
+
+    usuario_admin = bool(int(row_usuario["is_admin"] or 0) == 1)
+    st.session_state.acesso_liberado = True
+    st.session_state.usuario_logado = row_usuario["usuario"]
+    st.session_state.usuario_admin = usuario_admin
+    st.rerun()
 
 def salvar_anexos_pedido_fornecedor(arquivos):
     if not arquivos:
@@ -527,6 +791,33 @@ if 'p_simulado' not in st.session_state:
 def init_db():
     with conn() as c:
         # 1. Criação das tabelas base (se não existirem)
+        c.execute("""CREATE TABLE IF NOT EXISTS usuarios_sistema (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario TEXT NOT NULL UNIQUE,
+            senha_hash TEXT NOT NULL,
+            data_cadastro TEXT,
+            ativo INTEGER DEFAULT 1,
+            is_admin INTEGER DEFAULT 0
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS estacoes_trabalho (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome_estacao TEXT NOT NULL UNIQUE,
+            usuario_id INTEGER,
+            data_cadastro TEXT,
+            ativo INTEGER DEFAULT 1
+        )""")
+
+        cursor_usuarios = c.execute("PRAGMA table_info(usuarios_sistema)")
+        colunas_usuarios = [coluna[1] for coluna in cursor_usuarios.fetchall()]
+        if "is_admin" not in colunas_usuarios:
+            c.execute("ALTER TABLE usuarios_sistema ADD COLUMN is_admin INTEGER DEFAULT 0")
+        c.execute(
+            """UPDATE usuarios_sistema
+               SET is_admin=1
+               WHERE id = (SELECT id FROM usuarios_sistema ORDER BY id LIMIT 1)
+                 AND NOT EXISTS (SELECT 1 FROM usuarios_sistema WHERE is_admin=1)"""
+        )
+
         c.execute("""CREATE TABLE IF NOT EXISTS parametros (
             id INTEGER PRIMARY KEY CHECK (id=1),
             consumo REAL DEFAULT 2.5, manut REAL DEFAULT 0.25, 
@@ -1084,11 +1375,13 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_contas_pagar_venc ON contas_pagar(data_vencimento)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_contas_receber_venc ON contas_receber(data_vencimento)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_me_lembra_venc ON me_lembra(data_vencimento)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_estacoes_trabalho_ativo ON estacoes_trabalho(nome_estacao, ativo)")
         c.execute("PRAGMA optimize")
 
 
 # Executa a função para garantir que o banco está atualizado
 init_db()
+proteger_abertura_sistema()
 # --- FIM DO BLOCO INIT_DB ---
 
 # =========================
@@ -1267,6 +1560,9 @@ st.markdown(
         gap: 3px !important;
         box-shadow: var(--shadow-sm) !important;
         margin-bottom: 2px !important;
+        flex-wrap: wrap !important;
+        overflow: visible !important;
+        row-gap: 5px !important;
     }
     div[data-testid="stTabs"] button[data-baseweb="tab"] {
         border-radius: 8px !important;
@@ -1278,6 +1574,7 @@ st.markdown(
         transition: all 0.16s ease !important;
         background: transparent !important;
         white-space: nowrap !important;
+        flex: 0 0 auto !important;
     }
     div[data-testid="stTabs"] button[data-baseweb="tab"]:hover:not([aria-selected="true"]) {
         background: #eef4fb !important;
@@ -1503,7 +1800,7 @@ st.markdown(
     <div class="art-header">
         <div class="art-header-icon">🚛</div>
         <div class="art-header-text">
-            <h1>ART Amaral Rota Transportes</h1>
+            <h1>ART</h1>
             <p>Sistema de Gestão Operacional &nbsp;·&nbsp; Viagens &amp; Financeiro</p>
         </div>
     </div>
@@ -2267,12 +2564,12 @@ if not df_db.empty:
 # =========================
 # DEFINIÇÃO DAS ABAS
 # =========================
-aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14, aba17, aba_cr, aba18, aba20, aba_calc = st.tabs([
+aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14, aba17, aba_cr, aba18, aba20, aba_usuarios, aba_calc = st.tabs([
     "🏠 Dashboard Executivo",
     "📌 Movimento Viagens", "📋 Viagens Executadas", "📊 Análise", "🛠️ Manutenção", "🗂️ Cadastro",
     "📑 Relatório", "⛽ Abastecimento", "🎯 Metas", "🛢️ Trocas",
     "💵 Frete Líquido no Período", "🧾 Contas a Pagar", "💰 Contas a Receber", "🔔 ME LEMBRA", "📝 Anotações",
-    "🧮 Cálculo Rápido"
+    "👤 Usuários", "🧮 Cálculo Rápido"
 ])
 
 with aba_cadastro:
@@ -2280,6 +2577,96 @@ with aba_cadastro:
         "🏢 Oficinas", "🏙️ Cidades", "🛣️ KM Rotas", "⚙️ Parâmetros",
         "🚚 Veículos", "🏭 Fornecedores", "📌 Obrigação", "⛽ Comparativo Diesel", "🛣️ Praça Pedágio"
     ])
+
+with aba_usuarios:
+    st.subheader("👤 Usuários")
+    if not st.session_state.get("usuario_admin"):
+        st.warning("Somente o administrador pode cadastrar usuários, alterar senhas e liberar estações.")
+    else:
+        usuarios_rows = listar_usuarios_sistema()
+        usuarios_opcoes = [f"{r['id']} - {r['usuario']}" for r in usuarios_rows]
+        mapa_usuarios = {f"{r['id']} - {r['usuario']}": r for r in usuarios_rows}
+
+        tab_incluir_usuario, tab_alterar_usuario, tab_deletar_usuario = st.tabs([
+            "➕ Incluir", "✏️ Alterar", "🗑️ Deletar"
+        ])
+
+        with tab_incluir_usuario:
+            st.markdown("##### Incluir usuário")
+            with st.form("form_admin_cadastrar_usuario"):
+                novo_usuario = st.text_input("Usuário", key="admin_novo_usuario")
+                nova_senha = st.text_input("Senha", type="password", key="admin_nova_senha")
+                novo_admin = st.checkbox("Administrador", value=False, key="admin_novo_is_admin")
+                if st.form_submit_button("➕ Incluir usuário", type="primary"):
+                    ok, msg = cadastrar_usuario_sistema(
+                        novo_usuario,
+                        nova_senha,
+                        is_admin=novo_admin,
+                        liberar_estacao=False,
+                    )
+                    if ok:
+                        alerta_gravado(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        with tab_alterar_usuario:
+            st.markdown("##### Alterar usuário")
+            if usuarios_opcoes:
+                usuario_alt_sel = st.selectbox("Selecione o usuário", usuarios_opcoes, key="admin_usuario_alt_sel")
+                row_alt = mapa_usuarios[usuario_alt_sel]
+                with st.form("form_admin_alterar_usuario"):
+                    usuario_alt_nome = st.text_input("Usuário", value=str(row_alt["usuario"] or ""), key="admin_usuario_alt_nome")
+                    senha_alt = st.text_input("Nova senha (deixe em branco para manter)", type="password", key="admin_usuario_alt_senha")
+                    admin_alt = st.checkbox("Administrador", value=bool(int(row_alt["is_admin"] or 0) == 1), key="admin_usuario_alt_admin")
+                    ativo_alt = st.checkbox("Ativo", value=bool(int(row_alt["ativo"] or 0) == 1), key="admin_usuario_alt_ativo")
+                    if st.form_submit_button("✏️ Alterar usuário", type="primary"):
+                        ok, msg = atualizar_usuario_sistema(
+                            int(row_alt["id"]),
+                            usuario_alt_nome,
+                            nova_senha=senha_alt,
+                            is_admin=admin_alt,
+                            ativo=ativo_alt,
+                        )
+                        if ok:
+                            alerta_gravado(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+            else:
+                st.info("Nenhum usuário cadastrado.")
+
+        with tab_deletar_usuario:
+            st.markdown("##### Deletar usuário")
+            if usuarios_opcoes:
+                usuario_del_sel = st.selectbox("Selecione o usuário para deletar", usuarios_opcoes, key="admin_usuario_del_sel")
+                row_del = mapa_usuarios[usuario_del_sel]
+                st.warning(f"Confirma deletar o usuário {row_del['usuario']}? As estações liberadas para ele também serão removidas.")
+                confirmar_del = st.checkbox("Confirmo que desejo deletar este usuário", key="admin_usuario_del_confirm")
+                if st.button("🗑️ Deletar usuário", type="primary", disabled=not confirmar_del):
+                    ok, msg = deletar_usuario_sistema(int(row_del["id"]))
+                    if ok:
+                        alerta_gravado(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+            else:
+                st.info("Nenhum usuário cadastrado.")
+
+        st.markdown("##### Usuários cadastrados")
+        df_usuarios_admin = pd.DataFrame(
+            [
+                {
+                    "ID": int(r["id"]),
+                    "Usuário": r["usuario"],
+                    "Administrador": "Sim" if int(r["is_admin"] or 0) == 1 else "Não",
+                    "Ativo": "Sim" if int(r["ativo"] or 0) == 1 else "Não",
+                    "Cadastro": r["data_cadastro"] or "",
+                }
+                for r in listar_usuarios_sistema()
+            ]
+        )
+        st.dataframe(df_usuarios_admin, use_container_width=True, hide_index=True)
 
 with aba_home:
     st.markdown(
@@ -2661,7 +3048,7 @@ with aba_home:
             f"""
             <div class="dash-shell">
                 <div class="dash-hero">
-                    <h2>Painel Executivo ART Amaral Rota Transportes</h2>
+                    <h2>Painel Executivo ART</h2>
                     <p>Período analisado: <strong>{filtro_ini.strftime('%d/%m/%Y')}</strong> até <strong>{filtro_fim.strftime('%d/%m/%Y')}</strong></p>
                     <span class="dash-pill">Meta atingida: {perc_meta:.1f}%</span>
                     <span class="dash-pill">Margem atual: {margem_dash:.1f}%</span>
@@ -6064,6 +6451,7 @@ with aba9:
         
         # --- TABELA DE HISTÓRICO (MOSTRA TUDO, INCLUSIVE O INICIAL) ---
         if not df_abs.empty:
+            df_abs = df_abs.sort_values(["data_dt", "id"], ascending=[True, True]).reset_index(drop=True)
             df_abs["Data_BR"] = pd.to_datetime(df_abs["data_dt"]).dt.strftime('%d/%m/%Y')
             df_abs["Excluir"] = False
             df_base_abs = df_abs[["id", "data", "veiculo_placa", "local", "doc_nf", "km_inicial", "tipo_combustivel", "qtde_litros", "valor_unit", "desconto"]].copy()
@@ -6108,6 +6496,8 @@ with aba9:
                 column_config={
                     "Qtde Litros": st.column_config.NumberColumn("Qtde Litros", format="%.3f"),
                     "Valor Unitário": st.column_config.NumberColumn("Valor Unitário", format="R$ %.3f"),
+                    "Desconto": st.column_config.NumberColumn("Desconto", format="R$ %.2f"),
+                    "Total Gasto": st.column_config.NumberColumn("Total Gasto", format="R$ %.2f"),
                 },
             )
 
@@ -8718,6 +9108,7 @@ with aba17:
                 lambda d: cp_fil_ini <= d <= cp_fil_fim if pd.notna(d) else True
             )
         ]
+        df_cp_f = df_cp_f.sort_values("data_emissao", na_position="last")
 
         _CP_STATUS_ICON = {"PENDENTE": "🟡 Pendente", "VENCIDO": "🔴 Vencida", "PAGO": "🟢 Paga"}
         _cp_n_filtrado = len(df_cp_f)
@@ -8728,15 +9119,16 @@ with aba17:
         _cp_show_data = _cp_show_data.rename(columns={
             "id": "ID", "descricao": "Descrição", "fornecedor": "Fornecedor",
             "categoria": "Categoria", "veiculo_placa": "Placa", "n_documento": "Documento",
-            "data_vencimento": "Vencimento", "valor": "Valor (R$)",
+            "data_emissao": "Emissão", "data_vencimento": "Vencimento", "valor": "Valor (R$)",
             "data_pagamento": "Data Pgto", "forma_pagamento": "Forma Pgto",
         })
-        colunas_cp_grid = ["ID", "Status", "Descrição", "Fornecedor", "Categoria", "Placa", "Documento", "Vencimento", "Valor (R$)", "Data Pgto", "Forma Pgto"]
+        colunas_cp_grid = ["ID", "Emissão", "Status", "Descrição", "Fornecedor", "Categoria", "Placa", "Documento", "Vencimento", "Valor (R$)", "Data Pgto", "Forma Pgto"]
         st.dataframe(
             _cp_show_data[[c for c in colunas_cp_grid if c in _cp_show_data.columns]],
             use_container_width=True, hide_index=True,
             column_config={
                 "ID": st.column_config.NumberColumn("ID", format="%d", width="small"),
+                "Emissão": st.column_config.DateColumn("Emissão", format="DD/MM/YYYY"),
                 "Status": st.column_config.TextColumn("Status"),
                 "Placa": st.column_config.TextColumn("Placa"),
                 "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
@@ -9122,6 +9514,7 @@ with aba_cr:
                 lambda d: cr_fil_ini <= d <= cr_fil_fim if pd.notna(d) else True
             )
         ]
+        df_cr_f = df_cr_f.sort_values("data_emissao", na_position="last")
 
         _CR_STATUS_ICON = {"PENDENTE": "🟡 Pendente", "VENCIDO": "🔴 Vencida", "RECEBIDO": "🟢 Recebida"}
         _cr_n_filtrado = len(df_cr_f)
@@ -9132,15 +9525,16 @@ with aba_cr:
         _cr_show_data = _cr_show_data.rename(columns={
             "id": "ID", "descricao": "Descrição", "cliente": "Cliente",
             "categoria": "Categoria", "veiculo_placa": "Placa", "n_documento": "Documento",
-            "data_vencimento": "Vencimento", "valor": "Valor (R$)",
+            "data_emissao": "Emissão", "data_vencimento": "Vencimento", "valor": "Valor (R$)",
             "data_recebimento": "Data Rec.", "forma_recebimento": "Forma Rec.",
         })
-        colunas_cr_grid = ["ID", "Status", "Descrição", "Cliente", "Categoria", "Placa", "Documento", "Vencimento", "Valor (R$)", "Data Rec.", "Forma Rec."]
+        colunas_cr_grid = ["ID", "Emissão", "Status", "Descrição", "Cliente", "Categoria", "Placa", "Documento", "Vencimento", "Valor (R$)", "Data Rec.", "Forma Rec."]
         st.dataframe(
             _cr_show_data[[c for c in colunas_cr_grid if c in _cr_show_data.columns]],
             use_container_width=True, hide_index=True,
             column_config={
                 "ID": st.column_config.NumberColumn("ID", format="%d", width="small"),
+                "Emissão": st.column_config.DateColumn("Emissão", format="DD/MM/YYYY"),
                 "Status": st.column_config.TextColumn("Status"),
                 "Placa": st.column_config.TextColumn("Placa"),
                 "Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
