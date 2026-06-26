@@ -1200,22 +1200,6 @@ def init_db():
 
         cursor_cp = c.execute("PRAGMA table_info(contas_pagar)")
         colunas_cp = [coluna[1] for coluna in cursor_cp.fetchall()]
-        colunas_base_cp = {
-            "descricao": "TEXT",
-            "fornecedor": "TEXT",
-            "categoria": "TEXT",
-            "n_documento": "TEXT",
-            "data_emissao": "TEXT",
-            "data_vencimento": "TEXT",
-            "valor": "REAL DEFAULT 0.0",
-            "data_pagamento": "TEXT",
-            "forma_pagamento": "TEXT DEFAULT 'PIX'",
-            "observacao": "TEXT",
-            "data_cadastro": "TEXT",
-        }
-        for nome_coluna, definicao in colunas_base_cp.items():
-            if nome_coluna not in colunas_cp:
-                c.execute(f"ALTER TABLE contas_pagar ADD COLUMN {nome_coluna} {definicao}")
         if "veiculo_placa" not in colunas_cp:
             c.execute("ALTER TABLE contas_pagar ADD COLUMN veiculo_placa TEXT")
         if "tipo_lancamento" not in colunas_cp:
@@ -1233,22 +1217,6 @@ def init_db():
 
         cursor_cr = c.execute("PRAGMA table_info(contas_receber)")
         colunas_cr = [coluna[1] for coluna in cursor_cr.fetchall()]
-        colunas_base_cr = {
-            "descricao": "TEXT",
-            "cliente": "TEXT",
-            "categoria": "TEXT",
-            "n_documento": "TEXT",
-            "data_emissao": "TEXT",
-            "data_vencimento": "TEXT",
-            "valor": "REAL DEFAULT 0.0",
-            "data_recebimento": "TEXT",
-            "forma_recebimento": "TEXT DEFAULT 'PIX'",
-            "observacao": "TEXT",
-            "data_cadastro": "TEXT",
-        }
-        for nome_coluna, definicao in colunas_base_cr.items():
-            if nome_coluna not in colunas_cr:
-                c.execute(f"ALTER TABLE contas_receber ADD COLUMN {nome_coluna} {definicao}")
         if "veiculo_placa" not in colunas_cr:
             c.execute("ALTER TABLE contas_receber ADD COLUMN veiculo_placa TEXT")
 
@@ -3853,8 +3821,6 @@ with aba2:
             data_max_exec = datas_exec.max().date()
             dias_gastos = (data_max_exec - data_min_exec).days + 1
         tot_faturamento_liquido_periodo = float(df_exibir["Frete Líquido"].sum())
-        valor_km_rodado_bruto = (tot_frete / tot_km) if tot_km > 0 else 0.0
-        valor_km_rodado_liquido = (tot_faturamento_liquido_periodo / tot_km) if tot_km > 0 else 0.0
 
         # EXIBIÇÃO DAS MÉTRICAS
         st.markdown(
@@ -3885,16 +3851,8 @@ with aba2:
         m10.metric("Total Gasto Arla", brl(tot_valor_arla))
         m11.metric("Faturamento Liquido", brl(tot_faturamento_liquido_periodo))
         m12.metric("Dias Gastos", dias_gastos)
-        m13, m14, m15, _, _, _ = st.columns(6)
+        m13, _, _, _, _, _ = st.columns(6)
         m13.metric("Total Estadia no Período", int(tot_qtd_estadias_calc))
-        m14.metric(
-            "Valor KM Rodado Bruto",
-            (f"R$ {valor_km_rodado_bruto:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".") + "/KM") if tot_km > 0 else "-",
-        )
-        m15.metric(
-            "Valor KM Rodado Líquido",
-            (f"R$ {valor_km_rodado_liquido:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".") + "/KM") if tot_km > 0 else "-",
-        )
 
         st.markdown("---")
         tab_grid_exec, tab_lucro_exec = st.tabs(["📋 Grid de Viagens", "📈 Lucro e Viabilidade"])
@@ -4101,8 +4059,8 @@ with aba2:
                         qtd_viagens_ed = ce10.number_input("Qtd", min_value=1, value=int(r["qtd_viagens"] or 1), step=1)
 
                         ce11, ce12, ce13, ce14, ce15 = st.columns(5)
-                        valor_ton_ed = ce11.number_input("Val Ton", min_value=0.0, value=float(r["valor_ton"] or 0.0), step=0.0001, format="%.4f")
-                        valor_km_ed = ce12.number_input("Val KM", min_value=0.0, value=float(r["valor_km"] or 0.0), step=0.0001, format="%.4f")
+                        valor_ton_ed = ce11.number_input("Val Ton", min_value=0.0, value=float(r["valor_ton"] or 0.0), step=0.01)
+                        valor_km_ed = ce12.number_input("Val KM", min_value=0.0, value=float(r["valor_km"] or 0.0), step=0.01)
                         pedagio_ed = ce13.number_input("Pedágio", min_value=0.0, value=float(r["pedagio"] or 0.0), step=0.01)
                         qtd_pedagio_ed = ce14.number_input("Qtd Pedágio", min_value=0, value=int(r.get("qtd_pedagio", 0) or 0), step=1)
                         gasto_extra_ed = ce15.number_input("Gasto Extra", min_value=0.0, value=float(r["gasto_extra"] or 0.0), step=0.01)
@@ -9013,13 +8971,6 @@ def _add_status_cr(df):
         pass
     return df
 
-def _garantir_colunas(df, defaults):
-    df = df.copy()
-    for coluna, valor_padrao in defaults.items():
-        if coluna not in df.columns:
-            df[coluna] = valor_padrao
-    return df
-
 with aba17:
     if st.session_state.get("cp_flash_msg"):
         st.success(st.session_state.pop("cp_flash_msg"))
@@ -9029,14 +8980,6 @@ with aba17:
             "SELECT * FROM contas_pagar ORDER BY data_vencimento ASC, id DESC", c
         )
 
-    df_cp = _garantir_colunas(df_cp, {
-        "data_emissao": None,
-        "data_vencimento": None,
-        "data_pagamento": None,
-        "valor": 0.0,
-        "categoria": None,
-        "veiculo_placa": None,
-    })
     df_cp["data_vencimento"] = pd.to_datetime(df_cp["data_vencimento"], errors="coerce").dt.date
     df_cp["data_emissao"] = pd.to_datetime(df_cp["data_emissao"], errors="coerce").dt.date
     df_cp["data_pagamento"] = pd.to_datetime(df_cp["data_pagamento"], errors="coerce").dt.date
@@ -9160,10 +9103,11 @@ with aba17:
             df_cp_f = df_cp_f[df_cp_f["status"] == "PAGO"]
         if cp_filtro_cat != "Todas":
             df_cp_f = df_cp_f[df_cp_f["categoria"] == cp_filtro_cat]
-        mask_cp_venc = df_cp_f["data_vencimento"].apply(
-            lambda d: cp_fil_ini <= d <= cp_fil_fim if pd.notna(d) else True
-        ).reindex(df_cp_f.index, fill_value=False).astype(bool)
-        df_cp_f = df_cp_f.loc[mask_cp_venc]
+        df_cp_f = df_cp_f[
+            df_cp_f["data_vencimento"].apply(
+                lambda d: cp_fil_ini <= d <= cp_fil_fim if pd.notna(d) else True
+            )
+        ]
         df_cp_f = df_cp_f.sort_values("data_emissao", na_position="last")
 
         _CP_STATUS_ICON = {"PENDENTE": "🟡 Pendente", "VENCIDO": "🔴 Vencida", "PAGO": "🟢 Paga"}
@@ -9440,14 +9384,6 @@ with aba_cr:
             "SELECT * FROM contas_receber ORDER BY data_vencimento ASC, id DESC", c
         )
 
-    df_cr = _garantir_colunas(df_cr, {
-        "data_emissao": None,
-        "data_vencimento": None,
-        "data_recebimento": None,
-        "valor": 0.0,
-        "categoria": None,
-        "veiculo_placa": None,
-    })
     df_cr["data_vencimento"] = pd.to_datetime(df_cr["data_vencimento"], errors="coerce").dt.date
     df_cr["data_emissao"] = pd.to_datetime(df_cr["data_emissao"], errors="coerce").dt.date
     df_cr["data_recebimento"] = pd.to_datetime(df_cr["data_recebimento"], errors="coerce").dt.date
@@ -9573,10 +9509,11 @@ with aba_cr:
             df_cr_f = df_cr_f[df_cr_f["status"] == "RECEBIDO"]
         if cr_filtro_cat != "Todas":
             df_cr_f = df_cr_f[df_cr_f["categoria"] == cr_filtro_cat]
-        mask_cr_venc = df_cr_f["data_vencimento"].apply(
-            lambda d: cr_fil_ini <= d <= cr_fil_fim if pd.notna(d) else True
-        ).reindex(df_cr_f.index, fill_value=False).astype(bool)
-        df_cr_f = df_cr_f.loc[mask_cr_venc]
+        df_cr_f = df_cr_f[
+            df_cr_f["data_vencimento"].apply(
+                lambda d: cr_fil_ini <= d <= cr_fil_fim if pd.notna(d) else True
+            )
+        ]
         df_cr_f = df_cr_f.sort_values("data_emissao", na_position="last")
 
         _CR_STATUS_ICON = {"PENDENTE": "🟡 Pendente", "VENCIDO": "🔴 Vencida", "RECEBIDO": "🟢 Recebida"}
