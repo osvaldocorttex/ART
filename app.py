@@ -70,6 +70,27 @@ def format_pct(valor, casas_decimais=2):
     except:
         return f"{valor}%"
 
+def format_pct_parametros(valores, casas_decimais=2):
+    try:
+        serie = pd.to_numeric(pd.Series(valores), errors="coerce").dropna()
+        if serie.empty:
+            return format_pct(0, casas_decimais)
+        unicos = sorted({round(float(v), casas_decimais) for v in serie.tolist()})
+        if len(unicos) == 1:
+            return format_pct(unicos[0], casas_decimais)
+        return f"{format_pct(unicos[0], casas_decimais)} a {format_pct(unicos[-1], casas_decimais)}"
+    except Exception:
+        return format_pct(0, casas_decimais)
+
+def pct_parametro_relatorio(valores):
+    serie = pd.to_numeric(pd.Series(valores), errors="coerce").dropna()
+    if serie.empty:
+        return 0.0
+    unicos = sorted({round(float(v), 2) for v in serie.tolist()})
+    if len(unicos) == 1:
+        return float(unicos[0])
+    return float(serie.mean())
+
 def normalizar_tipo_combustivel(valor):
     txt = str(valor or "").upper().strip()
     if not txt:
@@ -212,10 +233,10 @@ def cadastrar_usuario_sistema(usuario, senha, nome_estacao=None, is_admin=False,
 
 
 def validar_usuario_sistema(usuario, senha):
-    usuario_limpo = str(usuario or "").strip()
+    usuario_limpo = str(usuario or "").strip().lower()
     with conn() as c:
         row = c.execute(
-            "SELECT id, usuario, senha_hash, is_admin FROM usuarios_sistema WHERE usuario=? AND ativo=1",
+            "SELECT id, usuario, senha_hash, is_admin FROM usuarios_sistema WHERE lower(usuario)=? AND ativo=1",
             (usuario_limpo,),
         ).fetchone()
     if row and conferir_senha(senha, row["senha_hash"]):
@@ -2596,11 +2617,11 @@ if not df_db.empty:
 # =========================
 # DEFINIÇÃO DAS ABAS
 # =========================
-aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14, aba17, aba_cr, aba18, aba20, aba_usuarios, aba_calc = st.tabs([
+aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14, aba17, aba_cr, aba_fluxo, aba18, aba20, aba_usuarios, aba_calc = st.tabs([
     "🏠 Dashboard Executivo",
     "📌 Movimento Viagens", "📋 Viagens Executadas", "📊 Análise", "🛠️ Manutenção", "🗂️ Cadastro",
     "📑 Relatório", "⛽ Abastecimento", "🎯 Metas", "🛢️ Trocas",
-    "💵 Frete Líquido no Período", "🧾 Contas a Pagar", "💰 Contas a Receber", "🔔 ME LEMBRA", "📝 Anotações",
+    "💵 Frete Líquido no Período", "🧾 Contas a Pagar", "💰 Contas a Receber", "📈 Fluxo de Caixa", "🔔 ME LEMBRA", "📝 Anotações",
     "👤 Usuários", "🧮 Cálculo Rápido"
 ])
 
@@ -6029,20 +6050,12 @@ with aba8:
         total_f = float(total_frete_rel.sum())
         frete_fixo_periodo_rel = frete_fixo_rateado_periodo(filtro_ini, filtro_fim)
         total_f += frete_fixo_periodo_rel
-        total_frete_comissao_rel = (
-            (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_rel) * qtd_rel
-        )
-        v_comis_viagens = float(
-            (total_frete_comissao_rel * (pd.to_numeric(df_rel_param["param_motora_pct"], errors="coerce").fillna(0.0) / 100.0)).sum()
-        )
-        v_comis_frete_fixo = float(
-            (serie_parametro_diaria("valor_frete_mensal_fixo", filtro_ini, filtro_fim) / 30.0
-             * (serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim) / 100.0)).sum()
-        )
-        v_comis = v_comis_viagens + v_comis_frete_fixo
-        base_comissionavel_total = float(total_frete_comissao_rel.sum()) + float(frete_fixo_periodo_rel)
-        pct_db = (v_comis / base_comissionavel_total * 100.0) if base_comissionavel_total > 0 else 0.0
-        pct_db_txt = format_pct(pct_db)
+        pct_parametros_rel = pd.to_numeric(df_rel_param["param_motora_pct"], errors="coerce").dropna().tolist()
+        pct_frete_fixo_rel = serie_parametro_diaria("motora_pct", filtro_ini, filtro_fim).dropna().tolist()
+        pct_comissao_rel = pct_parametro_relatorio(pct_parametros_rel + pct_frete_fixo_rel)
+        pct_db_txt = format_pct_parametros(pct_parametros_rel + pct_frete_fixo_rel)
+        base_comissionavel_total = float(total_f)
+        v_comis = base_comissionavel_total * (pct_comissao_rel / 100.0)
         total_pg = v_comis + fixo_db + pagamento_estadia_10_rel
         qtde_fretes = int(qtd_rel.sum())
 
@@ -6053,10 +6066,10 @@ with aba8:
         m2.metric(f"Comissão ({pct_db_txt})", brl(v_comis))
         m3.metric("Total a Pagar", brl(total_pg))
         m4.metric("Pagamento Estadia 10%", brl(pagamento_estadia_10_rel))
-        m5.metric("Adicional Frete (Sem Comissão)", brl(total_adicional_frete_rel))
+        m5.metric("Adicional Frete", brl(total_adicional_frete_rel))
         st.caption(f"Salário fixo do motorista: {brl(fixo_db)}")
         st.caption(
-            "Base da comissão = Total Bruto - Adicional Frete (Sem Comissão). "
+            "Base da comissão = Total Fretes. "
             f"Base comissionável no período: {brl(base_comissionavel_total)}"
         )
         
@@ -6138,7 +6151,7 @@ with aba8:
                     <div class="tot">
                         <div class="ln"><span>Qtd. de Fretes:</span> <span>{qtde_fretes}</span></div>
                         <div class="ln"><span>Total Bruto:</span> <span>{brl(total_f)}</span></div>
-                        <div class="ln"><span>(-) Adicional Frete (Sem Comissão):</span> <span>{brl(total_adicional_frete_rel)}</span></div>
+                        <div class="ln"><span>Adicional Frete:</span> <span>{brl(total_adicional_frete_rel)}</span></div>
                         <div class="ln"><span>Base da Comissão:</span> <span>{brl(base_comissionavel_total)}</span></div>
                         <div class="ln"><span>Frete Fixo Rateado:</span> <span>{brl(frete_fixo_periodo_rel)}</span></div>
                         <div class="ln"><span>Comissão ({pct_db_txt}):</span> <span>{brl(v_comis)}</span></div>
@@ -9840,6 +9853,148 @@ with aba_cr:
                             limpar_cache_app()
                             st.session_state["cr_flash_msg"] = "✅ Lançamento atualizado."
                             st.rerun()
+
+with aba_fluxo:
+    st.subheader("📈 Fluxo de Caixa")
+    st.caption("Recebimentos menos pagamentos dentro do período informado.")
+
+    hoje_fluxo = date.today()
+    inicio_mes_fluxo = date(hoje_fluxo.year, hoje_fluxo.month, 1)
+    fim_mes_fluxo = date(hoje_fluxo.year, 12, 31)
+    try:
+        fim_mes_fluxo = (date(hoje_fluxo.year + (1 if hoje_fluxo.month == 12 else 0), 1 if hoje_fluxo.month == 12 else hoje_fluxo.month + 1, 1) - timedelta(days=1))
+    except Exception:
+        fim_mes_fluxo = hoje_fluxo
+
+    fcx1, fcx2, fcx3 = st.columns([1, 1, 1.2])
+    fluxo_ini = fcx1.date_input("Período de:", value=inicio_mes_fluxo, format="DD/MM/YYYY", key="fluxo_ini")
+    fluxo_fim = fcx2.date_input("Período até:", value=fim_mes_fluxo, format="DD/MM/YYYY", key="fluxo_fim")
+    fluxo_base = fcx3.radio(
+        "Considerar data",
+        ["Vencimento", "Pagamento/Recebimento"],
+        horizontal=True,
+        key="fluxo_base_data",
+    )
+
+    if fluxo_ini > fluxo_fim:
+        st.warning("A data inicial não pode ser maior que a data final.")
+    else:
+        with conn() as c:
+            df_fluxo_cp = pd.read_sql("SELECT * FROM contas_pagar", c)
+            df_fluxo_cr = pd.read_sql("SELECT * FROM contas_receber", c)
+
+        df_fluxo_cp = _garantir_colunas(df_fluxo_cp, {
+            "data_emissao": None,
+            "data_vencimento": None,
+            "data_pagamento": None,
+            "valor": 0.0,
+            "descricao": "",
+            "fornecedor": "",
+            "categoria": "",
+            "veiculo_placa": "",
+        })
+        df_fluxo_cr = _garantir_colunas(df_fluxo_cr, {
+            "data_emissao": None,
+            "data_vencimento": None,
+            "data_recebimento": None,
+            "valor": 0.0,
+            "descricao": "",
+            "cliente": "",
+            "categoria": "",
+            "veiculo_placa": "",
+        })
+
+        for _col_fluxo in ["data_emissao", "data_vencimento", "data_pagamento"]:
+            df_fluxo_cp[_col_fluxo] = pd.to_datetime(df_fluxo_cp[_col_fluxo], errors="coerce").dt.date
+        for _col_fluxo in ["data_emissao", "data_vencimento", "data_recebimento"]:
+            df_fluxo_cr[_col_fluxo] = pd.to_datetime(df_fluxo_cr[_col_fluxo], errors="coerce").dt.date
+
+        df_fluxo_cp["valor"] = pd.to_numeric(df_fluxo_cp["valor"], errors="coerce").fillna(0.0)
+        df_fluxo_cr["valor"] = pd.to_numeric(df_fluxo_cr["valor"], errors="coerce").fillna(0.0)
+        df_fluxo_cp = _add_status_cp(df_fluxo_cp)
+        df_fluxo_cr = _add_status_cr(df_fluxo_cr)
+
+        if placa_filtro_calculo:
+            placa_ref_fluxo = str(placa_filtro_calculo).strip().upper()
+            df_fluxo_cp = df_fluxo_cp[
+                df_fluxo_cp["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_fluxo
+            ]
+            df_fluxo_cr = df_fluxo_cr[
+                df_fluxo_cr["veiculo_placa"].fillna("").astype(str).str.strip().str.upper() == placa_ref_fluxo
+            ]
+            st.caption(f"Filtro por placa ativo: `{rotulo_placa_com_descricao(placa_filtro_calculo)}`")
+
+        col_data_cp = "data_vencimento" if fluxo_base == "Vencimento" else "data_pagamento"
+        col_data_cr = "data_vencimento" if fluxo_base == "Vencimento" else "data_recebimento"
+
+        mask_cp_fluxo = df_fluxo_cp[col_data_cp].apply(
+            lambda d: fluxo_ini <= d <= fluxo_fim if pd.notna(d) else False
+        ).reindex(df_fluxo_cp.index, fill_value=False).astype(bool)
+        mask_cr_fluxo = df_fluxo_cr[col_data_cr].apply(
+            lambda d: fluxo_ini <= d <= fluxo_fim if pd.notna(d) else False
+        ).reindex(df_fluxo_cr.index, fill_value=False).astype(bool)
+
+        df_cp_periodo = df_fluxo_cp.loc[mask_cp_fluxo].copy()
+        df_cr_periodo = df_fluxo_cr.loc[mask_cr_fluxo].copy()
+
+        total_receber_fluxo = float(df_cr_periodo["valor"].sum()) if not df_cr_periodo.empty else 0.0
+        total_pagar_fluxo = float(df_cp_periodo["valor"].sum()) if not df_cp_periodo.empty else 0.0
+        saldo_fluxo = total_receber_fluxo - total_pagar_fluxo
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("💰 Contas a Receber", brl(total_receber_fluxo), delta=f"{len(df_cr_periodo)} lançamento(s)", delta_color="off")
+        m2.metric("🧾 Contas a Pagar", brl(total_pagar_fluxo), delta=f"{len(df_cp_periodo)} lançamento(s)", delta_color="inverse")
+        m3.metric("📌 Saldo do Período", brl(saldo_fluxo), delta="Receber - Pagar", delta_color="normal" if saldo_fluxo >= 0 else "inverse")
+
+        if saldo_fluxo < 0:
+            st.error(f"Saldo negativo no período: **{brl(saldo_fluxo)}**.")
+        else:
+            st.success(f"Saldo positivo no período: **{brl(saldo_fluxo)}**.")
+
+        st.markdown("### 📋 Detalhamento do Período")
+
+        det_cr = pd.DataFrame()
+        if not df_cr_periodo.empty:
+            det_cr = df_cr_periodo.copy()
+            det_cr["Tipo"] = "Receber"
+            det_cr["Pessoa"] = det_cr["cliente"].fillna("")
+            det_cr["Data"] = det_cr[col_data_cr]
+            det_cr["Entrada (R$)"] = det_cr["valor"]
+            det_cr["Saída (R$)"] = 0.0
+
+        det_cp = pd.DataFrame()
+        if not df_cp_periodo.empty:
+            det_cp = df_cp_periodo.copy()
+            det_cp["Tipo"] = "Pagar"
+            det_cp["Pessoa"] = det_cp["fornecedor"].fillna("")
+            det_cp["Data"] = det_cp[col_data_cp]
+            det_cp["Entrada (R$)"] = 0.0
+            det_cp["Saída (R$)"] = det_cp["valor"]
+
+        df_detalhe_fluxo = pd.concat([det_cr, det_cp], ignore_index=True)
+        if df_detalhe_fluxo.empty:
+            st.info("Nenhum lançamento encontrado para o período informado.")
+        else:
+            df_detalhe_fluxo["Saldo Linha (R$)"] = df_detalhe_fluxo["Entrada (R$)"] - df_detalhe_fluxo["Saída (R$)"]
+            df_detalhe_fluxo = df_detalhe_fluxo.sort_values(["Data", "Tipo"], na_position="last")
+            df_detalhe_fluxo = df_detalhe_fluxo.rename(columns={
+                "descricao": "Descrição",
+                "categoria": "Categoria",
+                "veiculo_placa": "Placa",
+                "status": "Status",
+            })
+            colunas_fluxo = ["Data", "Tipo", "Status", "Descrição", "Pessoa", "Categoria", "Placa", "Entrada (R$)", "Saída (R$)", "Saldo Linha (R$)"]
+            st.dataframe(
+                df_detalhe_fluxo[[c for c in colunas_fluxo if c in df_detalhe_fluxo.columns]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                    "Entrada (R$)": st.column_config.NumberColumn("Entrada (R$)", format="R$ %.2f"),
+                    "Saída (R$)": st.column_config.NumberColumn("Saída (R$)", format="R$ %.2f"),
+                    "Saldo Linha (R$)": st.column_config.NumberColumn("Saldo Linha (R$)", format="R$ %.2f"),
+                },
+            )
 
 with aba18:
     st.subheader("🔔 ME LEMBRA")
