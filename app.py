@@ -9063,13 +9063,20 @@ with aba17:
 
     if not df_cp.empty:
         hoje_cp = date.today()
-        df_pend_cp = df_cp[df_cp["status"].isin(["PENDENTE", "VENCIDO"])]
-        df_venc_cp = df_cp[df_cp["status"] == "VENCIDO"]
-        df_pago_cp = df_cp[df_cp["status"] == "PAGO"]
-        df_7d_cp = df_cp[
-            (df_cp["status"] == "PENDENTE")
-            & df_cp["data_vencimento"].notna()
-            & df_cp["data_vencimento"].apply(lambda d: 0 <= (d - hoje_cp).days <= 7 if pd.notna(d) else False)
+        cp_resumo_ini = st.session_state.get("cp_fil_ini", data_ini_carregar)
+        cp_resumo_fim = st.session_state.get("cp_fil_fim", data_fim_carregar)
+        df_cp_resumo = df_cp[
+            df_cp["data_vencimento"].apply(
+                lambda d: cp_resumo_ini <= d <= cp_resumo_fim if pd.notna(d) else True
+            )
+        ]
+        df_pend_cp = df_cp_resumo[df_cp_resumo["status"].isin(["PENDENTE", "VENCIDO"])]
+        df_venc_cp = df_cp_resumo[df_cp_resumo["status"] == "VENCIDO"]
+        df_pago_cp = df_cp_resumo[df_cp_resumo["status"] == "PAGO"]
+        df_7d_cp = df_cp_resumo[
+            (df_cp_resumo["status"] == "PENDENTE")
+            & df_cp_resumo["data_vencimento"].notna()
+            & df_cp_resumo["data_vencimento"].apply(lambda d: 0 <= (d - hoje_cp).days <= 7 if pd.notna(d) else False)
         ]
 
         st.markdown("### 📊 Resumo — Contas a Pagar")
@@ -9159,8 +9166,8 @@ with aba17:
             "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Pagas"],
             horizontal=False, key="cp_fil_status"
         )
-        cp_fil_ini = fil2.date_input("Vencimento de:", value=date(date.today().year, 1, 1), format="DD/MM/YYYY", key="cp_fil_ini")
-        cp_fil_fim = fil3.date_input("Vencimento até:", value=date(date.today().year, 12, 31), format="DD/MM/YYYY", key="cp_fil_fim")
+        cp_fil_ini = fil2.date_input("Vencimento de:", value=data_ini_carregar, format="DD/MM/YYYY", key="cp_fil_ini")
+        cp_fil_fim = fil3.date_input("Vencimento até:", value=data_fim_carregar, format="DD/MM/YYYY", key="cp_fil_fim")
         cp_cats_disp = ["Todas"] + sorted(df_cp["categoria"].dropna().unique().tolist())
         cp_filtro_cat = fil4.selectbox("Categoria", cp_cats_disp, key="cp_fil_cat")
 
@@ -9474,13 +9481,20 @@ with aba_cr:
 
     if not df_cr.empty:
         hoje_cr = date.today()
-        df_pend_cr = df_cr[df_cr["status"].isin(["PENDENTE", "VENCIDO"])]
-        df_venc_cr = df_cr[df_cr["status"] == "VENCIDO"]
-        df_rec_cr = df_cr[df_cr["status"] == "RECEBIDO"]
-        df_7d_cr = df_cr[
-            (df_cr["status"] == "PENDENTE")
-            & df_cr["data_vencimento"].notna()
-            & df_cr["data_vencimento"].apply(lambda d: 0 <= (d - hoje_cr).days <= 7 if pd.notna(d) else False)
+        cr_resumo_ini = st.session_state.get("cr_fil_ini", data_ini_carregar)
+        cr_resumo_fim = st.session_state.get("cr_fil_fim", data_fim_carregar)
+        df_cr_resumo = df_cr[
+            df_cr["data_vencimento"].apply(
+                lambda d: cr_resumo_ini <= d <= cr_resumo_fim if pd.notna(d) else True
+            )
+        ]
+        df_pend_cr = df_cr_resumo[df_cr_resumo["status"].isin(["PENDENTE", "VENCIDO"])]
+        df_venc_cr = df_cr_resumo[df_cr_resumo["status"] == "VENCIDO"]
+        df_rec_cr = df_cr_resumo[df_cr_resumo["status"] == "RECEBIDO"]
+        df_7d_cr = df_cr_resumo[
+            (df_cr_resumo["status"] == "PENDENTE")
+            & df_cr_resumo["data_vencimento"].notna()
+            & df_cr_resumo["data_vencimento"].apply(lambda d: 0 <= (d - hoje_cr).days <= 7 if pd.notna(d) else False)
         ]
 
         st.markdown("### 📊 Resumo — Contas a Receber")
@@ -9572,8 +9586,8 @@ with aba_cr:
             "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Recebidas"],
             horizontal=False, key="cr_fil_status"
         )
-        cr_fil_ini = gf2.date_input("Vencimento de:", value=date(date.today().year, 1, 1), format="DD/MM/YYYY", key="cr_fil_ini")
-        cr_fil_fim = gf3.date_input("Vencimento até:", value=date(date.today().year, 12, 31), format="DD/MM/YYYY", key="cr_fil_fim")
+        cr_fil_ini = gf2.date_input("Vencimento de:", value=data_ini_carregar, format="DD/MM/YYYY", key="cr_fil_ini")
+        cr_fil_fim = gf3.date_input("Vencimento até:", value=data_fim_carregar, format="DD/MM/YYYY", key="cr_fil_fim")
         cr_cats_disp = ["Todas"] + sorted(df_cr["categoria"].dropna().unique().tolist())
         cr_filtro_cat = gf4.selectbox("Categoria", cr_cats_disp, key="cr_fil_cat")
 
