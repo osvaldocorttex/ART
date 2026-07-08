@@ -9033,6 +9033,120 @@ def _garantir_colunas(df, defaults):
             df[coluna] = valor_padrao
     return df
 
+def _fmt_data_relatorio_financeiro(valor):
+    if valor is None or str(valor) in ("None", "NaT", ""):
+        return "-"
+    try:
+        valor_dt = pd.to_datetime(valor, errors="coerce")
+        if pd.isna(valor_dt):
+            return "-"
+        return valor_dt.strftime("%d/%m/%Y")
+    except Exception:
+        return "-"
+
+def _html_relatorio_financeiro(
+    titulo,
+    periodo_ini,
+    periodo_fim,
+    status_filtro,
+    categoria_filtro,
+    placa_filtro,
+    df_rel,
+    colunas,
+    resumo_linhas,
+    total_label,
+    total_valor,
+):
+    placa_txt = rotulo_placa_com_descricao(placa_filtro) if placa_filtro else "Todas"
+    linhas_tabela = []
+    for _, r in df_rel.iterrows():
+        tds = []
+        for campo, _rotulo, tipo in colunas:
+            valor = r.get(campo)
+            if tipo == "data":
+                valor_txt = _fmt_data_relatorio_financeiro(valor)
+            elif tipo == "moeda":
+                valor_txt = brl(float(valor or 0))
+            else:
+                valor_txt = str(valor or "-")
+            tds.append(f"<td>{escape(valor_txt)}</td>")
+        linhas_tabela.append("<tr>" + "".join(tds) + "</tr>")
+
+    if not linhas_tabela:
+        linhas_tabela.append(
+            f"<tr><td colspan=\"{len(colunas)}\" style=\"text-align:center;\">Nenhum lançamento encontrado para os filtros selecionados.</td></tr>"
+        )
+
+    linhas_resumo = "\n".join(
+        f"<div class=\"ln\"><span>{escape(label)}:</span> <span>{escape(valor)}</span></div>"
+        for label, valor in resumo_linhas
+    )
+    cabecalho_tabela = "\n".join(f"<th>{escape(rotulo)}</th>" for _campo, rotulo, _tipo in colunas)
+
+    return f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: sans-serif; margin: 30px; color: #333; }}
+            header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 11px; }}
+            th, td {{ border: 1px solid #999; padding: 7px; text-align: left; }}
+            th {{ background-color: #f2f2f2; }}
+            .container-resumo {{ margin-top: 30px; display: flex; justify-content: flex-end; }}
+            .tot {{ width: 360px; border: 1px solid #ccc; padding: 15px; background: #fafafa; }}
+            .ln {{ display: flex; justify-content: space-between; gap: 20px; margin-bottom: 8px; font-size: 14px; }}
+            .fin {{ font-weight: bold; font-size: 18px; border-top: 2px solid #2e7d32; color: #2e7d32; padding-top: 10px; margin-top: 10px; }}
+            .assinatura-box {{ margin-top: 80px; text-align: center; width: 400px; }}
+            .linha-assinatura {{ border-top: 1px solid #000; margin-bottom: 5px; }}
+            .btn-print {{ background: #007bff; color: white; padding: 15px; border: none; width: 100%; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 5px; }}
+            @media print {{ .btn-print {{ display: none; }} body {{ margin: 0; }} }}
+        </style>
+    </head>
+    <body>
+        <button class="btn-print" onclick="window.print()">🖨️ CLIQUE AQUI PARA IMPRIMIR ESTE RELATÓRIO</button>
+
+        <header>
+            <h1 style="margin:0;">ART TRANSPORTES</h1>
+            <p style="margin:5px 0;">{escape(titulo.upper())}</p>
+            <p>Período de vencimento: <b>{periodo_ini.strftime('%d/%m/%Y')}</b> até <b>{periodo_fim.strftime('%d/%m/%Y')}</b></p>
+            <p style="margin:5px 0;">
+                Status: <b>{escape(status_filtro)}</b>
+                | Categoria: <b>{escape(categoria_filtro)}</b>
+                | Placa: <b>{escape(placa_txt)}</b>
+            </p>
+        </header>
+
+        <table>
+            <thead>
+                <tr>
+                    {cabecalho_tabela}
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(linhas_tabela)}
+            </tbody>
+        </table>
+
+        <div class="container-resumo">
+            <div class="tot">
+                {linhas_resumo}
+                <div class="ln fin"><span>{escape(total_label)}:</span> <span>{escape(brl(total_valor))}</span></div>
+            </div>
+        </div>
+
+        <div class="assinatura-box">
+            <div class="linha-assinatura"></div>
+            <p><b>Assinatura do Responsável</b></p>
+            <p style="font-size: 10px; color: #666;">Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+        </div>
+
+        <script>
+            setTimeout(function(){{ window.print(); }}, 700);
+        </script>
+    </body>
+    </html>
+    """
+
 with aba17:
     if st.session_state.get("cp_flash_msg"):
         st.success(st.session_state.pop("cp_flash_msg"))
@@ -9213,6 +9327,45 @@ with aba17:
             },
         )
         st.caption(f"Exibindo **{_cp_n_filtrado}** de **{len(df_cp)}** lançamentos | Total filtrado: **{brl(_cp_total_filtrado)}**")
+
+        if st.button("🖨️ Imprimir", use_container_width=True, key="btn_print_contas_pagar"):
+            df_cp_print = df_cp_f.copy()
+            total_cp_pendente = pd.to_numeric(df_cp_print.loc[df_cp_print["status"] == "PENDENTE", "valor"], errors="coerce").fillna(0).sum()
+            total_cp_vencido = pd.to_numeric(df_cp_print.loc[df_cp_print["status"] == "VENCIDO", "valor"], errors="coerce").fillna(0).sum()
+            total_cp_pago = pd.to_numeric(df_cp_print.loc[df_cp_print["status"] == "PAGO", "valor"], errors="coerce").fillna(0).sum()
+            df_cp_print["status_print"] = df_cp_print["status"].map(_CP_STATUS_ICON).fillna("🟡 Pendente")
+            html_cp_print = _html_relatorio_financeiro(
+                "Relatório de Contas a Pagar",
+                cp_fil_ini,
+                cp_fil_fim,
+                cp_filtro_status,
+                cp_filtro_cat,
+                placa_filtro_calculo,
+                df_cp_print,
+                [
+                    ("id", "ID", "texto"),
+                    ("data_emissao", "Emissão", "data"),
+                    ("status_print", "Status", "texto"),
+                    ("descricao", "Descrição", "texto"),
+                    ("fornecedor", "Fornecedor", "texto"),
+                    ("categoria", "Categoria", "texto"),
+                    ("veiculo_placa", "Placa", "texto"),
+                    ("n_documento", "Documento", "texto"),
+                    ("data_vencimento", "Vencimento", "data"),
+                    ("valor", "Valor", "moeda"),
+                    ("data_pagamento", "Data Pgto", "data"),
+                    ("forma_pagamento", "Forma Pgto", "texto"),
+                ],
+                [
+                    ("Quantidade de Lançamentos", str(len(df_cp_print))),
+                    ("Total Pendente", brl(total_cp_pendente)),
+                    ("Total Vencido", brl(total_cp_vencido)),
+                    ("Total Pago", brl(total_cp_pago)),
+                ],
+                "TOTAL FILTRADO",
+                _cp_total_filtrado,
+            )
+            components.html(html_cp_print, height=1000, scrolling=True)
 
         st.markdown("#### ⚡ Gerenciar Lançamento")
         if "cp_editando_id" not in st.session_state:
@@ -9633,6 +9786,45 @@ with aba_cr:
             },
         )
         st.caption(f"Exibindo **{_cr_n_filtrado}** de **{len(df_cr)}** lançamentos | Total filtrado: **{brl(_cr_total_filtrado)}**")
+
+        if st.button("🖨️ Imprimir", use_container_width=True, key="btn_print_contas_receber"):
+            df_cr_print = df_cr_f.copy()
+            total_cr_pendente = pd.to_numeric(df_cr_print.loc[df_cr_print["status"] == "PENDENTE", "valor"], errors="coerce").fillna(0).sum()
+            total_cr_vencido = pd.to_numeric(df_cr_print.loc[df_cr_print["status"] == "VENCIDO", "valor"], errors="coerce").fillna(0).sum()
+            total_cr_recebido = pd.to_numeric(df_cr_print.loc[df_cr_print["status"] == "RECEBIDO", "valor"], errors="coerce").fillna(0).sum()
+            df_cr_print["status_print"] = df_cr_print["status"].map(_CR_STATUS_ICON).fillna("🟡 Pendente")
+            html_cr_print = _html_relatorio_financeiro(
+                "Relatório de Contas a Receber",
+                cr_fil_ini,
+                cr_fil_fim,
+                cr_filtro_status,
+                cr_filtro_cat,
+                placa_filtro_calculo,
+                df_cr_print,
+                [
+                    ("id", "ID", "texto"),
+                    ("data_emissao", "Emissão", "data"),
+                    ("status_print", "Status", "texto"),
+                    ("descricao", "Descrição", "texto"),
+                    ("cliente", "Cliente", "texto"),
+                    ("categoria", "Categoria", "texto"),
+                    ("veiculo_placa", "Placa", "texto"),
+                    ("n_documento", "Documento", "texto"),
+                    ("data_vencimento", "Vencimento", "data"),
+                    ("valor", "Valor", "moeda"),
+                    ("data_recebimento", "Data Rec.", "data"),
+                    ("forma_recebimento", "Forma Rec.", "texto"),
+                ],
+                [
+                    ("Quantidade de Lançamentos", str(len(df_cr_print))),
+                    ("Total Pendente", brl(total_cr_pendente)),
+                    ("Total Vencido", brl(total_cr_vencido)),
+                    ("Total Recebido", brl(total_cr_recebido)),
+                ],
+                "TOTAL FILTRADO",
+                _cr_total_filtrado,
+            )
+            components.html(html_cr_print, height=1000, scrolling=True)
 
         st.markdown("#### ⚡ Gerenciar Lançamento")
         if "cr_editando_id" not in st.session_state:
