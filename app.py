@@ -99,6 +99,7 @@ def normalizar_tipo_combustivel(valor):
 
 def alerta_gravado(mensagem="✅ Gravado com sucesso!"):
     limpar_cache_app()
+    st.session_state["_flash_gravado_msg"] = mensagem
     st.success(mensagem)
 
 def focar_campo_por_rotulo(rotulo):
@@ -344,6 +345,35 @@ def deletar_estacao_trabalho(estacao_id):
     with conn() as c:
         c.execute("DELETE FROM estacoes_trabalho WHERE id=?", (int(estacao_id),))
     return True, "Estação deletada com sucesso."
+
+
+def gravar_tudo_e_fechar_sistema():
+    try:
+        with conn() as c:
+            c.commit()
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as exc:
+        st.error(f"Não foi possível gravar e fechar o sistema: {exc}")
+        st.stop()
+
+    limpar_cache_app()
+    st.session_state.clear()
+    components.html(
+        """
+        <script>
+        setTimeout(function() {
+            try { window.parent.close(); } catch (e) {}
+            try { window.close(); } catch (e) {}
+        }, 500);
+        setTimeout(function() {
+            try { window.parent.location.reload(); } catch (e) {}
+        }, 900);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+    st.stop()
 
 
 def proteger_abertura_sistema():
@@ -742,7 +772,7 @@ def _carregar_historico_parametros_raw():
         return pd.read_sql(
             """SELECT COALESCE(NULLIF(TRIM(veiculo_placa), ''), 'GERAL') AS veiculo_placa,
                       vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
+                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, valor_inss, valor_acerto_folha, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                       qtde_pneu, vl_gasto_pneu_km
                FROM parametros_historico
                ORDER BY veiculo_placa ASC, date(vigencia_data) ASC, id ASC""",
@@ -796,6 +826,57 @@ def limpar_cache_app():
             pass
 
 
+def dados_versao_arquivo_principal():
+    caminho_app = Path(__file__).resolve()
+    data_mudanca = datetime.fromtimestamp(caminho_app.stat().st_mtime)
+    return {
+        "versao": data_mudanca.strftime("v%Y.%m.%d.%H%M"),
+        "data_hora_mudanca": data_mudanca.isoformat(timespec="seconds"),
+        "arquivo": caminho_app.name,
+    }
+
+
+def registrar_versao_sistema():
+    dados = dados_versao_arquivo_principal()
+    agora = datetime.now().isoformat(timespec="seconds")
+    with conn() as c:
+        c.execute(
+            """INSERT INTO sistema_versao (id, versao, data_hora_mudanca, arquivo, data_hora_registro)
+               VALUES (1, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   versao=excluded.versao,
+                   data_hora_mudanca=excluded.data_hora_mudanca,
+                   arquivo=excluded.arquivo,
+                   data_hora_registro=excluded.data_hora_registro
+               WHERE sistema_versao.versao<>excluded.versao
+                  OR sistema_versao.data_hora_mudanca<>excluded.data_hora_mudanca
+                  OR sistema_versao.arquivo<>excluded.arquivo""",
+            (dados["versao"], dados["data_hora_mudanca"], dados["arquivo"], agora),
+        )
+
+
+def obter_versao_sistema():
+    try:
+        with conn() as c:
+            row = c.execute(
+                "SELECT versao, data_hora_mudanca, data_hora_registro FROM sistema_versao WHERE id=1"
+            ).fetchone()
+        if row:
+            return dict(row)
+    except Exception:
+        pass
+    dados = dados_versao_arquivo_principal()
+    dados["data_hora_registro"] = dados["data_hora_mudanca"]
+    return dados
+
+
+def formatar_data_hora_br(valor):
+    try:
+        return datetime.fromisoformat(str(valor)).strftime("%d/%m/%Y %H:%M:%S")
+    except Exception:
+        return str(valor or "")
+
+
 limpar_cache_app()
 
 # =========================
@@ -812,6 +893,13 @@ if 'p_simulado' not in st.session_state:
 def init_db():
     with conn() as c:
         # 1. Criação das tabelas base (se não existirem)
+        c.execute("""CREATE TABLE IF NOT EXISTS sistema_versao (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            versao TEXT NOT NULL,
+            data_hora_mudanca TEXT NOT NULL,
+            arquivo TEXT,
+            data_hora_registro TEXT
+        )""")
         c.execute("""CREATE TABLE IF NOT EXISTS usuarios_sistema (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             usuario TEXT NOT NULL UNIQUE,
@@ -845,6 +933,8 @@ def init_db():
             pneu REAL DEFAULT 0.12, depre REAL DEFAULT 0.30, 
             motora_fixo REAL DEFAULT 2500.0, motora_pct REAL DEFAULT 10.0,
             seguro REAL DEFAULT 2750.0, seguro_vida_motorista REAL DEFAULT 0.0, financiamento REAL DEFAULT 0.0, pagto_ipva REAL DEFAULT 0.0,
+            valor_inss REAL DEFAULT 0.0,
+            valor_acerto_folha REAL DEFAULT 0.0,
             meta_faturamento REAL DEFAULT 50000.0,
             valor_frete_mensal_fixo REAL DEFAULT 0.0,
             qtde_pneu REAL DEFAULT 1.0,
@@ -1006,6 +1096,8 @@ def init_db():
             seguro_vida_motorista REAL,
             financiamento REAL,
             pagto_ipva REAL,
+            valor_inss REAL,
+            valor_acerto_folha REAL,
             cmp_custo_escritorio REAL,
             vl_custo_rastreador REAL,
             imposto_pct REAL,
@@ -1335,6 +1427,10 @@ def init_db():
             c.execute("ALTER TABLE parametros ADD COLUMN valor_frete_mensal_fixo REAL DEFAULT 0.0")
         if "seguro_vida_motorista" not in colunas_param:
             c.execute("ALTER TABLE parametros ADD COLUMN seguro_vida_motorista REAL DEFAULT 0.0")
+        if "valor_inss" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN valor_inss REAL DEFAULT 0.0")
+        if "valor_acerto_folha" not in colunas_param:
+            c.execute("ALTER TABLE parametros ADD COLUMN valor_acerto_folha REAL DEFAULT 0.0")
         if "filtro_placa_default" not in colunas_param:
             c.execute("ALTER TABLE parametros ADD COLUMN filtro_placa_default TEXT DEFAULT 'Todas as placas'")
 
@@ -1349,6 +1445,10 @@ def init_db():
             coluna_seguro_vida_hist_criada = True
         if "vl_custo_rastreador" not in colunas_hist_param:
             c.execute("ALTER TABLE parametros_historico ADD COLUMN vl_custo_rastreador REAL DEFAULT 0.0")
+        if "valor_inss" not in colunas_hist_param:
+            c.execute("ALTER TABLE parametros_historico ADD COLUMN valor_inss REAL DEFAULT 0.0")
+        if "valor_acerto_folha" not in colunas_hist_param:
+            c.execute("ALTER TABLE parametros_historico ADD COLUMN valor_acerto_folha REAL DEFAULT 0.0")
         if coluna_seguro_vida_hist_criada:
             c.execute(
                 """UPDATE parametros_historico
@@ -1391,6 +1491,8 @@ def init_db():
                 seguro_vida_motorista REAL,
                 financiamento REAL,
                 pagto_ipva REAL,
+                valor_inss REAL,
+                valor_acerto_folha REAL,
                 cmp_custo_escritorio REAL,
                 vl_custo_rastreador REAL,
                 imposto_pct REAL,
@@ -1402,12 +1504,12 @@ def init_db():
             c.execute("""INSERT OR REPLACE INTO parametros_historico_nova (
                             id, veiculo_placa, vigencia_data, consumo, manut, pneu, depre,
                             motora_fixo, motora_pct, seguro, seguro_vida_motorista, financiamento,
-                            pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct,
+                            pagto_ipva, valor_inss, valor_acerto_folha, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct,
                             valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
                          )
                          SELECT id, COALESCE(NULLIF(TRIM(veiculo_placa), ''), 'GERAL'), vigencia_data,
                                 consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro,
-                                seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio,
+                                seguro_vida_motorista, financiamento, pagto_ipva, COALESCE(valor_inss, 0.0), COALESCE(valor_acerto_folha, 0.0), cmp_custo_escritorio,
                                 vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                                 qtde_pneu, vl_gasto_pneu_km
                          FROM parametros_historico""")
@@ -1434,6 +1536,7 @@ def init_db():
 
 # Executa a função para garantir que o banco está atualizado
 init_db()
+registrar_versao_sistema()
 proteger_abertura_sistema()
 # --- FIM DO BLOCO INIT_DB ---
 
@@ -1450,6 +1553,7 @@ if st.session_state.simulacao_ativa:
 else:
     p = p_real
 
+versao_sistema = obter_versao_sistema()
 data_ini_carregar = datetime.strptime(p.get('data_filtro_ini', '2026-01-01'), '%Y-%m-%d').date()
 data_fim_carregar = datetime.strptime(p.get('data_filtro_fim', '2026-12-31'), '%Y-%m-%d').date()
 
@@ -1861,6 +1965,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.caption(
+    f"Versão do sistema: {versao_sistema.get('versao', '')} | "
+    f"Última mudança: {formatar_data_hora_br(versao_sistema.get('data_hora_mudanca'))}"
+)
+
+if st.session_state.get("_flash_gravado_msg"):
+    st.success(st.session_state.pop("_flash_gravado_msg"))
+
 st.markdown(
     '<div style="background:#fff;border:1px solid #cfdce9;border-radius:12px;padding:4px 14px 2px;'
     'margin-bottom:8px;box-shadow:0 1px 3px rgba(11,60,93,0.07);">'
@@ -1923,6 +2035,8 @@ PARAM_CAMPOS_HIST = [
     "seguro_vida_motorista",
     "financiamento",
     "pagto_ipva",
+    "valor_inss",
+    "valor_acerto_folha",
     "cmp_custo_escritorio",
     "vl_custo_rastreador",
     "imposto_pct",
@@ -2617,6 +2731,11 @@ if not df_db.empty:
 # =========================
 # DEFINIÇÃO DAS ABAS
 # =========================
+menu_col_sair, menu_col_spacer = st.columns([1.2, 8])
+with menu_col_sair:
+    if st.button("🚪 Sair do Sistema", key="btn_sair_sistema", use_container_width=True):
+        gravar_tudo_e_fechar_sistema()
+
 aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14, aba17, aba_cr, aba_fluxo, aba18, aba20, aba_usuarios, aba_calc = st.tabs([
     "🏠 Dashboard Executivo",
     "📌 Movimento Viagens", "📋 Viagens Executadas", "📊 Análise", "🛠️ Manutenção", "🗂️ Cadastro",
@@ -4195,7 +4314,7 @@ with aba2:
                                     ),
                                 )
                             limpar_cache_viagens()
-                            alerta_gravado("✅ Viagem atualizada com sucesso!")
+                            alerta_gravado()
                             st.session_state.viagens_exec_id_editando = None
                             st.rerun()
 
@@ -6028,6 +6147,27 @@ with aba8:
         unsafe_allow_html=True,
     )
     fixo_db = valor_mensal_rateado_periodo("motora_fixo", filtro_ini, filtro_fim)
+
+    def valor_parametro_relatorio_sem_rateio(campo):
+        data_ref = filtro_fim or filtro_ini or date.today()
+        serie = serie_parametro_diaria(campo, data_ref, data_ref)
+        if not serie.empty:
+            return float(pd.to_numeric(serie, errors="coerce").fillna(0.0).iloc[-1])
+        return float(p.get(campo, 0.0) or 0.0)
+
+    valor_inss_rel = valor_parametro_relatorio_sem_rateio("valor_inss")
+    valor_acerto_folha_rel = valor_parametro_relatorio_sem_rateio("valor_acerto_folha")
+    desc_col1, desc_col2 = st.columns(2)
+    incluir_inss_rel = desc_col1.checkbox(
+        "Descontar Valor INSS",
+        value=True,
+        key="rel_descontar_valor_inss",
+    )
+    incluir_acerto_folha_rel = desc_col2.checkbox(
+        "Descontar Valor Acerto Folha",
+        value=True,
+        key="rel_descontar_valor_acerto_folha",
+    )
     
     if not df_db.empty:
         # Cálculos de apoio
@@ -6056,7 +6196,11 @@ with aba8:
         pct_db_txt = format_pct_parametros(pct_parametros_rel + pct_frete_fixo_rel)
         base_comissionavel_total = float(total_f)
         v_comis = base_comissionavel_total * (pct_comissao_rel / 100.0)
-        total_pg = v_comis + fixo_db + pagamento_estadia_10_rel
+        desconto_inss_rel = valor_inss_rel if incluir_inss_rel else 0.0
+        desconto_acerto_folha_rel = valor_acerto_folha_rel if incluir_acerto_folha_rel else 0.0
+        total_descontos_folha_rel = desconto_inss_rel + desconto_acerto_folha_rel
+        total_pg_bruto = v_comis + fixo_db + pagamento_estadia_10_rel
+        total_pg = total_pg_bruto - total_descontos_folha_rel
         qtde_fretes = int(qtd_rel.sum())
 
         # Visualização no Streamlit
@@ -6067,11 +6211,16 @@ with aba8:
         m3.metric("Total a Pagar", brl(total_pg))
         m4.metric("Pagamento Estadia 10%", brl(pagamento_estadia_10_rel))
         m5.metric("Adicional Frete", brl(total_adicional_frete_rel))
+        d0, d1, d2 = st.columns(3)
+        d0.metric("Subtotal a Pagar", brl(total_pg_bruto))
+        d1.metric("Desconto INSS", brl(desconto_inss_rel))
+        d2.metric("Desconto Acerto Folha", brl(desconto_acerto_folha_rel))
         st.caption(f"Salário fixo do motorista: {brl(fixo_db)}")
         st.caption(
             "Base da comissão = Total Fretes. "
             f"Base comissionável no período: {brl(base_comissionavel_total)}"
         )
+        st.caption(f"Descontos aplicados no Total a Pagar: {brl(total_descontos_folha_rel)}")
         
         if st.button("🔍 PREPARAR IMPRESSÃO", use_container_width=True, key="btn_print_rel_final"):
             # Início do HTML
@@ -6104,6 +6253,7 @@ with aba8:
                     <p style="margin:5px 0;">
                         Salário Fixo do Motorista: <b>{brl(fixo_db)}</b>
                         | Comissão: <b>{pct_db_txt}</b>
+                        | Descontos: <b>{brl(total_descontos_folha_rel)}</b>
                         | Total a Pagar: <b>{brl(total_pg)}</b>
                     </p>
                 </header>
@@ -6157,6 +6307,9 @@ with aba8:
                         <div class="ln"><span>Comissão ({pct_db_txt}):</span> <span>{brl(v_comis)}</span></div>
                         <div class="ln"><span>Pagamento Estadia 10%:</span> <span>{brl(pagamento_estadia_10_rel)}</span></div>
                         <div class="ln"><span>Salário Fixo:</span> <span>{brl(fixo_db)}</span></div>
+                        <div class="ln"><span>Subtotal a Pagar:</span> <span>{brl(total_pg_bruto)}</span></div>
+                        <div class="ln"><span>(-) Valor INSS:</span> <span>{brl(desconto_inss_rel)}</span></div>
+                        <div class="ln"><span>(-) Valor Acerto Folha:</span> <span>{brl(desconto_acerto_folha_rel)}</span></div>
                         <div class="ln fin"><span>TOTAL A PAGAR:</span> <span>{brl(total_pg)}</span></div>
                     </div>
                 </div>
@@ -6358,7 +6511,7 @@ with aba9:
                     limpar_cache_app()
                     st.session_state["abs_form_defaults"] = {}
                     st.session_state["abs_form_nonce"] += 1
-                    st.session_state["abs_sucesso_msg"] = "✅ Abastecimento gravado com sucesso!"
+                    st.session_state["abs_sucesso_msg"] = "✅ Gravado com sucesso!"
                     st.rerun()
 
         if st.session_state.get("abs_focus_label"):
@@ -6774,7 +6927,7 @@ with aba9:
                                         int(st.session_state.abastecimento_id_editando),
                                     ),
                                 )
-                            alerta_gravado("✅ Abastecimento atualizado com sucesso!")
+                            alerta_gravado()
                             st.session_state.abastecimento_id_editando = None
                             st.rerun()
 
@@ -6839,6 +6992,7 @@ with aba10:
             row_param_placa = c.execute(
                 """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct,
                           seguro, seguro_vida_motorista, financiamento, pagto_ipva,
+                          valor_inss, valor_acerto_folha,
                           cmp_custo_escritorio, vl_custo_rastreador, imposto_pct,
                           valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
                    FROM parametros_historico
@@ -6920,16 +7074,18 @@ with aba10:
     c5.number_input("Pneu (R$/km)", value=float(pne_v), step=0.01, disabled=True)
     dep_v = st.number_input("Depreciação (R$/km)", value=float(dados_para_exibir.get('depre', 0.30)), step=0.01, key=f"dep_{tipo_modo}", disabled=not st.session_state.param_editando)
     
-    c6, c7, c8, c9, c10, c11, c12, c13, c14 = st.columns(9)
+    c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16 = st.columns(11)
     fix_v = c6.number_input("Salário Fixo (R$)", value=float(dados_para_exibir.get('motora_fixo', 2500.0)), step=50.0, key=f"fix_{tipo_modo}", disabled=not st.session_state.param_editando)
     pct_v = c7.number_input("Comissão (%)", value=float(dados_para_exibir.get('motora_pct', 10.0)), step=0.5, key=f"pct_{tipo_modo}", disabled=not st.session_state.param_editando)
     seg_v = c8.number_input("Seguro Mensal (R$)", value=float(dados_para_exibir.get('seguro', 2750.0)), step=10.0, key=f"seg_{tipo_modo}", disabled=not st.session_state.param_editando)
     seg_vida_motorista_v = c9.number_input("Seguro Vida Motorista Mensal (R$)", value=float(dados_para_exibir.get('seguro_vida_motorista', 0.0)), step=10.0, key=f"seg_vida_mot_{tipo_modo}", disabled=not st.session_state.param_editando)
     fin_v = c10.number_input("Financiamento (R$)", value=float(dados_para_exibir.get('financiamento', 0.0)), step=100.0, key=f"fin_{tipo_modo}", disabled=not st.session_state.param_editando)
-    esc_v = c11.number_input("Escritório (R$)", value=float(dados_para_exibir.get('cmp_custo_escritorio', 0.0)), step=50.0, key=f"esc_{tipo_modo}", disabled=not st.session_state.param_editando)
-    rastreador_v = c12.number_input("VL Custo Rastreador (R$)", value=float(dados_para_exibir.get('vl_custo_rastreador', 0.0)), step=50.0, key=f"rastreador_{tipo_modo}", disabled=not st.session_state.param_editando)
-    ipva_v = c13.number_input("Pagto IPVA Anual (R$)", value=float(dados_para_exibir.get('pagto_ipva', 0.0)), step=50.0, key=f"ipva_{tipo_modo}", disabled=not st.session_state.param_editando)
-    imp_v = c14.number_input("% de Impostos", min_value=0.0, step=0.1, value=float(dados_para_exibir.get('imposto_pct', 0.0)), key=f"imposto_{tipo_modo}", disabled=not st.session_state.param_editando)
+    inss_v = c11.number_input("Valor INSS (R$)", value=float(dados_para_exibir.get('valor_inss', 0.0)), step=10.0, key=f"inss_{tipo_modo}", disabled=not st.session_state.param_editando)
+    acerto_folha_v = c12.number_input("Valor Acerto Folha (R$)", value=float(dados_para_exibir.get('valor_acerto_folha', 0.0)), step=10.0, key=f"acerto_folha_{tipo_modo}", disabled=not st.session_state.param_editando)
+    esc_v = c13.number_input("Escritório (R$)", value=float(dados_para_exibir.get('cmp_custo_escritorio', 0.0)), step=50.0, key=f"esc_{tipo_modo}", disabled=not st.session_state.param_editando)
+    rastreador_v = c14.number_input("VL Custo Rastreador (R$)", value=float(dados_para_exibir.get('vl_custo_rastreador', 0.0)), step=50.0, key=f"rastreador_{tipo_modo}", disabled=not st.session_state.param_editando)
+    ipva_v = c15.number_input("Pagto IPVA Anual (R$)", value=float(dados_para_exibir.get('pagto_ipva', 0.0)), step=50.0, key=f"ipva_{tipo_modo}", disabled=not st.session_state.param_editando)
+    imp_v = c16.number_input("% de Impostos", min_value=0.0, step=0.1, value=float(dados_para_exibir.get('imposto_pct', 0.0)), key=f"imposto_{tipo_modo}", disabled=not st.session_state.param_editando)
 
     if not df_db.empty:
         qtd_imposto = pd.to_numeric(df_db.get("qtd_viagens", 1), errors="coerce").fillna(1.0)
@@ -6957,6 +7113,7 @@ with aba10:
             'consumo': con_v, 'manut': man_v, 'pneu': pne_v, 'depre': dep_v,
             'qtde_pneu': qtde_pneu_v, 'vl_gasto_pneu_km': vl_gasto_pneu_km_v,
             'motora_fixo': fix_v, 'motora_pct': pct_v, 'seguro': seg_v, 'seguro_vida_motorista': seg_vida_motorista_v, 'financiamento': fin_v,
+            'valor_inss': inss_v, 'valor_acerto_folha': acerto_folha_v,
             'cmp_custo_escritorio': esc_v, 'vl_custo_rastreador': rastreador_v, 'pagto_ipva': ipva_v, 'imposto_pct': imp_v,
             'meta_faturamento': meta_v,
             'valor_frete_mensal_fixo': frete_mensal_fixo_v,
@@ -6982,9 +7139,9 @@ with aba10:
                 c.execute(
                     """INSERT INTO parametros_historico (
                            veiculo_placa, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                           seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
+                           seguro, seguro_vida_motorista, financiamento, pagto_ipva, valor_inss, valor_acerto_folha, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                            qtde_pneu, vl_gasto_pneu_km
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(veiculo_placa, vigencia_data) DO UPDATE SET
                            consumo=excluded.consumo,
                            manut=excluded.manut,
@@ -6996,6 +7153,8 @@ with aba10:
                            seguro_vida_motorista=excluded.seguro_vida_motorista,
                            financiamento=excluded.financiamento,
                            pagto_ipva=excluded.pagto_ipva,
+                           valor_inss=excluded.valor_inss,
+                           valor_acerto_folha=excluded.valor_acerto_folha,
                            cmp_custo_escritorio=excluded.cmp_custo_escritorio,
                            vl_custo_rastreador=excluded.vl_custo_rastreador,
                            imposto_pct=excluded.imposto_pct,
@@ -7006,7 +7165,7 @@ with aba10:
                         placa_param_cadastro,
                         data_vigencia_param,
                         con_v, man_v, pne_v, dep_v, fix_v, pct_v,
-                        seg_v, seg_vida_motorista_v, fin_v, ipva_v, esc_v, rastreador_v, imp_v, frete_mensal_fixo_v,
+                        seg_v, seg_vida_motorista_v, fin_v, ipva_v, inss_v, acerto_folha_v, esc_v, rastreador_v, imp_v, frete_mensal_fixo_v,
                         qtde_pneu_v, vl_gasto_pneu_km_v,
                     ),
                 )
@@ -7026,7 +7185,7 @@ with aba10:
         df_hist_param = pd.read_sql(
             """SELECT id, COALESCE(NULLIF(TRIM(veiculo_placa), ''), 'GERAL') AS veiculo_placa,
                       vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
+                      seguro, seguro_vida_motorista, financiamento, pagto_ipva, valor_inss, valor_acerto_folha, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                       qtde_pneu, vl_gasto_pneu_km
                FROM parametros_historico
                ORDER BY veiculo_placa ASC, date(vigencia_data) DESC, id DESC""",
@@ -7076,6 +7235,8 @@ with aba10:
                 "seguro_vida_motorista": st.column_config.NumberColumn("Seguro Vida Motorista Mensal", format="R$ %.2f"),
                 "financiamento": st.column_config.NumberColumn("Financiamento", format="R$ %.2f"),
                 "pagto_ipva": st.column_config.NumberColumn("IPVA Anual", format="R$ %.2f"),
+                "valor_inss": st.column_config.NumberColumn("Valor INSS", format="R$ %.2f"),
+                "valor_acerto_folha": st.column_config.NumberColumn("Valor Acerto Folha", format="R$ %.2f"),
                 "cmp_custo_escritorio": st.column_config.NumberColumn("Escritório", format="R$ %.2f"),
                 "vl_custo_rastreador": st.column_config.NumberColumn("VL Custo Rastreador", format="R$ %.2f"),
                 "imposto_pct": st.column_config.NumberColumn("Imposto (%)", format="%.2f"),
@@ -7142,15 +7303,17 @@ with aba10:
             novo_seguro_vida_motorista = h9.number_input("Seguro Vida Motorista Mensal (R$)", value=float(row_hist["seguro_vida_motorista"]), step=10.0, key=f"hist_seg_vida_mot_{id_hist_sel}")
             novo_fin = h10.number_input("Financiamento (R$)", value=float(row_hist["financiamento"]), step=50.0, key=f"hist_fin_{id_hist_sel}")
 
-            h11, h12, h13, h14, h15 = st.columns(5)
+            h11, h12, h13, h14, h15, h16, h17 = st.columns(7)
             novo_ipva = h11.number_input("IPVA Anual (R$)", value=float(row_hist["pagto_ipva"]), step=50.0, key=f"hist_ipva_{id_hist_sel}")
-            novo_escr = h12.number_input("Escritório (R$)", value=float(row_hist["cmp_custo_escritorio"]), step=50.0, key=f"hist_esc_{id_hist_sel}")
-            novo_rastreador = h13.number_input("VL Custo Rastreador (R$)", value=float(row_hist["vl_custo_rastreador"] or 0.0), step=50.0, key=f"hist_rastreador_{id_hist_sel}")
-            novo_imp = h14.number_input("Imposto (%)", value=float(row_hist["imposto_pct"]), step=0.1, key=f"hist_imp_{id_hist_sel}")
-            novo_frete_fixo = h15.number_input("Frete Fixo Mensal (R$)", value=float(row_hist["valor_frete_mensal_fixo"]), step=100.0, key=f"hist_ff_{id_hist_sel}")
-            h16, h17 = st.columns(2)
-            nova_qtde_pneu = h16.number_input("Qtde Pneu", value=float(row_hist["qtde_pneu"] or 0.0), min_value=0.0, step=1.0, format="%.0f", key=f"hist_qpneu_{id_hist_sel}")
-            novo_vl_pneu_km = h17.number_input("Valor Pneu Km (R$)", value=float(row_hist["vl_gasto_pneu_km"] or 0.0), min_value=0.0, step=0.0001, format="%.4f", key=f"hist_vlpkm_{id_hist_sel}")
+            novo_inss = h12.number_input("Valor INSS (R$)", value=float(row_hist["valor_inss"] or 0.0), step=10.0, key=f"hist_inss_{id_hist_sel}")
+            novo_acerto_folha = h13.number_input("Valor Acerto Folha (R$)", value=float(row_hist["valor_acerto_folha"] or 0.0), step=10.0, key=f"hist_acerto_folha_{id_hist_sel}")
+            novo_escr = h14.number_input("Escritório (R$)", value=float(row_hist["cmp_custo_escritorio"]), step=50.0, key=f"hist_esc_{id_hist_sel}")
+            novo_rastreador = h15.number_input("VL Custo Rastreador (R$)", value=float(row_hist["vl_custo_rastreador"] or 0.0), step=50.0, key=f"hist_rastreador_{id_hist_sel}")
+            novo_imp = h16.number_input("Imposto (%)", value=float(row_hist["imposto_pct"]), step=0.1, key=f"hist_imp_{id_hist_sel}")
+            novo_frete_fixo = h17.number_input("Frete Fixo Mensal (R$)", value=float(row_hist["valor_frete_mensal_fixo"]), step=100.0, key=f"hist_ff_{id_hist_sel}")
+            h18, h19 = st.columns(2)
+            nova_qtde_pneu = h18.number_input("Qtde Pneu", value=float(row_hist["qtde_pneu"] or 0.0), min_value=0.0, step=1.0, format="%.0f", key=f"hist_qpneu_{id_hist_sel}")
+            novo_vl_pneu_km = h19.number_input("Valor Pneu Km (R$)", value=float(row_hist["vl_gasto_pneu_km"] or 0.0), min_value=0.0, step=0.0001, format="%.4f", key=f"hist_vlpkm_{id_hist_sel}")
 
             st.markdown("##### 📄 Duplicar Vigência")
             d1, d2 = st.columns([2, 1])
@@ -7175,9 +7338,9 @@ with aba10:
                         c.execute(
                             """INSERT INTO parametros_historico (
                                    veiculo_placa, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
+                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, valor_inss, valor_acerto_folha, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                                    qtde_pneu, vl_gasto_pneu_km
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
                                 nova_placa_hist,
                                 data_dup_txt,
@@ -7191,6 +7354,8 @@ with aba10:
                                 float(row_hist["seguro_vida_motorista"] or 0.0),
                                 float(row_hist["financiamento"] or 0.0),
                                 float(row_hist["pagto_ipva"] or 0.0),
+                                float(row_hist["valor_inss"] or 0.0),
+                                float(row_hist["valor_acerto_folha"] or 0.0),
                                 float(row_hist["cmp_custo_escritorio"] or 0.0),
                                 float(row_hist["vl_custo_rastreador"] or 0.0),
                                 float(row_hist["imposto_pct"] or 0.0),
@@ -7216,12 +7381,12 @@ with aba10:
                         c.execute(
                             """UPDATE parametros_historico
                                SET veiculo_placa=?, vigencia_data=?, consumo=?, manut=?, pneu=?, depre=?, motora_fixo=?, motora_pct=?,
-                                   seguro=?, seguro_vida_motorista=?, financiamento=?, pagto_ipva=?, cmp_custo_escritorio=?, vl_custo_rastreador=?, imposto_pct=?, valor_frete_mensal_fixo=?,
+                                   seguro=?, seguro_vida_motorista=?, financiamento=?, pagto_ipva=?, valor_inss=?, valor_acerto_folha=?, cmp_custo_escritorio=?, vl_custo_rastreador=?, imposto_pct=?, valor_frete_mensal_fixo=?,
                                    qtde_pneu=?, vl_gasto_pneu_km=?
                                WHERE id=?""",
                             (
                                 nova_placa_hist, nova_vig_txt, novo_consumo, nova_manut, novo_pneu, nova_depre, novo_mot_fixo, novo_mot_pct,
-                                novo_seguro, novo_seguro_vida_motorista, novo_fin, novo_ipva, novo_escr, novo_rastreador, novo_imp, novo_frete_fixo,
+                                novo_seguro, novo_seguro_vida_motorista, novo_fin, novo_ipva, novo_inss, novo_acerto_folha, novo_escr, novo_rastreador, novo_imp, novo_frete_fixo,
                                 nova_qtde_pneu, novo_vl_pneu_km, int(id_hist_sel),
                             ),
                         )
@@ -8292,16 +8457,16 @@ with aba19:
                         )
                         p_hist_base = c.execute(
                             """SELECT consumo, manut, pneu, depre, motora_fixo, motora_pct, seguro, seguro_vida_motorista, financiamento,
-                                      pagto_ipva, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
+                                      pagto_ipva, valor_inss, valor_acerto_folha, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo, qtde_pneu, vl_gasto_pneu_km
                                FROM parametros WHERE id=1"""
                         ).fetchone()
                         data_vigencia_cmp = str(p.get("data_filtro_ini", date.today().isoformat()) or date.today().isoformat())
                         c.execute(
                             """INSERT INTO parametros_historico (
                                    veiculo_placa, vigencia_data, consumo, manut, pneu, depre, motora_fixo, motora_pct,
-                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
+                                   seguro, seguro_vida_motorista, financiamento, pagto_ipva, valor_inss, valor_acerto_folha, cmp_custo_escritorio, vl_custo_rastreador, imposto_pct, valor_frete_mensal_fixo,
                                    qtde_pneu, vl_gasto_pneu_km
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT(veiculo_placa, vigencia_data) DO UPDATE SET
                                    cmp_custo_escritorio=excluded.cmp_custo_escritorio""",
                             (
@@ -8317,6 +8482,8 @@ with aba19:
                                 float(p_hist_base["seguro_vida_motorista"] or 0.0),
                                 float(p_hist_base["financiamento"] or 0.0),
                                 float(p_hist_base["pagto_ipva"] or 0.0),
+                                float(p_hist_base["valor_inss"] or 0.0),
+                                float(p_hist_base["valor_acerto_folha"] or 0.0),
                                 float(novo_custo_escritorio or 0.0),
                                 float(p_hist_base["vl_custo_rastreador"] or 0.0),
                                 float(p_hist_base["imposto_pct"] or 0.0),
@@ -9266,7 +9433,7 @@ with aba17:
                             ),
                         )
                     limpar_cache_app()
-                    st.session_state["cp_flash_msg"] = "✅ Conta a pagar salva com sucesso!"
+                    st.session_state["cp_flash_msg"] = "✅ Gravado com sucesso!"
                     st.rerun()
 
     if not df_cp.empty:
@@ -9532,7 +9699,7 @@ with aba17:
                                 )
                             st.session_state.cp_duplicando_id = None
                             limpar_cache_app()
-                            st.session_state["cp_flash_msg"] = "✅ Conta a pagar duplicada com sucesso!"
+                            st.session_state["cp_flash_msg"] = "✅ Gravado com sucesso!"
                             st.rerun()
 
             if st.session_state.get("cp_editando_id") == cp_id_sel:
@@ -9598,7 +9765,7 @@ with aba17:
                                 )
                             st.session_state.cp_editando_id = None
                             limpar_cache_app()
-                            st.session_state["cp_flash_msg"] = "✅ Lançamento atualizado."
+                            st.session_state["cp_flash_msg"] = "✅ Gravado com sucesso!"
                             st.rerun()
 
 # =========================
@@ -9725,7 +9892,7 @@ with aba_cr:
                             ),
                         )
                     limpar_cache_app()
-                    st.session_state["cr_flash_msg"] = "✅ Conta a receber salva com sucesso!"
+                    st.session_state["cr_flash_msg"] = "✅ Gravado com sucesso!"
                     st.rerun()
 
     if not df_cr.empty:
@@ -9991,7 +10158,7 @@ with aba_cr:
                                 )
                             st.session_state.cr_duplicando_id = None
                             limpar_cache_app()
-                            st.session_state["cr_flash_msg"] = "✅ Conta a receber duplicada com sucesso!"
+                            st.session_state["cr_flash_msg"] = "✅ Gravado com sucesso!"
                             st.rerun()
 
             if st.session_state.get("cr_editando_id") == cr_id_sel:
@@ -10057,7 +10224,7 @@ with aba_cr:
                                 )
                             st.session_state.cr_editando_id = None
                             limpar_cache_app()
-                            st.session_state["cr_flash_msg"] = "✅ Lançamento atualizado."
+                            st.session_state["cr_flash_msg"] = "✅ Gravado com sucesso!"
                             st.rerun()
 
 with aba_fluxo:
@@ -10085,6 +10252,13 @@ with aba_fluxo:
     if fluxo_ini > fluxo_fim:
         st.warning("A data inicial não pode ser maior que a data final.")
     else:
+        dias_fluxo = dias_rateio_periodo(fluxo_ini, fluxo_fim)
+        st.caption(
+            f"Valores calculados de **{fluxo_ini.strftime('%d/%m/%Y')}** até "
+            f"**{fluxo_fim.strftime('%d/%m/%Y')}** ({dias_fluxo} dia(s)), "
+            f"considerando a data de **{fluxo_base}**."
+        )
+
         with conn() as c:
             df_fluxo_cp = pd.read_sql("SELECT * FROM contas_pagar", c)
             df_fluxo_cr = pd.read_sql("SELECT * FROM contas_receber", c)
@@ -10148,8 +10322,8 @@ with aba_fluxo:
         saldo_fluxo = total_receber_fluxo - total_pagar_fluxo
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("💰 Contas a Receber", brl(total_receber_fluxo), delta=f"{len(df_cr_periodo)} lançamento(s)", delta_color="off")
-        m2.metric("🧾 Contas a Pagar", brl(total_pagar_fluxo), delta=f"{len(df_cp_periodo)} lançamento(s)", delta_color="inverse")
+        m1.metric("💰 Contas a Receber no Período", brl(total_receber_fluxo), delta=f"{len(df_cr_periodo)} lançamento(s)", delta_color="off")
+        m2.metric("🧾 Contas a Pagar no Período", brl(total_pagar_fluxo), delta=f"{len(df_cp_periodo)} lançamento(s)", delta_color="inverse")
         m3.metric("📌 Saldo do Período", brl(saldo_fluxo), delta="Receber - Pagar", delta_color="normal" if saldo_fluxo >= 0 else "inverse")
 
         if saldo_fluxo < 0:
@@ -10201,6 +10375,46 @@ with aba_fluxo:
                     "Saldo Linha (R$)": st.column_config.NumberColumn("Saldo Linha (R$)", format="R$ %.2f"),
                 },
             )
+
+            if st.button("🖨️ Imprimir", use_container_width=True, key="btn_print_fluxo_caixa"):
+                _FLUXO_STATUS_ICON = {
+                    "PENDENTE": "🟡 Pendente",
+                    "VENCIDO": "🔴 Vencida",
+                    "PAGO": "🟢 Paga",
+                    "RECEBIDO": "🟢 Recebido",
+                }
+                df_fluxo_print = df_detalhe_fluxo.copy()
+                df_fluxo_print["status_print"] = df_fluxo_print["Status"].map(_FLUXO_STATUS_ICON).fillna(df_fluxo_print["Status"].fillna("-"))
+                html_fluxo_print = _html_relatorio_financeiro(
+                    "Relatório de Fluxo de Caixa",
+                    fluxo_ini,
+                    fluxo_fim,
+                    f"Base: {fluxo_base}",
+                    "Todas",
+                    placa_filtro_calculo,
+                    df_fluxo_print,
+                    [
+                        ("Data", "Data", "data"),
+                        ("Tipo", "Tipo", "texto"),
+                        ("status_print", "Status", "texto"),
+                        ("Descrição", "Descrição", "texto"),
+                        ("Pessoa", "Pessoa", "texto"),
+                        ("Categoria", "Categoria", "texto"),
+                        ("Placa", "Placa", "texto"),
+                        ("Entrada (R$)", "Entrada", "moeda"),
+                        ("Saída (R$)", "Saída", "moeda"),
+                        ("Saldo Linha (R$)", "Saldo Linha", "moeda"),
+                    ],
+                    [
+                        ("Quantidade de Lançamentos", str(len(df_fluxo_print))),
+                        ("Período Filtrado", f"{fluxo_ini.strftime('%d/%m/%Y')} até {fluxo_fim.strftime('%d/%m/%Y')}"),
+                        ("Total a Receber no Período", brl(total_receber_fluxo)),
+                        ("Total a Pagar no Período", brl(total_pagar_fluxo)),
+                    ],
+                    "SALDO DO PERÍODO",
+                    saldo_fluxo,
+                )
+                components.html(html_fluxo_print, height=1000, scrolling=True)
 
 with aba18:
     st.subheader("🔔 ME LEMBRA")
