@@ -14,7 +14,27 @@ import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Controle ART", layout="wide", page_icon="🚛")
 
-DB = "controle_viagens.db"
+APP_DIR = Path(__file__).resolve().parent
+DB = str(APP_DIR / "controle_viagens.db")
+UPLOADS_DIR = APP_DIR / "uploads"
+
+
+def caminho_relativo_app(caminho):
+    try:
+        return caminho.resolve().relative_to(APP_DIR).as_posix()
+    except Exception:
+        return str(caminho).replace("\\", "/")
+
+
+def resolver_caminho_app(caminho):
+    caminho_txt = str(caminho or "").strip()
+    if not caminho_txt:
+        return Path()
+    caminho_normalizado = caminho_txt.replace("\\", "/")
+    caminho_path = Path(caminho_normalizado)
+    if caminho_path.is_absolute():
+        return caminho_path
+    return APP_DIR / caminho_path
 
 # =========================
 # 1. FUNÇÕES DE APOIO
@@ -119,6 +139,47 @@ def focar_campo_por_rotulo(rotulo):
                 if (typeof campo.select === 'function') campo.select();
             }}
         }}, 350);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+def manter_aba_principal_ativa():
+    components.html(
+        """
+        <script>
+        (function () {
+            const storageKey = "controle_art_aba_principal";
+            const doc = window.parent.document;
+            const topTabs = doc.querySelector('div[data-testid="stTabs"] [role="tablist"]');
+            if (!topTabs) return;
+
+            function labelOf(tab) {
+                return (tab.innerText || "").trim();
+            }
+
+            topTabs.querySelectorAll('button[role="tab"]').forEach(function (tab) {
+                if (tab.dataset.keepMainTabAttached === "1") return;
+                tab.dataset.keepMainTabAttached = "1";
+                tab.addEventListener("click", function () {
+                    const label = labelOf(tab);
+                    if (label) window.localStorage.setItem(storageKey, label);
+                });
+            });
+
+            const savedLabel = window.localStorage.getItem(storageKey);
+            if (!savedLabel) return;
+
+            const activeTab = topTabs.querySelector('button[role="tab"][aria-selected="true"]');
+            if (activeTab && labelOf(activeTab) === savedLabel) return;
+
+            const wantedTab = Array.from(topTabs.querySelectorAll('button[role="tab"]'))
+                .find(function (tab) { return labelOf(tab) === savedLabel; });
+            if (wantedTab) {
+                setTimeout(function () { wantedTab.click(); }, 50);
+            }
+        })();
         </script>
         """,
         height=0,
@@ -427,7 +488,7 @@ def proteger_abertura_sistema():
 def salvar_anexos_pedido_fornecedor(arquivos):
     if not arquivos:
         return []
-    pasta_destino = Path("uploads") / "pedidos_fornecedor"
+    pasta_destino = UPLOADS_DIR / "pedidos_fornecedor"
     pasta_destino.mkdir(parents=True, exist_ok=True)
     anexos_salvos = []
     for arq in arquivos:
@@ -440,7 +501,7 @@ def salvar_anexos_pedido_fornecedor(arquivos):
         anexos_salvos.append(
             {
                 "nome_arquivo": nome_original,
-                "caminho_arquivo": str(caminho_final),
+                "caminho_arquivo": caminho_relativo_app(caminho_final),
             }
         )
     return anexos_salvos
@@ -449,7 +510,7 @@ def salvar_anexos_pedido_fornecedor(arquivos):
 def salvar_documento_anotacao(arquivo):
     if not arquivo:
         return None
-    pasta_destino = Path("uploads") / "anotacoes"
+    pasta_destino = UPLOADS_DIR / "anotacoes"
     pasta_destino.mkdir(parents=True, exist_ok=True)
     nome_original = Path(str(getattr(arquivo, "name", "") or "documento")).name
     timestamp = datetime.now().strftime("%d%m%y%H%M%S%f")
@@ -459,7 +520,7 @@ def salvar_documento_anotacao(arquivo):
         f_out.write(arquivo.getbuffer())
     return {
         "nome_arquivo": nome_original,
-        "caminho_arquivo": str(caminho_final),
+        "caminho_arquivo": caminho_relativo_app(caminho_final),
     }
 
 
@@ -634,7 +695,7 @@ def excluir_manutencao_completa(manutencao_id):
         if not caminho:
             continue
         try:
-            Path(caminho).unlink(missing_ok=True)
+            resolver_caminho_app(caminho).unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -2743,6 +2804,7 @@ aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14,
     "💵 Frete Líquido no Período", "🧾 Contas a Pagar", "💰 Contas a Receber", "📈 Fluxo de Caixa", "🔔 ME LEMBRA", "📝 Anotações",
     "👤 Usuários", "🧮 Cálculo Rápido"
 ])
+manter_aba_principal_ativa()
 
 with aba_cadastro:
     aba5, aba6, aba7, aba10, aba12, aba15, aba16, aba19, aba21 = st.tabs([
@@ -3632,7 +3694,10 @@ with aba1:
     if not lista_cidades: st.warning("Cadastre cidades primeiro.")
     elif not lista_veiculos_full: st.warning("Cadastre um veículo primeiro.")
     else:
-        col_sel1, col_sel2, col_sel3 = st.columns(3); o_v = col_sel1.selectbox("Origem", lista_cidades, index=None, placeholder="Origem"); d_dest = col_sel2.selectbox("Destino", lista_cidades, index=None, placeholder="Destino"); veic_sel = col_sel3.selectbox("Veículo", lista_veiculos_full, index=None, placeholder="Veículo")
+        col_sel1, col_sel2, col_sel3 = st.columns(3)
+        o_v = col_sel1.selectbox("Origem", lista_cidades, index=None, placeholder="Origem", key="mov_viagem_origem")
+        d_dest = col_sel2.selectbox("Destino", lista_cidades, index=None, placeholder="Destino", key="mov_viagem_destino")
+        veic_sel = col_sel3.selectbox("Veículo", lista_veiculos_full, index=None, placeholder="Veículo", key="mov_viagem_veiculo")
         km_sug, vt_sug, vk_sug, trecho_existe = 0.0, 0.0, 0.0, False
         if o_v and d_dest:
             with conn() as c:
@@ -5558,7 +5623,7 @@ with aba4:
                             caminho_anexo = str(anexo["caminho_arquivo"] or "").strip()
                             if not caminho_anexo:
                                 continue
-                            path_anexo = Path(caminho_anexo)
+                            path_anexo = resolver_caminho_app(caminho_anexo)
                             nome_anexo = anexo["nome_arquivo"] or path_anexo.name
                             a_col1, a_col2 = st.columns([4, 1])
                             if path_anexo.exists():
@@ -5582,7 +5647,7 @@ with aba4:
                     else:
                         pedido_path_legacy = str(r.get("pedido_fornecedor_arquivo") or "").strip()
                         if pedido_path_legacy:
-                            path_pedido_legacy = Path(pedido_path_legacy)
+                            path_pedido_legacy = resolver_caminho_app(pedido_path_legacy)
                             if path_pedido_legacy.exists():
                                 with path_pedido_legacy.open("rb") as f_pedido_legacy:
                                     st.download_button(
@@ -9445,7 +9510,7 @@ with aba17:
         fil1, fil2, fil3, fil4 = st.columns([2, 2, 2, 2])
         cp_filtro_status = fil1.radio(
             "Status", ["Todos", "🟡 Pendentes", "🔴 Vencidas", "🟢 Pagas"],
-            horizontal=False, key="cp_fil_status"
+            index=1, horizontal=False, key="cp_fil_status"
         )
         cp_fil_ini = fil2.date_input("Vencimento de:", value=data_ini_carregar, format="DD/MM/YYYY", key="cp_fil_ini")
         cp_fil_fim = fil3.date_input("Vencimento até:", value=data_fim_carregar, format="DD/MM/YYYY", key="cp_fil_fim")
@@ -11125,7 +11190,7 @@ with aba20:
                     c.execute("DELETE FROM anotacoes WHERE id=?", (int(st.session_state.anot_excluir_id),))
                 for caminho_documento_excluir in set(caminhos_excluir):
                     try:
-                        Path(caminho_documento_excluir).unlink(missing_ok=True)
+                        resolver_caminho_app(caminho_documento_excluir).unlink(missing_ok=True)
                     except Exception:
                         pass
                 st.session_state.anot_excluir_id = None
@@ -11180,7 +11245,7 @@ with aba20:
                         caminho_anexo = anexo["caminho_arquivo"]
                         if not caminho_anexo:
                             continue
-                        path_documento_atual = Path(caminho_anexo)
+                        path_documento_atual = resolver_caminho_app(caminho_anexo)
                         nome_download = anexo["nome_arquivo"] or path_documento_atual.name
                         if path_documento_atual.exists():
                             with path_documento_atual.open("rb") as f_doc_atual:
