@@ -49,6 +49,18 @@ def format_br(valor, prefixo="", casas_decimais=2):
 
 def brl(valor): return format_br(valor, "R$ ")
 
+def parse_valor_monetario(valor):
+    txt = str(valor or "").strip()
+    if not txt:
+        return None
+    txt = txt.replace("R$", "").replace(" ", "")
+    if "," in txt:
+        txt = txt.replace(".", "").replace(",", ".")
+    try:
+        return float(txt)
+    except Exception:
+        return None
+
 def calcular_qtd_estadia(data_chegada, hora_chegada, data_descarregamento, hora_descarregamento):
     """Conta estadias nos marcos de 08:00 apos as primeiras 24h da chegada."""
     try:
@@ -6250,6 +6262,9 @@ with aba8:
             (pd.to_numeric(df_db["Total Frete"], errors="coerce").fillna(0.0) + pagto_estadia_rel + adicional_frete_rel) * qtd_rel
         )
         df_rel_param = df_db.copy()
+        df_rel_param["qtd_rel"] = qtd_rel
+        df_rel_param["pagto_estadia_rel"] = pagto_estadia_rel
+        df_rel_param["adicional_frete_rel"] = adicional_frete_rel
         df_rel_param["total_frete_rel"] = total_frete_rel
         df_rel_param = aplicar_parametros_por_data(df_rel_param, col_data="data")
         total_f = float(total_frete_rel.sum())
@@ -6264,7 +6279,7 @@ with aba8:
         desconto_inss_rel = valor_inss_rel if incluir_inss_rel else 0.0
         desconto_acerto_folha_rel = valor_acerto_folha_rel if incluir_acerto_folha_rel else 0.0
         total_descontos_folha_rel = desconto_inss_rel + desconto_acerto_folha_rel
-        total_pg_bruto = v_comis + fixo_db + pagamento_estadia_10_rel
+        total_pg_bruto = v_comis + fixo_db + pagamento_estadia_10_rel + total_adicional_frete_rel
         total_pg = total_pg_bruto - total_descontos_folha_rel
         qtde_fretes = int(qtd_rel.sum())
 
@@ -6332,6 +6347,7 @@ with aba8:
                             <th>Rota (Origem x Destino)</th>
                             <th>Peso (Ton)</th>
                             <th>Valor Ton</th>
+                            <th>Adic. Frete</th>
                             <th>Total Frete</th>
                         </tr>
                     </thead>
@@ -6339,12 +6355,9 @@ with aba8:
             """
             
             # Loop das linhas da tabela
-            for i_rel, r in df_db.iterrows():
-                qtd_linha = int(qtd_rel.loc[i_rel]) if i_rel in qtd_rel.index else 1
-                pagto_estadia_linha = float(r.get("pagto_estadia") or 0.0)
-                adicional_frete_linha = float(r.get("valor_adicional_frete") or 0.0)
-                frete_base_linha = float(r.get("Total Frete") or 0.0)
-                total_frete_linha = float((frete_base_linha + pagto_estadia_linha + adicional_frete_linha) * qtd_linha)
+            for _, r in df_rel_param.iterrows():
+                adicional_frete_linha = float(r.get("adicional_frete_rel") or 0.0)
+                total_frete_linha = float(r.get("total_frete_rel") or 0.0)
                 html += f"""
                 <tr>
                     <td>{r['data'].strftime('%d/%m/%Y')}</td>
@@ -6353,6 +6366,7 @@ with aba8:
                     <td>{r['origem']} x {r['destino']}</td>
                     <td>{r['toneladas']}</td>
                     <td>{brl(r['valor_ton'])}</td>
+                    <td>{brl(adicional_frete_linha)}</td>
                     <td>{brl(total_frete_linha)}</td>
                 </tr>
                 """
@@ -9517,6 +9531,14 @@ with aba17:
         cp_cats_disp = ["Todas"] + sorted(df_cp["categoria"].dropna().unique().tolist())
         cp_filtro_cat = fil4.selectbox("Categoria", cp_cats_disp, key="cp_fil_cat")
 
+        cp_busca1, cp_busca2, cp_busca3 = st.columns([2, 2, 1.3])
+        cp_filtro_descricao = cp_busca1.text_input("Filtrar Descrição", key="cp_fil_descricao").strip()
+        cp_filtro_fornecedor = cp_busca2.text_input("Filtrar Fornecedor", key="cp_fil_fornecedor").strip()
+        cp_filtro_valor_txt = cp_busca3.text_input("Filtrar Valor", key="cp_fil_valor", placeholder="Ex: 1.234,56").strip()
+        cp_filtro_valor = parse_valor_monetario(cp_filtro_valor_txt)
+        if cp_filtro_valor_txt and cp_filtro_valor is None:
+            st.warning("Informe um valor válido para filtrar em Contas a Pagar.")
+
         df_cp_f = df_cp.copy()
         if "Pendentes" in cp_filtro_status:
             df_cp_f = df_cp_f[df_cp_f["status"] == "PENDENTE"]
@@ -9530,6 +9552,12 @@ with aba17:
             lambda d: cp_fil_ini <= d <= cp_fil_fim if pd.notna(d) else True
         ).reindex(df_cp_f.index, fill_value=False).astype(bool)
         df_cp_f = df_cp_f.loc[mask_cp_venc]
+        if cp_filtro_descricao:
+            df_cp_f = df_cp_f[df_cp_f["descricao"].fillna("").astype(str).str.contains(cp_filtro_descricao, case=False, na=False, regex=False)]
+        if cp_filtro_fornecedor:
+            df_cp_f = df_cp_f[df_cp_f["fornecedor"].fillna("").astype(str).str.contains(cp_filtro_fornecedor, case=False, na=False, regex=False)]
+        if cp_filtro_valor is not None:
+            df_cp_f = df_cp_f[pd.to_numeric(df_cp_f["valor"], errors="coerce").fillna(0.0).sub(cp_filtro_valor).abs() < 0.005]
         df_cp_f = df_cp_f.sort_values("data_emissao", na_position="last")
 
         _CP_STATUS_ICON = {"PENDENTE": "🟡 Pendente", "VENCIDO": "🔴 Vencida", "PAGO": "🟢 Paga"}
@@ -9976,6 +10004,14 @@ with aba_cr:
         cr_cats_disp = ["Todas"] + sorted(df_cr["categoria"].dropna().unique().tolist())
         cr_filtro_cat = gf4.selectbox("Categoria", cr_cats_disp, key="cr_fil_cat")
 
+        cr_busca1, cr_busca2, cr_busca3 = st.columns([2, 2, 1.3])
+        cr_filtro_descricao = cr_busca1.text_input("Filtrar Descrição", key="cr_fil_descricao").strip()
+        cr_filtro_cliente = cr_busca2.text_input("Filtrar Cliente", key="cr_fil_cliente").strip()
+        cr_filtro_valor_txt = cr_busca3.text_input("Filtrar Valor", key="cr_fil_valor", placeholder="Ex: 1.234,56").strip()
+        cr_filtro_valor = parse_valor_monetario(cr_filtro_valor_txt)
+        if cr_filtro_valor_txt and cr_filtro_valor is None:
+            st.warning("Informe um valor válido para filtrar em Contas a Receber.")
+
         df_cr_f = df_cr.copy()
         if "Pendentes" in cr_filtro_status:
             df_cr_f = df_cr_f[df_cr_f["status"] == "PENDENTE"]
@@ -9989,6 +10025,12 @@ with aba_cr:
             lambda d: cr_fil_ini <= d <= cr_fil_fim if pd.notna(d) else True
         ).reindex(df_cr_f.index, fill_value=False).astype(bool)
         df_cr_f = df_cr_f.loc[mask_cr_venc]
+        if cr_filtro_descricao:
+            df_cr_f = df_cr_f[df_cr_f["descricao"].fillna("").astype(str).str.contains(cr_filtro_descricao, case=False, na=False, regex=False)]
+        if cr_filtro_cliente:
+            df_cr_f = df_cr_f[df_cr_f["cliente"].fillna("").astype(str).str.contains(cr_filtro_cliente, case=False, na=False, regex=False)]
+        if cr_filtro_valor is not None:
+            df_cr_f = df_cr_f[pd.to_numeric(df_cr_f["valor"], errors="coerce").fillna(0.0).sub(cr_filtro_valor).abs() < 0.005]
         df_cr_f = df_cr_f.sort_values("data_emissao", na_position="last")
 
         _CR_STATUS_ICON = {"PENDENTE": "🟡 Pendente", "VENCIDO": "🔴 Vencida", "RECEBIDO": "🟢 Recebida"}
