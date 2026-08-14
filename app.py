@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 import hashlib
 import hmac
 from html import escape
+import io
 from pathlib import Path
 import secrets
 import socket
@@ -9690,6 +9691,30 @@ with aba17:
         )
         st.caption(f"Exibindo **{_cp_n_filtrado}** de **{len(df_cp)}** lançamentos | Total filtrado: **{brl(_cp_total_filtrado)}**")
 
+        df_cp_export = pd.DataFrame({
+            "Data Emissão": df_cp_f["data_emissao"].apply(lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) else ""),
+            "Descrição": df_cp_f["descricao"].fillna(""),
+            "Data Vencimento": df_cp_f["data_vencimento"].apply(lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) else ""),
+            "Fornecedor/Beneficiário": df_cp_f["fornecedor"].fillna(""),
+            "Categoria": df_cp_f["categoria"].fillna(""),
+            "N. Documento/Boleto/NF": df_cp_f["n_documento"].fillna(""),
+            "Forma Pagamento": df_cp_f["forma_pagamento"].fillna(""),
+            "Placa Veículo": df_cp_f["veiculo_placa"].fillna(""),
+            "Valor": pd.to_numeric(df_cp_f["valor"], errors="coerce").fillna(0.0),
+            "Observação": df_cp_f["observacao"].fillna(""),
+        })
+        _cp_excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(_cp_excel_buffer, engine="openpyxl") as _cp_writer:
+            df_cp_export.to_excel(_cp_writer, index=False, sheet_name="Contas a Pagar")
+        st.download_button(
+            label="📥 Gerar Excel (Contas a Pagar)",
+            data=_cp_excel_buffer.getvalue(),
+            file_name=f"contas_a_pagar_{date.today().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="btn_excel_contas_pagar",
+        )
+
         if st.button("🖨️ Imprimir", use_container_width=True, key="btn_print_contas_pagar"):
             df_cp_print = df_cp_f.copy()
             total_cp_pendente = pd.to_numeric(df_cp_print.loc[df_cp_print["status"] == "PENDENTE", "valor"], errors="coerce").fillna(0).sum()
@@ -10163,6 +10188,30 @@ with aba_cr:
         )
         st.caption(f"Exibindo **{_cr_n_filtrado}** de **{len(df_cr)}** lançamentos | Total filtrado: **{brl(_cr_total_filtrado)}**")
 
+        df_cr_export = pd.DataFrame({
+            "Data Emissão": df_cr_f["data_emissao"].apply(lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) else ""),
+            "Descrição": df_cr_f["descricao"].fillna(""),
+            "Data Vencimento": df_cr_f["data_vencimento"].apply(lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) else ""),
+            "Cliente": df_cr_f["cliente"].fillna(""),
+            "Categoria": df_cr_f["categoria"].fillna(""),
+            "N. Documento/NF": df_cr_f["n_documento"].fillna(""),
+            "Forma Recebimento": df_cr_f["forma_recebimento"].fillna(""),
+            "Placa Veículo": df_cr_f["veiculo_placa"].fillna(""),
+            "Valor": pd.to_numeric(df_cr_f["valor"], errors="coerce").fillna(0.0),
+            "Observação": df_cr_f["observacao"].fillna(""),
+        })
+        _cr_excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(_cr_excel_buffer, engine="openpyxl") as _cr_writer:
+            df_cr_export.to_excel(_cr_writer, index=False, sheet_name="Contas a Receber")
+        st.download_button(
+            label="📥 Gerar Excel (Contas a Receber)",
+            data=_cr_excel_buffer.getvalue(),
+            file_name=f"contas_a_receber_{date.today().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="btn_excel_contas_receber",
+        )
+
         if st.button("🖨️ Imprimir", use_container_width=True, key="btn_print_contas_receber"):
             df_cr_print = df_cr_f.copy()
             total_cr_pendente = pd.to_numeric(df_cr_print.loc[df_cr_print["status"] == "PENDENTE", "valor"], errors="coerce").fillna(0).sum()
@@ -10583,6 +10632,30 @@ with aba_fluxo:
                     "Saída (R$)": st.column_config.NumberColumn("Saída (R$)", format="R$ %.2f"),
                     "Saldo Linha (R$)": st.column_config.NumberColumn("Saldo Linha (R$)", format="R$ %.2f"),
                 },
+            )
+
+            df_fluxo_export = pd.DataFrame({
+                "Data": df_detalhe_fluxo["Data"].apply(lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) else ""),
+                "Tipo": df_detalhe_fluxo["Tipo"].fillna(""),
+                "Status": df_detalhe_fluxo["Status"].fillna(""),
+                "Descrição": df_detalhe_fluxo["Descrição"].fillna(""),
+                "Pessoa": df_detalhe_fluxo["Pessoa"].fillna(""),
+                "Categoria": df_detalhe_fluxo["Categoria"].fillna(""),
+                "Placa": df_detalhe_fluxo["Placa"].fillna(""),
+                "Entrada (R$)": pd.to_numeric(df_detalhe_fluxo["Entrada (R$)"], errors="coerce").fillna(0.0),
+                "Saída (R$)": pd.to_numeric(df_detalhe_fluxo["Saída (R$)"], errors="coerce").fillna(0.0),
+                "Saldo Linha (R$)": pd.to_numeric(df_detalhe_fluxo["Saldo Linha (R$)"], errors="coerce").fillna(0.0),
+            })
+            _fluxo_excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(_fluxo_excel_buffer, engine="openpyxl") as _fluxo_writer:
+                df_fluxo_export.to_excel(_fluxo_writer, index=False, sheet_name="Fluxo de Caixa")
+            st.download_button(
+                label="📥 Gerar Excel (Fluxo de Caixa)",
+                data=_fluxo_excel_buffer.getvalue(),
+                file_name=f"fluxo_de_caixa_{date.today().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="btn_excel_fluxo_caixa",
             )
 
             if st.button("🖨️ Imprimir", use_container_width=True, key="btn_print_fluxo_caixa"):
