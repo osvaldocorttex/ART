@@ -134,6 +134,7 @@ def alerta_gravado(mensagem="✅ Gravado com sucesso!"):
     limpar_cache_app()
     st.session_state["_flash_gravado_msg"] = mensagem
     st.success(mensagem)
+    st.toast(mensagem, icon="✅")
 
 def focar_campo_por_rotulo(rotulo):
     rotulo_js = str(rotulo or "").replace("\\", "\\\\").replace("'", "\\'")
@@ -163,35 +164,50 @@ def manter_aba_principal_ativa():
         """
         <script>
         (function () {
-            const storageKey = "controle_art_aba_principal";
+            const storageKeyPrefix = "controle_art_aba_grupo_";
             const doc = window.parent.document;
-            const topTabs = doc.querySelector('div[data-testid="stTabs"] [role="tablist"]');
-            if (!topTabs) return;
 
             function labelOf(tab) {
                 return (tab.innerText || "").trim();
             }
 
-            topTabs.querySelectorAll('button[role="tab"]').forEach(function (tab) {
-                if (tab.dataset.keepMainTabAttached === "1") return;
-                tab.dataset.keepMainTabAttached = "1";
-                tab.addEventListener("click", function () {
-                    const label = labelOf(tab);
-                    if (label) window.localStorage.setItem(storageKey, label);
+            function processarGrupo(grupoTabs) {
+                const tabs = Array.from(grupoTabs.querySelectorAll('button[role="tab"]'));
+                if (!tabs.length) return;
+                const storageKey = storageKeyPrefix + tabs.map(labelOf).join("||");
+
+                tabs.forEach(function (tab) {
+                    if (tab.dataset.keepMainTabAttached === "1") return;
+                    tab.dataset.keepMainTabAttached = "1";
+                    tab.addEventListener("click", function () {
+                        const label = labelOf(tab);
+                        if (label) window.localStorage.setItem(storageKey, label);
+                    });
                 });
-            });
 
-            const savedLabel = window.localStorage.getItem(storageKey);
-            if (!savedLabel) return;
+                const savedLabel = window.localStorage.getItem(storageKey);
+                if (!savedLabel) return;
 
-            const activeTab = topTabs.querySelector('button[role="tab"][aria-selected="true"]');
-            if (activeTab && labelOf(activeTab) === savedLabel) return;
+                const activeTab = grupoTabs.querySelector('button[role="tab"][aria-selected="true"]');
+                if (activeTab && labelOf(activeTab) === savedLabel) return;
 
-            const wantedTab = Array.from(topTabs.querySelectorAll('button[role="tab"]'))
-                .find(function (tab) { return labelOf(tab) === savedLabel; });
-            if (wantedTab) {
-                setTimeout(function () { wantedTab.click(); }, 50);
+                const wantedTab = tabs.find(function (tab) { return labelOf(tab) === savedLabel; });
+                if (wantedTab) {
+                    setTimeout(function () { wantedTab.click(); }, 50);
+                }
             }
+
+            function varrerTodosOsGrupos() {
+                doc.querySelectorAll('div[data-testid="stTabs"] [role="tablist"]').forEach(processarGrupo);
+            }
+
+            varrerTodosOsGrupos();
+            let tentativasVarredura = 0;
+            const intervaloVarredura = setInterval(function () {
+                tentativasVarredura += 1;
+                varrerTodosOsGrupos();
+                if (tentativasVarredura >= 20) clearInterval(intervaloVarredura);
+            }, 150);
         })();
         </script>
         """,
@@ -203,6 +219,7 @@ def conn():
     c = sqlite3.connect(DB, check_same_thread=False)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=8000")
     c.execute("PRAGMA synchronous=NORMAL")
     c.execute("PRAGMA temp_store=MEMORY")
     c.execute("PRAGMA cache_size=-64000")
@@ -456,14 +473,129 @@ def proteger_abertura_sistema():
 
     primeiro_acesso = not existem_usuarios_sistema()
 
-    st.markdown("### Acesso ao sistema")
+    st.markdown(
+        """
+        <style>
+        html { color-scheme: light only; }
+        #MainMenu { visibility: hidden !important; }
+        footer { visibility: hidden !important; }
+        [data-testid="stAppDeployButton"] { display: none !important; }
+        [data-testid="stDecoration"] { display: none !important; }
+        [data-testid="stToolbarActions"] { display: none !important; }
+        [data-testid="stHeader"] { background: transparent !important; }
+        .stApp {
+            background:
+                radial-gradient(circle at 18% 12%, rgba(0,166,166,0.28) 0%, transparent 45%),
+                radial-gradient(circle at 88% 88%, rgba(27,108,168,0.28) 0%, transparent 50%),
+                linear-gradient(160deg, #0b3c5d 0%, #123f5e 45%, #0e4a5c 100%) !important;
+            font-family: "Inter", "Segoe UI", "Trebuchet MS", sans-serif !important;
+        }
+        .main .block-container {
+            max-width: 440px !important;
+            padding-top: 9vh !important;
+            padding-left: 1rem !important;
+            padding-right: 1rem !important;
+        }
+        .art-login-brand {
+            text-align: center;
+            margin-bottom: 20px;
+            animation: art-login-rise 0.5s ease-out;
+        }
+        .art-login-brand .icon {
+            font-size: 2.4rem;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 70px; height: 70px;
+            border-radius: 20px;
+            background: linear-gradient(135deg, #1b6ca8 0%, #00a6a6 100%);
+            box-shadow: 0 10px 26px rgba(0,0,0,0.28);
+            margin-bottom: 12px;
+        }
+        .art-login-brand h1 {
+            color: #ffffff;
+            font-size: 1.5rem;
+            font-weight: 800;
+            margin: 0;
+            letter-spacing: -0.2px;
+        }
+        .art-login-brand p {
+            color: rgba(255,255,255,0.72);
+            font-size: 0.78rem;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            margin: 4px 0 0;
+            text-transform: uppercase;
+        }
+        .art-login-caption {
+            text-align: center;
+            color: rgba(255,255,255,0.78);
+            font-size: 0.85rem;
+            margin: 0 0 14px;
+        }
+        div[data-testid="stForm"] {
+            background: #ffffff !important;
+            border-radius: 18px !important;
+            padding: 26px 24px 20px !important;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.35) !important;
+            border: 1px solid rgba(255,255,255,0.18) !important;
+            animation: art-login-rise 0.6s ease-out;
+        }
+        div[data-testid="stForm"] label {
+            font-weight: 600 !important;
+            color: #37516c !important;
+            font-size: 0.82rem !important;
+        }
+        div[data-testid="stForm"] input {
+            border-radius: 9px !important;
+            font-size: 16px !important;
+            padding: 10px 12px !important;
+        }
+        div[data-testid="stFormSubmitButton"] button {
+            width: 100% !important;
+            border-radius: 9px !important;
+            background: linear-gradient(120deg, #0b3c5d 0%, #1b6ca8 55%, #00a6a6 100%) !important;
+            border: none !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            padding: 10px 0 !important;
+            box-shadow: 0 8px 20px rgba(11,60,93,0.4) !important;
+            margin-top: 8px !important;
+            transition: transform 0.15s ease, box-shadow 0.15s ease !important;
+        }
+        div[data-testid="stFormSubmitButton"] button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 10px 24px rgba(11,60,93,0.5) !important;
+        }
+        @keyframes art-login-rise {
+            from { opacity: 0; transform: translateY(10px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        @media (max-width: 480px) {
+            .main .block-container { padding-top: 7vh !important; }
+            .art-login-brand .icon { width: 58px; height: 58px; font-size: 2.0rem; border-radius: 16px; }
+            .art-login-brand h1 { font-size: 1.25rem; }
+            div[data-testid="stForm"] { padding: 22px 18px 16px !important; }
+        }
+        </style>
+        <div class="art-login-brand">
+            <div class="icon">🚛</div>
+            <h1>Controle ART</h1>
+            <p>Gestão de Viagens &amp; Frota</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if primeiro_acesso:
-        st.caption("Crie o usuário administrador para acessar o sistema.")
+        st.markdown(
+            '<p class="art-login-caption">Crie o usuário administrador para acessar o sistema.</p>',
+            unsafe_allow_html=True,
+        )
         with st.form("form_primeiro_acesso_sistema"):
             usuario = st.text_input("Usuário administrador")
             senha = st.text_input("Senha", type="password")
-            enviar = st.form_submit_button("Cadastrar e abrir sistema", type="primary")
+            enviar = st.form_submit_button("Cadastrar e abrir sistema", type="primary", use_container_width=True)
 
         if not enviar:
             st.stop()
@@ -478,11 +610,14 @@ def proteger_abertura_sistema():
         st.error(msg)
         st.stop()
 
-    st.caption("Informe usuário e senha para abrir o sistema.")
+    st.markdown(
+        '<p class="art-login-caption">Informe usuário e senha para abrir o sistema.</p>',
+        unsafe_allow_html=True,
+    )
     with st.form("form_acesso_sistema"):
         usuario = st.text_input("Usuário")
         senha = st.text_input("Senha", type="password")
-        enviar = st.form_submit_button("Abrir sistema", type="primary")
+        enviar = st.form_submit_button("Abrir sistema", type="primary", use_container_width=True)
 
     if not enviar:
         st.stop()
@@ -816,6 +951,8 @@ def _carregar_bootstrap_app():
         p_row = c.execute("SELECT * FROM parametros WHERE id=1").fetchone()
         p_real_local = dict(p_row) if p_row else {}
         lista_cidades_local = [cid["nome"] for cid in c.execute("SELECT nome FROM cidades ORDER BY nome ASC").fetchall()]
+        lista_clientes_local = [cli["descricao"] for cli in c.execute("SELECT descricao FROM clientes ORDER BY descricao ASC").fetchall()]
+        lista_categorias_local = [cat["descricao"] for cat in c.execute("SELECT descricao FROM categorias ORDER BY descricao ASC").fetchall()]
         veiculos_db_local = [dict(v) for v in c.execute("SELECT placa, descricao FROM veiculos ORDER BY descricao ASC").fetchall()]
         oficinas_db_local = [dict(o) for o in c.execute("SELECT id, nome FROM oficinas ORDER BY nome ASC").fetchall()]
         fornecedores_db_local = [dict(f) for f in c.execute("SELECT id, codigo, nome FROM fornecedores ORDER BY nome ASC").fetchall()]
@@ -825,6 +962,8 @@ def _carregar_bootstrap_app():
     return {
         "p_real": p_real_local,
         "lista_cidades": lista_cidades_local,
+        "lista_clientes": lista_clientes_local,
+        "lista_categorias": lista_categorias_local,
         "veiculos_db": veiculos_db_local,
         "oficinas_db": oficinas_db_local,
         "fornecedores_db": fornecedores_db_local,
@@ -1029,6 +1168,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS veiculos (id INTEGER PRIMARY KEY AUTOINCREMENT, descricao TEXT, modelo TEXT, ano TEXT, cor TEXT, placa TEXT UNIQUE, renavan TEXT, observacao TEXT, quantidade_eixo INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS viagens (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, cliente TEXT, origem TEXT, destino TEXT, km REAL, toneladas REAL, valor_ton REAL, valor_km REAL DEFAULT 0.0, tipo_cobranca TEXT DEFAULT 'TONELADA', pedagio REAL, qtd_pedagio INTEGER DEFAULT 0, gasto_extra REAL DEFAULT 0.0, pagto_estadia REAL DEFAULT 0.0, valor_adicional_frete REAL DEFAULT 0.0, descricao_valor_adicional_frete TEXT, descricao_gasto_extra TEXT, diesel REAL, consumo REAL, arla REAL DEFAULT 0.0, consumo_arla REAL DEFAULT 0.0, hora_carregamento TEXT, data_chegada TEXT, hora_chegada TEXT, data_descarregamento TEXT, hora_descarregamento TEXT, dias_gastos INTEGER DEFAULT 0, obs TEXT, nf TEXT, veiculo_placa TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS cidades (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT UNIQUE)")
+        c.execute("CREATE TABLE IF NOT EXISTS clientes (id INTEGER PRIMARY KEY AUTOINCREMENT, descricao TEXT UNIQUE)")
         c.execute("CREATE TABLE IF NOT EXISTS rotas (id INTEGER PRIMARY KEY AUTOINCREMENT, origem TEXT, destino TEXT, nome_empresa_origem TEXT, nome_empresa_destino TEXT, km REAL, valor_ton REAL DEFAULT 0.0, UNIQUE(origem, destino))")
         c.execute("CREATE TABLE IF NOT EXISTS abastecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, local TEXT, doc_nf TEXT, km_inicial REAL, tipo_combustivel TEXT, qtde_litros REAL, valor_unit REAL, desconto REAL DEFAULT 0.0, total_gasto REAL, veiculo_placa TEXT)")
         c.execute("""CREATE TABLE IF NOT EXISTS oficinas (
@@ -1070,6 +1210,17 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             descricao_obrigacao TEXT UNIQUE
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS categorias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descricao TEXT UNIQUE
+        )""")
+        for _cat_seed in [
+            "Combustível", "Manutenção", "Pneus", "Pedágio", "Seguro",
+            "IPVA / Licenciamento", "Financiamento / Parcela", "Salários",
+            "Impostos / Taxas", "Aluguel", "Água / Energia", "Telefone / Internet",
+            "Material de Escritório", "Frete", "Serviço", "Bonificação", "Outros",
+        ]:
+            c.execute("INSERT OR IGNORE INTO categorias (descricao) VALUES (?)", (_cat_seed,))
         c.execute("""CREATE TABLE IF NOT EXISTS contas_pagar (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             descricao TEXT NOT NULL,
@@ -1640,6 +1791,8 @@ data_ini_carregar = datetime.strptime(p.get('data_filtro_ini', '2026-01-01'), '%
 data_fim_carregar = datetime.strptime(p.get('data_filtro_fim', '2026-12-31'), '%Y-%m-%d').date()
 
 lista_cidades = bootstrap["lista_cidades"]
+lista_clientes = bootstrap["lista_clientes"]
+lista_categorias = bootstrap["lista_categorias"]
 veiculos_db = bootstrap["veiculos_db"]
 apenas_placas = [v["placa"] for v in veiculos_db]
 lista_veiculos_full = [f"{v['placa']} - {v['descricao']}" for v in veiculos_db]
@@ -1891,6 +2044,25 @@ st.markdown(
         background: #eef4fb !important;
     }
 
+    /* ===== EXIT BUTTON (de-emphasized, top-right, out of the way) ===== */
+    .st-key-exit_btn_wrap {
+        max-width: 190px !important;
+        margin-left: auto !important;
+        margin-bottom: 6px !important;
+    }
+    .st-key-exit_btn_wrap .stButton > button {
+        color: var(--text-muted) !important;
+        border-color: var(--border) !important;
+        box-shadow: none !important;
+        font-size: 0.78rem !important;
+        padding: 5px 12px !important;
+    }
+    .st-key-exit_btn_wrap .stButton > button:hover {
+        color: var(--danger) !important;
+        border-color: var(--danger) !important;
+        background: #fff5f5 !important;
+    }
+
     /* ===== FORM INPUTS ===== */
     div[data-testid="stTextInput"] input,
     div[data-testid="stNumberInput"] input,
@@ -1984,13 +2156,22 @@ st.markdown(
     /* ===== CHECKBOX & RADIO ===== */
     div[data-testid="stCheckbox"] input:checked + div { border-color: var(--blue) !important; background: var(--blue) !important; }
 
+    /* ===== APP CHROME (hide Streamlit branding for a native-app feel) ===== */
+    #MainMenu { visibility: hidden !important; }
+    footer { visibility: hidden !important; }
+    [data-testid="stAppDeployButton"] { display: none !important; }
+    [data-testid="stDecoration"] { display: none !important; }
+    [data-testid="stToolbarActions"] { display: none !important; }
+    [data-testid="stHeader"] { background: transparent !important; }
+    .art-back-to-top { display: none; }
+
     /* ===== MOBILE RESPONSIVE ===== */
     @media (max-width: 900px) {
         .main .block-container {
             padding-top: 0.5rem !important;
-            padding-bottom: 0.8rem !important;
-            padding-left: 0.5rem !important;
-            padding-right: 0.5rem !important;
+            padding-bottom: calc(0.8rem + env(safe-area-inset-bottom, 0px)) !important;
+            padding-left: calc(0.5rem + env(safe-area-inset-left, 0px)) !important;
+            padding-right: calc(0.5rem + env(safe-area-inset-right, 0px)) !important;
         }
         .art-header { padding: 11px 14px; gap: 10px; }
         .art-header-icon { font-size: 1.8rem; }
@@ -1998,36 +2179,104 @@ st.markdown(
         .art-header-text p { font-size: 0.68rem; }
         div[data-testid="stAppViewContainer"] { overflow-x: hidden; }
         div[data-testid="stHorizontalBlock"] {
-            gap: 0.4rem !important;
+            gap: 0.5rem !important;
             flex-wrap: wrap;
         }
-        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+        div[data-testid="stHorizontalBlock"] > div[data-testid="column"],
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
             min-width: 100% !important;
             flex: 1 1 100% !important;
         }
-        div[data-testid="stTabs"] [role="tablist"] {
-            flex-wrap: wrap !important;
-            overflow: visible !important;
-            gap: 0.3rem !important;
+        /* KPI / metric rows become a compact 2-up grid instead of one long stacked column */
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) > div[data-testid="column"],
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) > div[data-testid="stColumn"],
+        div[data-testid="stHorizontalBlock"]:has(.kpi-card) > div[data-testid="column"],
+        div[data-testid="stHorizontalBlock"]:has(.kpi-card) > div[data-testid="stColumn"] {
+            min-width: 47% !important;
+            flex: 1 1 47% !important;
         }
+        /* Tab strip becomes a single horizontally-swipeable row (app-style) instead of a tall wrapped grid */
+        div[data-testid="stTabs"] [role="tablist"] {
+            flex-wrap: nowrap !important;
+            overflow-x: auto !important;
+            overflow-y: hidden !important;
+            -webkit-overflow-scrolling: touch !important;
+            scrollbar-width: none !important;
+            justify-content: flex-start !important;
+            mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+        }
+        div[data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: none !important; }
         div[data-testid="stTabs"] button[data-baseweb="tab"] {
-            white-space: normal !important;
-            min-height: 2rem !important;
-            padding: 0.3rem 0.5rem !important;
-            flex: 1 1 46% !important;
+            white-space: nowrap !important;
+            min-height: 2.2rem !important;
+            padding: 0.4rem 0.7rem !important;
+            flex: 0 0 auto !important;
         }
         div[data-testid="stTabs"] button[data-baseweb="tab"] p {
-            white-space: normal !important;
-            font-size: 0.73rem !important;
-            line-height: 1.2 !important;
-            text-align: center !important;
+            white-space: nowrap !important;
+            font-size: 0.76rem !important;
         }
         div[data-testid="stMetric"] { padding: 8px 10px !important; }
         div[data-testid="stMetricValue"] { font-size: 1.1rem !important; }
-        .stButton > button { width: 100% !important; }
+        .stButton > button { width: 100% !important; min-height: 2.6rem !important; }
         input, select, textarea { font-size: 16px !important; }
         div[data-testid="stDataFrame"],
-        div[data-testid="stTable"] { overflow-x: auto !important; }
+        div[data-testid="stTable"] {
+            overflow-x: auto !important;
+            -webkit-overflow-scrolling: touch !important;
+        }
+        .st-key-exit_btn_wrap { max-width: 152px !important; }
+        .st-key-exit_btn_wrap .stButton > button {
+            width: 100% !important;
+            min-height: 1.9rem !important;
+            font-size: 0.7rem !important;
+            padding: 4px 8px !important;
+        }
+        /* Plotly's desktop toolbar (zoom/pan/camera) is clutter on a touch screen */
+        .js-plotly-plot .plotly .modebar { display: none !important; }
+        /* Bigger, clearer tap target for the upload button (no drag-and-drop on mobile) */
+        div[data-testid="stFileUploader"] section {
+            padding: 14px 10px !important;
+        }
+        div[data-testid="stFileUploaderDropzoneInstructions"] span,
+        div[data-testid="stFileUploaderDropzoneInstructions"] small {
+            font-size: 0.78rem !important;
+        }
+        div[data-testid="stFileUploader"] button {
+            min-height: 2.4rem !important;
+            width: 100% !important;
+        }
+        div[data-testid="stExpander"] summary {
+            min-height: 2.6rem !important;
+            display: flex !important;
+            align-items: center !important;
+        }
+        .art-back-to-top {
+            position: fixed;
+            right: 16px;
+            bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+            width: 42px; height: 42px;
+            border-radius: 50%;
+            background: linear-gradient(120deg, var(--navy) 0%, var(--blue) 100%);
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.1rem;
+            text-decoration: none;
+            box-shadow: 0 6px 18px rgba(11,60,93,0.4);
+            z-index: 999;
+        }
+    }
+
+    @media (max-width: 380px) {
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) > div[data-testid="column"],
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) > div[data-testid="stColumn"],
+        div[data-testid="stHorizontalBlock"]:has(.kpi-card) > div[data-testid="column"],
+        div[data-testid="stHorizontalBlock"]:has(.kpi-card) > div[data-testid="stColumn"] {
+            min-width: 100% !important;
+            flex: 1 1 100% !important;
+        }
     }
     </style>
     """,
@@ -2036,6 +2285,7 @@ st.markdown(
 
 st.markdown(
     """
+    <div id="art-top"></div>
     <div class="art-header">
         <div class="art-header-icon">🚛</div>
         <div class="art-header-text">
@@ -2043,6 +2293,7 @@ st.markdown(
             <p>Sistema de Gestão Operacional &nbsp;·&nbsp; Viagens &amp; Financeiro</p>
         </div>
     </div>
+    <a href="#art-top" class="art-back-to-top" aria-label="Voltar ao topo">↑</a>
     """,
     unsafe_allow_html=True,
 )
@@ -2814,8 +3065,7 @@ if not df_db.empty:
 # =========================
 # DEFINIÇÃO DAS ABAS
 # =========================
-menu_col_sair, menu_col_spacer = st.columns([1.2, 8])
-with menu_col_sair:
+with st.container(key="exit_btn_wrap"):
     if st.button("🚪 Sair do Sistema", key="btn_sair_sistema", use_container_width=True):
         gravar_tudo_e_fechar_sistema()
 
@@ -2829,9 +3079,10 @@ aba_home, aba1, aba2, aba3, aba4, aba_cadastro, aba8, aba9, aba11, aba13, aba14,
 manter_aba_principal_ativa()
 
 with aba_cadastro:
-    aba5, aba6, aba7, aba10, aba12, aba15, aba16, aba19, aba21 = st.tabs([
+    aba5, aba6, aba7, aba10, aba12, aba15, aba16, aba19, aba21, aba22, aba23 = st.tabs([
         "🏢 Oficinas", "🏙️ Cidades", "🛣️ KM Rotas", "⚙️ Parâmetros",
-        "🚚 Veículos", "🏭 Fornecedores", "📌 Obrigação", "⛽ Comparativo Diesel", "🛣️ Praça Pedágio"
+        "🚚 Veículos", "🏭 Fornecedores", "📌 Obrigação", "⛽ Comparativo Diesel", "🛣️ Praça Pedágio", "👥 Cliente",
+        "🏷️ Categoria"
     ])
 
 with aba_usuarios:
@@ -3734,15 +3985,137 @@ with aba_home:
 # Abas 1 a 12 permanecem iguais
 with aba1:
     if "msg_frete" in st.session_state:
-        st.success(st.session_state.pop("msg_frete"))
+        _msg_frete = st.session_state.pop("msg_frete")
+        st.success(_msg_frete)
+        st.toast(_msg_frete, icon="✅")
+
+    for _pend_key, _widget_key in (
+        ("_pend_mov_viagem_origem", "mov_viagem_origem"),
+        ("_pend_mov_viagem_destino", "mov_viagem_destino"),
+        ("_pend_mov_viagem_veiculo", "mov_viagem_veiculo"),
+        ("_pend_mov_viagem_cliente", "mov_viagem_cliente"),
+    ):
+        if _pend_key in st.session_state:
+            st.session_state[_widget_key] = st.session_state.pop(_pend_key)
 
     if not lista_cidades: st.warning("Cadastre cidades primeiro.")
     elif not lista_veiculos_full: st.warning("Cadastre um veículo primeiro.")
+    elif not lista_clientes: st.warning("Cadastre um cliente primeiro na aba Cadastro > 👥 Cliente.")
     else:
         col_sel1, col_sel2, col_sel3 = st.columns(3)
-        o_v = col_sel1.selectbox("Origem", lista_cidades, index=None, placeholder="Origem", key="mov_viagem_origem")
-        d_dest = col_sel2.selectbox("Destino", lista_cidades, index=None, placeholder="Destino", key="mov_viagem_destino")
-        veic_sel = col_sel3.selectbox("Veículo", lista_veiculos_full, index=None, placeholder="Veículo", key="mov_viagem_veiculo")
+        sub_o1, sub_o2 = col_sel1.columns([6, 1], vertical_alignment="bottom")
+        o_v = sub_o1.selectbox("Origem", lista_cidades, index=None, placeholder="Origem", key="mov_viagem_origem")
+        with sub_o2.popover("➕", use_container_width=True, help="Cadastrar nova cidade"):
+            st.markdown("**➕ Nova Cidade**")
+            nova_cidade_pop_v = st.text_input("Nome da cidade", key="pop_nova_cidade_origem").strip().upper()
+            if st.button("💾 Gravar Cidade", key="pop_btn_salvar_cidade_origem", use_container_width=True):
+                if not nova_cidade_pop_v:
+                    st.warning("Informe o nome da cidade.")
+                else:
+                    with conn() as c:
+                        cur_pop_cid = c.execute("INSERT OR IGNORE INTO cidades (nome) VALUES (?)", (nova_cidade_pop_v,))
+                    if cur_pop_cid.rowcount == 0:
+                        st.warning("Essa cidade já está cadastrada.")
+                    else:
+                        limpar_cache_bootstrap()
+                        st.session_state["_pend_mov_viagem_origem"] = nova_cidade_pop_v
+                        st.rerun()
+
+        lista_destinos_rota_v = []
+        if o_v:
+            with conn() as c:
+                rows_destinos_rota_v = c.execute(
+                    "SELECT destino FROM rotas WHERE origem=? UNION SELECT origem FROM rotas WHERE destino=?",
+                    (o_v, o_v),
+                ).fetchall()
+            lista_destinos_rota_v = sorted({
+                str(row[0]).strip() for row in rows_destinos_rota_v
+                if row[0] and str(row[0]).strip() != o_v
+            })
+            if st.session_state.get("mov_viagem_destino") not in lista_destinos_rota_v:
+                st.session_state["mov_viagem_destino"] = None
+            if not lista_destinos_rota_v:
+                col_sel2.warning("Nenhuma rota cadastrada para esta origem.")
+
+        sub_d1, sub_d2 = col_sel2.columns([6, 1], vertical_alignment="bottom")
+        d_dest = sub_d1.selectbox(
+            "Destino",
+            lista_destinos_rota_v,
+            index=None,
+            placeholder="Destino" if o_v else "Selecione a origem primeiro",
+            key="mov_viagem_destino",
+            disabled=not o_v,
+        )
+        with sub_d2.popover("➕", use_container_width=True, help="Cadastrar nova rota/destino", disabled=not o_v):
+            st.markdown(f"**➕ Nova Rota a partir de {o_v or '(selecione a origem)'}**")
+            opcoes_destino_pop = [cid for cid in lista_cidades if cid != o_v]
+            destino_existente_pop = st.selectbox(
+                "Cidade destino já cadastrada",
+                opcoes_destino_pop,
+                index=None,
+                placeholder="Selecione ou informe uma nova abaixo",
+                key="pop_destino_existente",
+            )
+            nova_cidade_destino_pop = st.text_input(
+                "Ou nova cidade (preencha só se não estiver na lista acima)",
+                key="pop_destino_nova_cidade",
+            ).strip().upper()
+            pop_km, pop_vt, pop_vk = st.columns(3)
+            km_pop = pop_km.number_input("Distância (KM)", min_value=0.0, step=0.1, key="pop_destino_km")
+            vt_pop = pop_vt.number_input("Valor por Tonelada (R$)", min_value=0.0, step=0.01, key="pop_destino_valor_ton")
+            vk_pop = pop_vk.number_input("Valor por KM (R$)", min_value=0.0, step=0.01, key="pop_destino_valor_km")
+            if st.button("💾 Gravar Rota", key="pop_btn_salvar_rota", use_container_width=True):
+                destino_final_pop = nova_cidade_destino_pop or destino_existente_pop
+                if not o_v:
+                    st.warning("Selecione a origem primeiro.")
+                elif not destino_final_pop:
+                    st.warning("Informe ou selecione a cidade de destino.")
+                elif destino_final_pop == o_v:
+                    st.error("Origem e Destino não podem ser iguais.")
+                elif vt_pop == 0.0 and vk_pop == 0.0:
+                    st.warning("Informe Valor por Tonelada ou Valor por KM.")
+                else:
+                    with conn() as c:
+                        c.execute("INSERT OR IGNORE INTO cidades (nome) VALUES (?)", (destino_final_pop,))
+                        rota_existente_pop = c.execute(
+                            "SELECT id FROM rotas WHERE origem=? AND destino=?", (o_v, destino_final_pop)
+                        ).fetchone()
+                        if not rota_existente_pop:
+                            c.execute(
+                                """INSERT INTO rotas
+                                   (origem, destino, nome_empresa_origem, nome_empresa_destino, km, valor_ton, valor_km)
+                                   VALUES (?,?,?,?,?,?,?)""",
+                                (o_v, destino_final_pop, "", "", km_pop, vt_pop, vk_pop),
+                            )
+                    if rota_existente_pop:
+                        st.warning("Rota já cadastrada.")
+                    else:
+                        limpar_cache_bootstrap()
+                        st.session_state["_pend_mov_viagem_destino"] = destino_final_pop
+                        st.rerun()
+
+        sub_v1, sub_v2 = col_sel3.columns([6, 1], vertical_alignment="bottom")
+        veic_sel = sub_v1.selectbox("Veículo", lista_veiculos_full, index=None, placeholder="Veículo", key="mov_viagem_veiculo")
+        with sub_v2.popover("➕", use_container_width=True, help="Cadastrar novo veículo"):
+            st.markdown("**➕ Novo Veículo**")
+            desc_pop_v = st.text_input("Descrição", key="pop_veiculo_desc").strip()
+            placa_pop_v = st.text_input("Placa", key="pop_veiculo_placa").strip().upper()
+            modelo_pop_v = st.text_input("Modelo", key="pop_veiculo_modelo").strip()
+            if st.button("💾 Gravar Veículo", key="pop_btn_salvar_veiculo", use_container_width=True):
+                if not desc_pop_v or not placa_pop_v:
+                    st.warning("Informe Descrição e Placa.")
+                else:
+                    try:
+                        with conn() as c:
+                            c.execute(
+                                "INSERT INTO veiculos (descricao, modelo, placa) VALUES (?, ?, ?)",
+                                (desc_pop_v, modelo_pop_v, placa_pop_v),
+                            )
+                        limpar_cache_bootstrap()
+                        st.session_state["_pend_mov_viagem_veiculo"] = f"{placa_pop_v} - {desc_pop_v}"
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.warning("Já existe um veículo com essa placa.")
         km_sug, vt_sug, vk_sug, trecho_existe = 0.0, 0.0, 0.0, False
         if o_v and d_dest:
             with conn() as c:
@@ -3753,147 +4126,158 @@ with aba1:
         ca, cb, cc, cd = st.columns(4)
         d_v = ca.date_input("Data carregamento", format="DD/MM/YYYY")
         hora_carregamento_v = cb.text_input("Hora carregamento", placeholder="HH:MM")
-        cl_v = cc.text_input("Cliente", value="CONTATTO")
+        sub_c1, sub_c2 = cc.columns([6, 1], vertical_alignment="bottom")
+        idx_cliente_v = lista_clientes.index("CONTATTO") if "CONTATTO" in lista_clientes else 0
+        cl_v = sub_c1.selectbox("Descrição Cliente", lista_clientes, index=idx_cliente_v, key="mov_viagem_cliente")
+        with sub_c2.popover("➕", use_container_width=True, help="Cadastrar novo cliente"):
+            st.markdown("**➕ Novo Cliente**")
+            novo_cliente_pop = st.text_input("Descrição Cliente", key="pop_cliente_desc").strip().upper()
+            if st.button("💾 Gravar Cliente", key="pop_btn_salvar_cliente", use_container_width=True):
+                if not novo_cliente_pop:
+                    st.warning("Informe a descrição do cliente.")
+                else:
+                    with conn() as c:
+                        cur_pop_cli = c.execute("INSERT OR IGNORE INTO clientes (descricao) VALUES (?)", (novo_cliente_pop,))
+                    if cur_pop_cli.rowcount == 0:
+                        st.warning("Esse cliente já está cadastrado.")
+                    else:
+                        limpar_cache_bootstrap()
+                        st.session_state["_pend_mov_viagem_cliente"] = novo_cliente_pop
+                        st.rerun()
         nf_v = cd.text_input("N.NF")
-        ct2, ct3, ct4, ct5 = st.columns(4)
-        data_chegada_tmp_v = ct2.date_input("Data Chegada Descarregamento", value=None, format="DD/MM/YYYY", key="cad_data_chegada")
-        deixar_data_chegada_em_branco_v = ct2.checkbox("Salvar data chegada em branco", value=True, key="cad_data_chegada_em_branco")
-        if deixar_data_chegada_em_branco_v:
-            data_chegada_v = None
-            ct2.caption("Você pode preencher depois na edição.")
-        else:
-            data_chegada_v = data_chegada_tmp_v
-        hora_chegada_v = ct3.text_input("Hora Chegada Descarregamento", placeholder="HH:MM")
-        data_descarregamento_tmp_v = ct4.date_input("Data descarregamento", value=None, format="DD/MM/YYYY", key="cad_data_descarregamento")
-        deixar_data_descarregamento_em_branco_v = ct4.checkbox("Salvar data descarregamento em branco", value=True, key="cad_data_descarregamento_em_branco")
-        if deixar_data_descarregamento_em_branco_v:
-            data_descarregamento_v = None
-            ct4.caption("Você pode preencher depois na edição.")
-        else:
-            data_descarregamento_v = data_descarregamento_tmp_v
-        hora_descarregamento_tmp_v = ct5.text_input("Hora descarregamento", placeholder="HH:MM")
-        deixar_hora_descarregamento_em_branco_v = ct5.checkbox("Salvar hora descarregamento em branco", value=True, key="cad_hora_descarregamento_em_branco")
-        hora_descarregamento_v = "" if deixar_hora_descarregamento_em_branco_v else hora_descarregamento_tmp_v
-        c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns(11)
-        tipo_cobranca_v = c0.selectbox("Tipo Cálculo", ["TONELADA", "KM"], key="cad_tipo_calc")
-        modo_ton = (tipo_cobranca_v == "TONELADA")
-        km_v = c1.number_input("KM", value=km_sug, disabled=True)
-        kg_txt = c2.text_input("KG", key="cad_frete_kg", disabled=not modo_ton)
-        components.html(
-            """
-            <script>
-            (function () {
-              const doc = window.parent.document;
-              const input = doc.querySelector('input[aria-label="KG"]');
-              if (!input || input.dataset.kgMaskAttached === "1") return;
-              input.dataset.kgMaskAttached = "1";
-              input.dataset.kgMaskUpdating = "0";
+        with st.form("form_nova_viagem_mov"):
+            ct2, ct3, ct4, ct5 = st.columns(4)
+            data_chegada_v = ct2.date_input("Data Chegada Descarregamento", value=None, format="DD/MM/YYYY", key="cad_data_chegada")
+            hora_chegada_v = ct3.text_input("Hora Chegada Descarregamento", placeholder="HH:MM")
+            data_descarregamento_v = ct4.date_input("Data descarregamento", value=None, format="DD/MM/YYYY", key="cad_data_descarregamento")
+            hora_descarregamento_v = ct5.text_input("Hora descarregamento", placeholder="HH:MM")
+            c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns(11)
+            tipo_cobranca_v = c0.selectbox("Tipo Cálculo", ["TONELADA", "KM"], key="cad_tipo_calc")
+            modo_ton = (tipo_cobranca_v == "TONELADA")
+            km_v = c1.number_input("KM", value=km_sug, disabled=True)
+            kg_txt = c2.text_input("KG", key="cad_frete_kg", disabled=not modo_ton)
+            components.html(
+                """
+                <script>
+                (function () {
+                  const doc = window.parent.document;
+                  const input = doc.querySelector('input[aria-label="KG"]');
+                  if (!input || input.dataset.kgMaskAttached === "1") return;
+                  input.dataset.kgMaskAttached = "1";
+                  input.dataset.kgMaskUpdating = "0";
 
-              const proto = window.parent.HTMLInputElement.prototype;
-              const valueSetter = Object.getOwnPropertyDescriptor(proto, "value").set;
+                  const proto = window.parent.HTMLInputElement.prototype;
+                  const valueSetter = Object.getOwnPropertyDescriptor(proto, "value").set;
 
-              function formatKg(value) {
-                const digits = (value || "").replace(/\\D/g, "");
-                if (!digits) return "";
-                return Number(digits).toLocaleString("pt-BR");
-              }
+                  function formatKg(value) {
+                    const digits = (value || "").replace(/\\D/g, "");
+                    if (!digits) return "";
+                    return Number(digits).toLocaleString("pt-BR");
+                  }
 
-              input.addEventListener("input", function () {
-                if (input.dataset.kgMaskUpdating === "1") return;
-                const formatted = formatKg(input.value);
-                if (formatted === input.value) return;
+                  input.addEventListener("input", function () {
+                    if (input.dataset.kgMaskUpdating === "1") return;
+                    const formatted = formatKg(input.value);
+                    if (formatted === input.value) return;
 
-                input.dataset.kgMaskUpdating = "1";
-                valueSetter.call(input, formatted);
-                input.dispatchEvent(new Event("input", { bubbles: true }));
-                input.dataset.kgMaskUpdating = "0";
-              });
-            })();
-            </script>
-            """,
-            height=0,
-        )
-        # Valor/Tonelada vem da aba de rotas; aqui fica apenas para consulta.
-        vt_v = c3.number_input("Val Ton", value=vt_sug, disabled=True)
-        vk_v = c4.number_input("Val KM", value=vk_sug, step=0.01, disabled=modo_ton)
-        pd_v = c5.number_input("Pedágio", value=0.0)
-        qtd_pedagio_volta_padrao = 0
-        if o_v and d_dest:
-            rota_pp_ref = f"{str(o_v).strip()} → {str(d_dest).strip()}"
-            with conn() as c:
-                qtd_row_pp = c.execute(
-                    """SELECT COUNT(*) AS qtd
-                       FROM praca_pedagio
-                       WHERE TRIM(COALESCE(rota, '')) = ?
-                         AND UPPER(TRIM(COALESCE(sentido_viagem, ''))) = 'VOLTA'""",
-                    (rota_pp_ref,),
-                ).fetchone()
-            qtd_pedagio_volta_padrao = int(qtd_row_pp["qtd"] if qtd_row_pp else 0)
-        qtd_pedagio_v = c6.number_input("Qtde Pedágio", min_value=0, value=int(qtd_pedagio_volta_padrao), step=1)
-        vaf_v = c7.number_input("Vl Adic Frete", min_value=0.0, value=0.0, step=0.01)
-        desc_vaf_v = c8.text_input("Desc Vl Adic Frete")
-        gx_v = c9.number_input("Gasto Extra", min_value=0.0, value=0.0, step=0.01)
-        est_v = c10.number_input("Pagto Estadia", min_value=0.0, value=0.0, step=0.01)
-        desc_gx_v = st.text_input("Descrição Gasto Extra")
-        cf1, cf2, cf3, cf4 = st.columns(4)
-        di_v = cf1.number_input("VL/L/Diesel", value=v_diesel_sug)
-        cons_v = cf2.number_input("Gasto Diesel P/KM", value=v_cons_sug)
-        arla_v = cf3.number_input("VL/Litro Arla", min_value=0.0, value=v_arla_sug, step=0.01)
-        cons_arla_v = cf4.number_input("Gasto Arla P/KM", min_value=0.0, value=v_cons_arla_sug, step=0.01)
+                    input.dataset.kgMaskUpdating = "1";
+                    valueSetter.call(input, formatted);
+                    input.dispatchEvent(new Event("input", { bubbles: true }));
+                    input.dataset.kgMaskUpdating = "0";
+                  });
+                })();
+                </script>
+                """,
+                height=0,
+            )
+            # Valor/Tonelada vem da aba de rotas; aqui fica apenas para consulta.
+            vt_v = c3.number_input("Val Ton", value=vt_sug, disabled=True)
+            vk_v = c4.number_input("Val KM", value=vk_sug, step=0.01, disabled=modo_ton)
+            pd_v = c5.number_input("Pedágio", value=0.0)
+            qtd_pedagio_volta_padrao = 0
+            if o_v and d_dest:
+                rota_pp_ref = f"{str(o_v).strip()} → {str(d_dest).strip()}"
+                with conn() as c:
+                    qtd_row_pp = c.execute(
+                        """SELECT COUNT(*) AS qtd
+                           FROM praca_pedagio
+                           WHERE TRIM(COALESCE(rota, '')) = ?
+                             AND UPPER(TRIM(COALESCE(sentido_viagem, ''))) = 'VOLTA'""",
+                        (rota_pp_ref,),
+                    ).fetchone()
+                qtd_pedagio_volta_padrao = int(qtd_row_pp["qtd"] if qtd_row_pp else 0)
+            qtd_pedagio_v = c6.number_input("Qtde Pedágio", min_value=0, value=int(qtd_pedagio_volta_padrao), step=1)
+            vaf_v = c7.number_input("Vl Adic Frete", min_value=0.0, value=0.0, step=0.01)
+            desc_vaf_v = c8.text_input("Desc Vl Adic Frete")
+            gx_v = c9.number_input("Gasto Extra", min_value=0.0, value=0.0, step=0.01)
+            est_v = c10.number_input("Pagto Estadia", min_value=0.0, value=0.0, step=0.01)
+            desc_gx_v = st.text_input("Descrição Gasto Extra")
+            cf1, cf2, cf3, cf4 = st.columns(4)
+            di_v = cf1.number_input("VL/L/Diesel", value=v_diesel_sug)
+            cons_v = cf2.number_input("Gasto Diesel P/KM", value=v_cons_sug)
+            arla_v = cf3.number_input("VL/Litro Arla", min_value=0.0, value=v_arla_sug, step=0.01)
+            cons_arla_v = cf4.number_input("Gasto Arla P/KM", min_value=0.0, value=v_cons_arla_sug, step=0.01)
 
-        kg_digitos = "".join(ch for ch in str(kg_txt or "") if ch.isdigit())
-        kg_v = float(kg_digitos) if kg_digitos else 0.0
-        tn_v_calc = (kg_v / 1000.0) if modo_ton else 0.0
-        total_frete_prev = ((km_v * vk_v) if not modo_ton else (tn_v_calc * vt_v)) + vaf_v + est_v
-        st.info(f"Total Frete Previsto ({tipo_cobranca_v}): {brl(total_frete_prev)}")
-        if modo_ton:
-            st.caption("Tipo TONELADA: informe apenas o KG. O Valor/Ton é lido da rota cadastrada.")
-        else:
-            st.caption("Tipo KM: informe apenas o Valor KM.")
+            kg_digitos = "".join(ch for ch in str(kg_txt or "") if ch.isdigit())
+            kg_v = float(kg_digitos) if kg_digitos else 0.0
+            tn_v_calc = (kg_v / 1000.0) if modo_ton else 0.0
+            total_frete_prev = ((km_v * vk_v) if not modo_ton else (tn_v_calc * vt_v)) + vaf_v + est_v
+            st.info(f"Total Frete Previsto ({tipo_cobranca_v}): {brl(total_frete_prev)}")
+            if modo_ton:
+                st.caption("Tipo TONELADA: informe apenas o KG. O Valor/Ton é lido da rota cadastrada.")
+            else:
+                st.caption("Tipo KM: informe apenas o Valor KM.")
 
-        if st.button("💾 Gravar", key="btn_salvar_frete"):
+            sub_gravar_viagem = st.form_submit_button("💾 Gravar", use_container_width=True)
+
+        if sub_gravar_viagem:
             condicao_valor = (vk_v > 0) if not modo_ton else (kg_v > 0 and vt_v > 0)
             if trecho_existe and o_v and d_dest and veic_sel and condicao_valor:
                 placa = veic_sel.split(" - ")[0]
-                with conn() as c:
-                    c.execute(
-                        """INSERT INTO viagens
-                           (data, cliente, origem, destino, km, toneladas, valor_ton, valor_km, tipo_cobranca, pedagio, qtd_pedagio, gasto_extra, pagto_estadia, valor_adicional_frete, descricao_valor_adicional_frete, descricao_gasto_extra, diesel, consumo, arla, consumo_arla, hora_carregamento, data_chegada, hora_chegada, data_descarregamento, hora_descarregamento, nf, veiculo_placa, qtd_viagens)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            d_v.isoformat(),
-                            cl_v,
-                            o_v,
-                            d_dest,
-                            km_v,
-                            tn_v_calc if modo_ton else 0.0,
-                            vt_v if modo_ton else 0.0,
-                            vk_v if not modo_ton else 0.0,
-                            tipo_cobranca_v,
-                            pd_v,
-                            int(qtd_pedagio_v or 0),
-                            gx_v,
-                            est_v,
-                            vaf_v,
-                            desc_vaf_v.strip(),
-                            desc_gx_v.strip(),
-                            di_v,
-                            cons_v,
-                            arla_v,
-                            cons_arla_v,
-                            str(hora_carregamento_v or "").strip(),
-                            data_chegada_v.isoformat() if data_chegada_v else None,
-                            str(hora_chegada_v or "").strip(),
-                            data_descarregamento_v.isoformat() if data_descarregamento_v else None,
-                            str(hora_descarregamento_v or "").strip(),
-                            nf_v,
-                            placa,
-                            1,
-                        ),
-                    )
-                limpar_cache_viagens()
-                st.session_state.msg_frete = "✅ Gravado com sucesso!"
-                st.rerun()
+                try:
+                    with conn() as c:
+                        c.execute(
+                            """INSERT INTO viagens
+                               (data, cliente, origem, destino, km, toneladas, valor_ton, valor_km, tipo_cobranca, pedagio, qtd_pedagio, gasto_extra, pagto_estadia, valor_adicional_frete, descricao_valor_adicional_frete, descricao_gasto_extra, diesel, consumo, arla, consumo_arla, hora_carregamento, data_chegada, hora_chegada, data_descarregamento, hora_descarregamento, nf, veiculo_placa, qtd_viagens)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                d_v.isoformat(),
+                                cl_v,
+                                o_v,
+                                d_dest,
+                                km_v,
+                                tn_v_calc if modo_ton else 0.0,
+                                vt_v if modo_ton else 0.0,
+                                vk_v if not modo_ton else 0.0,
+                                tipo_cobranca_v,
+                                pd_v,
+                                int(qtd_pedagio_v or 0),
+                                gx_v,
+                                est_v,
+                                vaf_v,
+                                desc_vaf_v.strip(),
+                                desc_gx_v.strip(),
+                                di_v,
+                                cons_v,
+                                arla_v,
+                                cons_arla_v,
+                                str(hora_carregamento_v or "").strip(),
+                                data_chegada_v.isoformat() if data_chegada_v else None,
+                                str(hora_chegada_v or "").strip(),
+                                data_descarregamento_v.isoformat() if data_descarregamento_v else None,
+                                str(hora_descarregamento_v or "").strip(),
+                                nf_v,
+                                placa,
+                                1,
+                            ),
+                        )
+                    limpar_cache_viagens()
+                    st.session_state.msg_frete = "✅ Gravado com sucesso!"
+                    st.rerun()
+                except sqlite3.OperationalError:
+                    st.error("⚠️ Não foi possível gravar agora (banco de dados ocupado). Toque em 'Gravar' novamente.")
+                except Exception as e:
+                    st.error(f"⚠️ Erro ao gravar a viagem: {e}")
             else:
                 st.warning("Preencha os valores obrigatórios da modalidade selecionada para salvar.")
 
@@ -4381,6 +4765,16 @@ with aba2:
                         consumo_arla_ed = ce19.number_input("Gasto Arla P/KM", min_value=0.0, value=float(r["consumo_arla"] or 0.0), step=0.01)
                         desc_gasto_extra_ed = st.text_input("Descrição Gasto Extra", value=str(r["descricao_gasto_extra"] or ""))
 
+                        ce22, _ = st.columns(2)
+                        total_frete_valor_atual_ed = float(pd.to_numeric(r.get("Total Frete Valor", 0.0), errors="coerce") or 0.0)
+                        total_frete_valor_ed = ce22.number_input(
+                            "Total Frete Valor",
+                            min_value=0.0,
+                            value=total_frete_valor_atual_ed,
+                            step=0.01,
+                            help="Se alterado, o Val Ton/Val KM será recalculado automaticamente para que o Total Frete Valor bata com este número.",
+                        )
+
                         b1, b2 = st.columns(2)
                         btn_atualizar_viagem = b1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
                         btn_excluir_viagem = b2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
@@ -4391,6 +4785,16 @@ with aba2:
                         else:
                             tipo_sql = str(tipo_cobranca_ed).upper().strip()
                             toneladas_sql = (kg_ed / 1000.0) if tipo_sql == "TONELADA" else 0.0
+
+                            frete_base_atual_ed = (toneladas_sql * valor_ton_ed) if tipo_sql == "TONELADA" else (km_ed * valor_km_ed)
+                            total_calculado_ed = (frete_base_atual_ed + pagto_estadia_ed + valor_adic_frete_ed) * qtd_viagens_ed
+                            if abs(total_frete_valor_ed - total_calculado_ed) > 0.01:
+                                frete_base_necessario_ed = (total_frete_valor_ed / qtd_viagens_ed) - pagto_estadia_ed - valor_adic_frete_ed
+                                if tipo_sql == "TONELADA":
+                                    valor_ton_ed = (frete_base_necessario_ed / toneladas_sql) if toneladas_sql > 0 else 0.0
+                                else:
+                                    valor_km_ed = (frete_base_necessario_ed / km_ed) if km_ed > 0 else 0.0
+
                             valor_ton_sql = valor_ton_ed if tipo_sql == "TONELADA" else 0.0
                             valor_km_sql = valor_km_ed if tipo_sql == "KM" else 0.0
                             with conn() as c:
@@ -6029,7 +6433,9 @@ with aba6:
     if "cidade_editando" not in st.session_state:
         st.session_state.cidade_editando = False
     if "msg_cidades" in st.session_state:
-        st.success(st.session_state.pop("msg_cidades"))
+        _msg_cidades = st.session_state.pop("msg_cidades")
+        st.success(_msg_cidades)
+        st.toast(_msg_cidades, icon="✅")
 
     with st.form("cid_f", clear_on_submit=True):
         nc = st.text_input("Nome da Cidade").strip().upper()
@@ -6104,14 +6510,35 @@ with aba6:
                     st.rerun()
                 if erros:
                     st.warning(" | ".join(erros))
+
+        st.markdown("---")
+        st.markdown("#### 🗑️ Excluir Cidade")
+        id_cidade_excluir = st.selectbox(
+            "Escolha uma cidade para excluir",
+            options=df_cidades["id"].tolist(),
+            format_func=lambda x: df_cidades.loc[df_cidades["id"] == x, "nome"].iloc[0],
+            key="cidade_select_excluir",
+        )
+        if st.button("🗑️ Excluir Cidade", key="btn_cidade_excluir"):
+            nome_cidade_excluir = str(df_cidades.loc[df_cidades["id"] == id_cidade_excluir, "nome"].iloc[0])
+            with conn() as c:
+                qtd_mov_cidade = c.execute(
+                    "SELECT COUNT(*) FROM viagens WHERE origem=? OR destino=?",
+                    (nome_cidade_excluir, nome_cidade_excluir),
+                ).fetchone()[0]
+            if qtd_mov_cidade:
+                st.error(f"Não é possível excluir '{nome_cidade_excluir}': existem {qtd_mov_cidade} movimento(s) de viagem usando essa cidade.")
+            else:
+                with conn() as c:
+                    c.execute("DELETE FROM cidades WHERE id=?", (int(id_cidade_excluir),))
+                limpar_cache_bootstrap()
+                alerta_gravado("✅ Cidade excluída com sucesso!")
+                st.rerun()
     else:
         st.info("Nenhuma cidade cadastrada.")
 
 with aba7:
     st.subheader("🛣️ Gestão de Rotas (KM e Valores)")
-    if "rota_editando" not in st.session_state:
-        st.session_state.rota_editando = False
-    
     # 1. FORMULÁRIO PARA NOVO CADASTRO
     with st.expander("➕ Cadastrar Nova Rota", expanded=False):
         with st.form("rota_f", clear_on_submit=True):
@@ -6124,7 +6551,7 @@ with aba7:
             ce1, ce2 = st.columns(2)
             nome_empresa_origem = ce1.text_input("Nome Empresa Origem", key="rota_nome_empresa_origem").strip()
             nome_empresa_destino = ce2.text_input("Nome Empresa Destino", key="rota_nome_empresa_destino").strip()
-            
+
             if st.form_submit_button("💾 Gravar", key="btn_rota_cadastro_gravar"):
                 if o == d:
                     st.error("Origem e Destino não podem ser iguais.")
@@ -6132,13 +6559,21 @@ with aba7:
                     st.warning("VALOR NULO")
                 elif o and d:
                     with conn() as c:
-                        c.execute(
-                            """INSERT OR REPLACE INTO rotas
-                               (origem, destino, nome_empresa_origem, nome_empresa_destino, km, valor_ton, valor_km)
-                               VALUES (?,?,?,?,?,?,?)""",
-                            (o, d, nome_empresa_origem, nome_empresa_destino, k, v, vk),
-                        )
-                    alerta_gravado()
+                        rota_existente = c.execute(
+                            "SELECT id FROM rotas WHERE origem=? AND destino=?", (o, d)
+                        ).fetchone()
+                        if not rota_existente:
+                            c.execute(
+                                """INSERT INTO rotas
+                                   (origem, destino, nome_empresa_origem, nome_empresa_destino, km, valor_ton, valor_km)
+                                   VALUES (?,?,?,?,?,?,?)""",
+                                (o, d, nome_empresa_origem, nome_empresa_destino, k, v, vk),
+                            )
+                    if rota_existente:
+                        st.warning("Rota já cadastrada.")
+                    else:
+                        alerta_gravado()
+                        st.rerun()
 
     st.markdown("---")
     st.markdown("### 📋 Lista de Rotas Cadastradas")
@@ -6218,78 +6653,136 @@ with aba7:
         )
         st.markdown("---")
 
-        st.button("✏️ Editar", key="btn_rota_editar", use_container_width=True)
-        df_rotas["Excluir"] = False
-        df_ed_rotas = st.data_editor(
-            df_rotas,
-            key="editor_rotas_art_v2",
-            column_config={
-                "id": None, 
-                "Excluir": st.column_config.CheckboxColumn("🗑️"),
-                "origem": st.column_config.TextColumn("Origem", disabled=True),
-                "destino": st.column_config.TextColumn("Destino", disabled=True),
-                "nome_empresa_origem": st.column_config.TextColumn("Nome Empresa Origem"),
-                "nome_empresa_destino": st.column_config.TextColumn("Nome Empresa Destino"),
-                "km": st.column_config.NumberColumn("KM", format="%.1f"),
-                "valor_ton": st.column_config.NumberColumn("Valor/Ton", format="R$ %.2f"),
-                "valor_km": st.column_config.NumberColumn("Valor/KM", format="R$ %.2f")
-            },
+        st.dataframe(
+            df_rotas.drop(columns=["id"]).rename(
+                columns={
+                    "origem": "Origem",
+                    "destino": "Destino",
+                    "nome_empresa_origem": "Nome Empresa Origem",
+                    "nome_empresa_destino": "Nome Empresa Destino",
+                    "km": "KM",
+                    "valor_ton": "Valor/Ton",
+                    "valor_km": "Valor/KM",
+                }
+            ),
             hide_index=True,
-            use_container_width=True
+            use_container_width=True,
+            column_config={
+                "KM": st.column_config.NumberColumn(format="%.1f"),
+                "Valor/Ton": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Valor/KM": st.column_config.NumberColumn(format="R$ %.2f"),
+            },
         )
-        col_r1, col_r2 = st.columns(2)
-        if col_r1.button("💾 Gravar", key="btn_save_rotas", use_container_width=True):
-            rotas_valor_nulo = df_ed_rotas[
-                (pd.to_numeric(df_ed_rotas["valor_ton"], errors="coerce").fillna(0.0) == 0.0) &
-                (pd.to_numeric(df_ed_rotas["valor_km"], errors="coerce").fillna(0.0) == 0.0) &
-                (df_ed_rotas["Excluir"] != True)
-            ]
-            if not rotas_valor_nulo.empty:
-                st.warning("Existem rotas com valor zerado. Os nomes de empresa e demais alterações serão gravados mesmo assim.")
-            with conn() as c:
-                for _, r in df_ed_rotas.iterrows():
-                    if not r["Excluir"]:
-                        nome_emp_origem = "" if pd.isna(r.get("nome_empresa_origem")) else str(r.get("nome_empresa_origem")).strip()
-                        nome_emp_destino = "" if pd.isna(r.get("nome_empresa_destino")) else str(r.get("nome_empresa_destino")).strip()
-                        c.execute(
-                            """UPDATE rotas
-                               SET nome_empresa_origem=?, nome_empresa_destino=?, km=?, valor_ton=?, valor_km=?
-                               WHERE id=?""",
-                            (
-                                nome_emp_origem,
-                                nome_emp_destino,
-                                r["km"],
-                                r["valor_ton"],
-                                r["valor_km"],
-                                r["id"],
-                            ),
-                        )
-            alerta_gravado()
-        if col_r2.button("🔴 Excluir Selecionados", type="primary", key="btn_del_rotas", use_container_width=True):
-            itens_para_excluir = df_ed_rotas[df_ed_rotas["Excluir"] == True]
-            if not itens_para_excluir.empty:
-                com_erro = []
-                sucesso_count = 0
-                with conn() as c:
-                    for _, rota in itens_para_excluir.iterrows():
-                        check = c.execute(
-                            """SELECT COUNT(*) as total FROM viagens 
-                               WHERE (origem = ? AND destino = ?) 
-                               OR (origem = ? AND destino = ?)""",
-                            (rota['origem'], rota['destino'], rota['destino'], rota['origem'])
-                        ).fetchone()
-                        if check['total'] > 0:
-                            com_erro.append(f"{rota['origem']} x {rota['destino']}")
-                        else:
-                            c.execute("DELETE FROM rotas WHERE id=?", (rota['id'],))
-                            sucesso_count += 1
-                if com_erro:
-                    st.error(f"⚠️ **Não foi possível excluir as seguintes rotas:** {', '.join(com_erro)}. \n\nMotivo: Existem fretes cadastrados usando estas rotas no histórico.")
-                if sucesso_count > 0:
-                    st.success(f"✅ {sucesso_count} rota(s) excluída(s com sucesso!")
-                    st.rerun()
+
+        if "rota_id_editando" not in st.session_state:
+            st.session_state.rota_id_editando = None
+
+        df_rotas_sel = df_rotas.copy()
+        df_rotas_sel["rotulo_edicao"] = (
+            df_rotas_sel["origem"].fillna("").astype(str).str.strip()
+            + " → "
+            + df_rotas_sel["destino"].fillna("").astype(str).str.strip()
+        )
+        id_rota_sel = st.selectbox(
+            "Escolha uma rota para editar",
+            options=df_rotas_sel["id"].tolist(),
+            format_func=lambda x: df_rotas_sel.loc[df_rotas_sel["id"] == x, "rotulo_edicao"].iloc[0],
+            key="rota_select_editar",
+        )
+        c_r1, c_r2 = st.columns(2)
+        if c_r1.button("✏️ Editar Registro", key="btn_rota_abrir_form", use_container_width=True):
+            st.session_state.rota_id_editando = int(id_rota_sel)
+            st.rerun()
+        if c_r2.button("❌ Cancelar Edição", key="btn_rota_cancelar_form", use_container_width=True):
+            st.session_state.rota_id_editando = None
+            st.rerun()
+
+        if st.session_state.rota_id_editando is not None:
+            reg_rota_sel = df_rotas[df_rotas["id"] == st.session_state.rota_id_editando]
+            if reg_rota_sel.empty:
+                st.session_state.rota_id_editando = None
+                st.warning("Registro selecionado não foi encontrado.")
             else:
-                st.info("Selecione a lixeira (🗑️) para excluir.")
+                r = reg_rota_sel.iloc[0]
+                st.markdown("### ✏️ Editar Rota")
+                with st.form("form_edicao_rota"):
+                    origem_atual_rota_ed = str(r["origem"] or "").strip()
+                    destino_atual_rota_ed = str(r["destino"] or "").strip()
+                    opcoes_origem_rota_ed = list(lista_cidades) if isinstance(lista_cidades, list) else []
+                    opcoes_destino_rota_ed = list(lista_cidades) if isinstance(lista_cidades, list) else []
+                    if origem_atual_rota_ed and origem_atual_rota_ed not in opcoes_origem_rota_ed:
+                        opcoes_origem_rota_ed = [origem_atual_rota_ed] + opcoes_origem_rota_ed
+                    if destino_atual_rota_ed and destino_atual_rota_ed not in opcoes_destino_rota_ed:
+                        opcoes_destino_rota_ed = [destino_atual_rota_ed] + opcoes_destino_rota_ed
+                    idx_origem_rota_ed = opcoes_origem_rota_ed.index(origem_atual_rota_ed) if origem_atual_rota_ed in opcoes_origem_rota_ed else 0
+                    idx_destino_rota_ed = opcoes_destino_rota_ed.index(destino_atual_rota_ed) if destino_atual_rota_ed in opcoes_destino_rota_ed else 0
+
+                    ce1, ce2 = st.columns(2)
+                    origem_rota_ed = ce1.selectbox("Origem", options=opcoes_origem_rota_ed, index=idx_origem_rota_ed, key=f"rota_origem_ed_{int(r['id'])}")
+                    destino_rota_ed = ce2.selectbox("Destino", options=opcoes_destino_rota_ed, index=idx_destino_rota_ed, key=f"rota_destino_ed_{int(r['id'])}")
+
+                    ce3, ce4, ce5 = st.columns(3)
+                    km_rota_ed = ce3.number_input("KM", min_value=0.0, value=float(r["km"] or 0.0), step=0.1)
+                    valor_ton_rota_ed = ce4.number_input("Valor/Ton (R$)", min_value=0.0, value=float(r["valor_ton"] or 0.0), step=0.01)
+                    valor_km_rota_ed = ce5.number_input("Valor/KM (R$)", min_value=0.0, value=float(r["valor_km"] or 0.0), step=0.01)
+
+                    ce6, ce7 = st.columns(2)
+                    nome_emp_origem_rota_ed = ce6.text_input("Nome Empresa Origem", value=str(r.get("nome_empresa_origem", "") or "")).strip()
+                    nome_emp_destino_rota_ed = ce7.text_input("Nome Empresa Destino", value=str(r.get("nome_empresa_destino", "") or "")).strip()
+
+                    b1, b2 = st.columns(2)
+                    btn_atualizar_rota = b1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
+                    btn_excluir_rota = b2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
+
+                if btn_atualizar_rota:
+                    if origem_rota_ed == destino_rota_ed:
+                        st.error("Origem e Destino não podem ser iguais.")
+                    else:
+                        with conn() as c:
+                            rota_duplicada = c.execute(
+                                "SELECT id FROM rotas WHERE origem=? AND destino=? AND id<>?",
+                                (origem_rota_ed, destino_rota_ed, int(st.session_state.rota_id_editando)),
+                            ).fetchone()
+                            if not rota_duplicada:
+                                c.execute(
+                                    """UPDATE rotas
+                                       SET origem=?, destino=?, nome_empresa_origem=?, nome_empresa_destino=?, km=?, valor_ton=?, valor_km=?
+                                       WHERE id=?""",
+                                    (
+                                        origem_rota_ed,
+                                        destino_rota_ed,
+                                        nome_emp_origem_rota_ed,
+                                        nome_emp_destino_rota_ed,
+                                        km_rota_ed,
+                                        valor_ton_rota_ed,
+                                        valor_km_rota_ed,
+                                        int(st.session_state.rota_id_editando),
+                                    ),
+                                )
+                        if rota_duplicada:
+                            st.warning("Rota já cadastrada.")
+                        else:
+                            alerta_gravado()
+                            st.session_state.rota_id_editando = None
+                            st.rerun()
+
+                if btn_excluir_rota:
+                    with conn() as c:
+                        check = c.execute(
+                            """SELECT COUNT(*) as total FROM viagens
+                               WHERE (origem = ? AND destino = ?)
+                               OR (origem = ? AND destino = ?)""",
+                            (r["origem"], r["destino"], r["destino"], r["origem"]),
+                        ).fetchone()
+                        pode_excluir = check["total"] == 0
+                        if pode_excluir:
+                            c.execute("DELETE FROM rotas WHERE id=?", (int(st.session_state.rota_id_editando),))
+                    if not pode_excluir:
+                        st.error("⚠️ Não foi possível excluir esta rota. Motivo: Existem fretes cadastrados usando esta rota no histórico.")
+                    else:
+                        alerta_gravado("✅ Rota excluída com sucesso!")
+                        st.session_state.rota_id_editando = None
+                        st.rerun()
     else:
         st.info("Nenhuma rota cadastrada.")
 with aba8:
@@ -6577,7 +7070,9 @@ with aba9:
         st.caption("Nenhum abastecimento anterior para replicar.")
 
     if st.session_state.get("abs_sucesso_msg"):
-        st.success(st.session_state.pop("abs_sucesso_msg"))
+        _abs_sucesso_msg = st.session_state.pop("abs_sucesso_msg")
+        st.success(_abs_sucesso_msg)
+        st.toast(_abs_sucesso_msg, icon="✅")
     if st.session_state.get("abs_replicado_msg"):
         st.info(st.session_state.pop("abs_replicado_msg"))
 
@@ -7745,17 +8240,35 @@ with aba13:
                 if str(novo_tipo_servico or "").strip():
                     with conn() as c:
                         c.execute("INSERT OR IGNORE INTO tipos_servico_troca (nome) VALUES (?)", (novo_tipo_servico.strip(),))
-                    st.success("Tipo de serviço cadastrado com sucesso.")
+                    alerta_gravado("✅ Tipo de serviço cadastrado com sucesso!")
                     st.rerun()
                 else:
                     st.warning("Digite o nome do tipo de serviço antes de adicionar.")
+
+            st.markdown("---")
+            tipo_del_cad, btn_del_cad = st.columns([3, 1])
+            tipo_servico_excluir_cad = tipo_del_cad.selectbox(
+                "Excluir Tipo de Serviço", ["Selecione"] + lista_servicos_troca, key="tipo_servico_excluir_cad"
+            )
+            if btn_del_cad.button("🗑️ Excluir", key="btn_del_tipo_servico_cad"):
+                if tipo_servico_excluir_cad == "Selecione":
+                    st.warning("Escolha um tipo de serviço para excluir.")
+                else:
+                    with conn() as c:
+                        c.execute("DELETE FROM tipos_servico_troca WHERE nome=?", (tipo_servico_excluir_cad,))
+                    alerta_gravado("✅ Tipo de serviço excluído com sucesso!")
+                    st.rerun()
 
         with st.expander("➕ Alterar Tipo de Serviço", expanded=False):
             with st.form("f_alterar_tipo_servico", clear_on_submit=True):
                 tipo_alterar, novo_nome = st.columns([3, 2])
                 tipo_servico_para_alterar = tipo_alterar.selectbox("Tipo de Serviço a Alterar", ["Selecione"] + lista_servicos_troca, key="tipo_servico_para_alterar")
                 novo_nome_servico = novo_nome.text_input("Novo nome do Tipo de Serviço", key="novo_nome_tipo_servico")
-                if st.form_submit_button("🔄 Alterar Tipo", key="btn_alterar_tipo_servico"):
+                col_alt_serv, col_del_serv = st.columns(2)
+                btn_alterar_tipo_servico = col_alt_serv.form_submit_button("🔄 Alterar Tipo", use_container_width=True, key="btn_alterar_tipo_servico")
+                btn_excluir_tipo_servico = col_del_serv.form_submit_button("🗑️ Excluir", use_container_width=True, key="btn_excluir_tipo_servico")
+
+                if btn_alterar_tipo_servico:
                     alterou_tipo_servico = False
                     if tipo_servico_para_alterar == "Selecione":
                         st.warning("Escolha um tipo de serviço para alterar.")
@@ -7771,12 +8284,21 @@ with aba13:
                                 updated_tipos = c.execute("UPDATE tipos_servico_troca SET nome=? WHERE nome=?", (novo_nome_clean, tipo_servico_para_alterar)).rowcount
                                 updated_controle = c.execute("UPDATE controle_trocas SET tipo_servico=? WHERE tipo_servico=?", (novo_nome_clean, tipo_servico_para_alterar)).rowcount
                                 if updated_tipos > 0:
-                                    st.success(f"Tipo de serviço alterado com sucesso. ({updated_tipos} tipo(s), {updated_controle} movimento(s) atualizados)")
+                                    alerta_gravado(f"✅ Tipo de serviço alterado com sucesso. ({updated_tipos} tipo(s), {updated_controle} movimento(s) atualizados)")
                                     alterou_tipo_servico = True
                                 else:
                                     st.warning("Nenhum tipo de serviço foi alterado. Verifique a seleção.")
                         if alterou_tipo_servico:
                             st.rerun()
+
+                if btn_excluir_tipo_servico:
+                    if tipo_servico_para_alterar == "Selecione":
+                        st.warning("Escolha um tipo de serviço para excluir.")
+                    else:
+                        with conn() as c:
+                            c.execute("DELETE FROM tipos_servico_troca WHERE nome=?", (tipo_servico_para_alterar,))
+                        alerta_gravado("✅ Tipo de serviço excluído com sucesso!")
+                        st.rerun()
 
         st.markdown("---")
         with st.form("f_troca_v11", clear_on_submit=True):
@@ -9326,11 +9848,207 @@ with aba21:
                             alerta_gravado()
                             st.rerun()
 
+with aba22:
+    st.subheader("👥 Cliente")
+    if "msg_clientes" in st.session_state:
+        _msg_clientes = st.session_state.pop("msg_clientes")
+        st.success(_msg_clientes)
+        st.toast(_msg_clientes, icon="✅")
+
+    with st.form("cli_f", clear_on_submit=True):
+        desc_cli = st.text_input("Descrição Cliente").strip().upper()
+        if st.form_submit_button("💾 Gravar", key="btn_cliente_cadastro_gravar"):
+            if not desc_cli:
+                st.warning("Informe a descrição do cliente.")
+            else:
+                with conn() as c:
+                    cur_cliente = c.execute("INSERT OR IGNORE INTO clientes (descricao) VALUES (?)", (desc_cli,))
+                if cur_cliente.rowcount == 0:
+                    st.warning("Esse cliente já está cadastrado.")
+                else:
+                    limpar_cache_bootstrap()
+                    st.session_state.msg_clientes = "✅ Gravado com sucesso!"
+                    st.rerun()
+
+    with conn() as c:
+        df_clientes = pd.read_sql("SELECT id, descricao FROM clientes ORDER BY descricao", c)
+
+    if df_clientes.empty:
+        st.info("Nenhum cliente cadastrado.")
+    else:
+        st.dataframe(
+            df_clientes.rename(columns={"id": "ID", "descricao": "Descrição Cliente"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if "cliente_id_editando" not in st.session_state:
+            st.session_state.cliente_id_editando = None
+
+        id_cliente_sel = st.selectbox(
+            "Escolha um cliente para editar",
+            options=df_clientes["id"].tolist(),
+            format_func=lambda x: df_clientes.loc[df_clientes["id"] == x, "descricao"].iloc[0],
+            key="cliente_select_editar",
+        )
+        c_cli1, c_cli2 = st.columns(2)
+        if c_cli1.button("✏️ Editar Registro", key="btn_cliente_abrir_form", use_container_width=True):
+            st.session_state.cliente_id_editando = int(id_cliente_sel)
+            st.rerun()
+        if c_cli2.button("❌ Cancelar Edição", key="btn_cliente_cancelar_form", use_container_width=True):
+            st.session_state.cliente_id_editando = None
+            st.rerun()
+
+        if st.session_state.cliente_id_editando is not None:
+            reg_sel_cli = df_clientes[df_clientes["id"] == st.session_state.cliente_id_editando]
+            if reg_sel_cli.empty:
+                st.session_state.cliente_id_editando = None
+                st.warning("Registro selecionado não foi encontrado.")
+            else:
+                r_cli = reg_sel_cli.iloc[0]
+                st.markdown("### ✏️ Editar Cliente")
+                with st.form("form_edicao_cliente"):
+                    desc_cli_ed = st.text_input("Descrição Cliente", value=str(r_cli["descricao"] or "")).strip().upper()
+                    b_cli1, b_cli2 = st.columns(2)
+                    btn_atualizar_cliente = b_cli1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
+                    btn_excluir_cliente = b_cli2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
+
+                if btn_atualizar_cliente:
+                    if not desc_cli_ed:
+                        st.warning("Informe a descrição do cliente.")
+                    else:
+                        desc_antiga_cli = str(r_cli["descricao"] or "").strip().upper()
+                        try:
+                            with conn() as c:
+                                c.execute(
+                                    "UPDATE clientes SET descricao=? WHERE id=?",
+                                    (desc_cli_ed, int(st.session_state.cliente_id_editando)),
+                                )
+                                if desc_cli_ed != desc_antiga_cli:
+                                    c.execute(
+                                        "UPDATE viagens SET cliente=? WHERE cliente=?",
+                                        (desc_cli_ed, desc_antiga_cli),
+                                    )
+                            alerta_gravado()
+                            st.session_state.cliente_id_editando = None
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.error("Já existe outro cliente com essa descrição.")
+
+                if btn_excluir_cliente:
+                    with conn() as c:
+                        c.execute("DELETE FROM clientes WHERE id=?", (int(st.session_state.cliente_id_editando),))
+                    alerta_gravado("✅ Cliente excluído com sucesso!")
+                    st.session_state.cliente_id_editando = None
+                    st.rerun()
+
+with aba23:
+    st.subheader("🏷️ Categoria")
+    st.caption("Categorias usadas nos lançamentos de Contas a Pagar e Contas a Receber.")
+    if "msg_categorias" in st.session_state:
+        _msg_categorias = st.session_state.pop("msg_categorias")
+        st.success(_msg_categorias)
+        st.toast(_msg_categorias, icon="✅")
+
+    with st.form("cat_f", clear_on_submit=True):
+        desc_cat = st.text_input("Descrição Categoria").strip()
+        if st.form_submit_button("💾 Gravar", key="btn_categoria_cadastro_gravar"):
+            if not desc_cat:
+                st.warning("Informe a descrição da categoria.")
+            else:
+                with conn() as c:
+                    cur_categoria = c.execute("INSERT OR IGNORE INTO categorias (descricao) VALUES (?)", (desc_cat,))
+                if cur_categoria.rowcount == 0:
+                    st.warning("Essa categoria já está cadastrada.")
+                else:
+                    limpar_cache_bootstrap()
+                    st.session_state.msg_categorias = "✅ Gravado com sucesso!"
+                    st.rerun()
+
+    with conn() as c:
+        df_categorias = pd.read_sql("SELECT id, descricao FROM categorias ORDER BY descricao", c)
+
+    if df_categorias.empty:
+        st.info("Nenhuma categoria cadastrada.")
+    else:
+        st.dataframe(
+            df_categorias.rename(columns={"id": "ID", "descricao": "Descrição Categoria"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if "categoria_id_editando" not in st.session_state:
+            st.session_state.categoria_id_editando = None
+
+        id_categoria_sel = st.selectbox(
+            "Escolha uma categoria para editar",
+            options=df_categorias["id"].tolist(),
+            format_func=lambda x: df_categorias.loc[df_categorias["id"] == x, "descricao"].iloc[0],
+            key="categoria_select_editar",
+        )
+        c_cat1, c_cat2, c_cat3 = st.columns(3)
+        if c_cat1.button("✏️ Editar Registro", key="btn_categoria_abrir_form", use_container_width=True):
+            st.session_state.categoria_id_editando = int(id_categoria_sel)
+            st.rerun()
+        if c_cat2.button("❌ Cancelar Edição", key="btn_categoria_cancelar_form", use_container_width=True):
+            st.session_state.categoria_id_editando = None
+            st.rerun()
+        if c_cat3.button("🗑️ Excluir", key="btn_categoria_excluir_direto", use_container_width=True):
+            with conn() as c:
+                c.execute("DELETE FROM categorias WHERE id=?", (int(id_categoria_sel),))
+            limpar_cache_bootstrap()
+            st.session_state.categoria_id_editando = None
+            alerta_gravado("✅ Categoria excluída com sucesso!")
+            st.rerun()
+
+        if st.session_state.categoria_id_editando is not None:
+            reg_sel_cat = df_categorias[df_categorias["id"] == st.session_state.categoria_id_editando]
+            if reg_sel_cat.empty:
+                st.session_state.categoria_id_editando = None
+                st.warning("Registro selecionado não foi encontrado.")
+            else:
+                r_cat = reg_sel_cat.iloc[0]
+                st.markdown("### ✏️ Editar Categoria")
+                with st.form("form_edicao_categoria"):
+                    desc_cat_ed = st.text_input("Descrição Categoria", value=str(r_cat["descricao"] or "")).strip()
+                    b_cat1, b_cat2 = st.columns(2)
+                    btn_atualizar_categoria = b_cat1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
+                    btn_excluir_categoria = b_cat2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
+
+                if btn_atualizar_categoria:
+                    if not desc_cat_ed:
+                        st.warning("Informe a descrição da categoria.")
+                    else:
+                        desc_antiga_cat = str(r_cat["descricao"] or "").strip()
+                        try:
+                            with conn() as c:
+                                c.execute(
+                                    "UPDATE categorias SET descricao=? WHERE id=?",
+                                    (desc_cat_ed, int(st.session_state.categoria_id_editando)),
+                                )
+                                if desc_cat_ed != desc_antiga_cat:
+                                    c.execute("UPDATE contas_pagar SET categoria=? WHERE categoria=?", (desc_cat_ed, desc_antiga_cat))
+                                    c.execute("UPDATE contas_receber SET categoria=? WHERE categoria=?", (desc_cat_ed, desc_antiga_cat))
+                            limpar_cache_bootstrap()
+                            alerta_gravado()
+                            st.session_state.categoria_id_editando = None
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.error("Já existe outra categoria com essa descrição.")
+
+                if btn_excluir_categoria:
+                    with conn() as c:
+                        c.execute("DELETE FROM categorias WHERE id=?", (int(st.session_state.categoria_id_editando),))
+                    limpar_cache_bootstrap()
+                    alerta_gravado("✅ Categoria excluída com sucesso!")
+                    st.session_state.categoria_id_editando = None
+                    st.rerun()
+
 # =========================
 # ABA 17 - CONTAS A PAGAR
 # =========================
 
-CATEGORIAS_CP = [
+CATEGORIAS_CP = lista_categorias or [
     "Combustível", "Manutenção", "Pneus", "Pedágio", "Seguro",
     "IPVA / Licenciamento", "Financiamento / Parcela", "Salários",
     "Impostos / Taxas", "Aluguel", "Água / Energia", "Telefone / Internet",
@@ -9338,7 +10056,7 @@ CATEGORIAS_CP = [
 ]
 FORMAS_PAGAMENTO_CP = ["PIX", "TED / DOC", "Dinheiro", "Cheque", "Boleto", "Débito Automático", "Cartão", "Outros"]
 
-CATEGORIAS_CR = ["Frete", "Serviço", "Bonificação", "Aluguel", "Outros"]
+CATEGORIAS_CR = lista_categorias or ["Frete", "Serviço", "Bonificação", "Aluguel", "Outros"]
 FORMAS_RECEBIMENTO_CR = ["PIX", "TED / DOC", "Dinheiro", "Cheque", "Depósito", "Cartão", "Outros"]
 
 def _add_status_cp(df):
@@ -9498,7 +10216,9 @@ def _html_relatorio_financeiro(
 
 with aba17:
     if st.session_state.get("cp_flash_msg"):
-        st.success(st.session_state.pop("cp_flash_msg"))
+        _cp_flash_msg = st.session_state.pop("cp_flash_msg")
+        st.success(_cp_flash_msg)
+        st.toast(_cp_flash_msg, icon="✅")
 
     with conn() as c:
         df_cp = pd.read_sql(
@@ -9993,7 +10713,9 @@ with aba17:
 # =========================
 with aba_cr:
     if st.session_state.get("cr_flash_msg"):
-        st.success(st.session_state.pop("cr_flash_msg"))
+        _cr_flash_msg = st.session_state.pop("cr_flash_msg")
+        st.success(_cr_flash_msg)
+        st.toast(_cr_flash_msg, icon="✅")
 
     with conn() as c:
         df_cr = pd.read_sql(
@@ -11633,9 +12355,10 @@ with aba_calc:
     with col_km_in:
         st.markdown('<div class="cmp-shared-title">📏 Cobrança por KM</div>', unsafe_allow_html=True)
         ci1, ci2 = st.columns(2)
-        cr_val_km = _cr_num(
+        cr_val_km_informado = _cr_num(
             ci1.text_input("Valor por KM (R$/km)", value="0.0000", key="cr_val_km2"),
         )
+        cr_val_km_auto_placeholder = ci1.empty()
 
     with col_sep:
         st.markdown("<div style='text-align:center;padding-top:32px;font-size:1.4rem;color:#cfdce9;font-weight:900;'>VS</div>", unsafe_allow_html=True)
@@ -11649,6 +12372,14 @@ with aba_calc:
         cr_qtde_ton = _cr_num(
             ci4.text_input("Qtde Toneladas (ton)", value="0.000", key="cr_qtde_ton2"),
         )
+
+    # Se o Valor por KM não foi informado, calcula automaticamente a partir do frete por tonelada.
+    cr_val_km_auto = cr_val_km_informado <= 0 and cr_val_ton > 0 and cr_qtde_ton > 0 and cr_km > 0
+    if cr_val_km_auto:
+        cr_val_km = (cr_val_ton * cr_qtde_ton) / cr_km
+        cr_val_km_auto_placeholder.caption(f"🔄 Calculado automaticamente: {brl(cr_val_km)}/km")
+    else:
+        cr_val_km = cr_val_km_informado
 
     # ── CÁLCULOS POR MODALIDADE ──────────────────────────────────────────────
     frete_bruto_km  = cr_val_km  * cr_km
@@ -11673,13 +12404,14 @@ with aba_calc:
             f'</div>'
         )
 
-    def _build_card(frete_bruto, liquido, margem, header_class, liquido_class_name, modalidade_txt):
+    def _build_card(frete_bruto, liquido, margem, header_class, liquido_class_name, modalidade_txt, valor_unit_label, valor_unit_value):
         neg_class = " neg" if liquido < 0 else ""
         margem_txt = f"{margem:.1f}% de margem" if frete_bruto > 0 else "—"
         liquido_por_km = liquido / cr_km if cr_km > 0 else 0.0
         liq_km_txt = f"{brl(liquido_por_km)}/km" if cr_km > 0 else "—"
         rows = (
-            _cmp_row("Frete Bruto",    brl(frete_bruto))
+            _cmp_row(valor_unit_label, valor_unit_value)
+            + _cmp_row("Frete Bruto",    brl(frete_bruto))
             + _cmp_row("Custo Diesel", brl(custo_diesel), f"{lit_diesel:.1f} L")
             + _cmp_row("Custo Arla",   brl(custo_arla),   f"{lit_arla:.1f} L")
             + _cmp_row("Pedágio",      brl(cr_pedagio))
@@ -11701,7 +12433,8 @@ with aba_calc:
         st.markdown(
             _build_card(frete_bruto_km, liquido_km, margem_km,
                         "cmp-km-header", "cmp-liquido-km",
-                        f"📏 Por KM &nbsp;·&nbsp; {format_br(cr_km, casas_decimais=0)} km × {brl(cr_val_km)}/km"),
+                        f"📏 Por KM &nbsp;·&nbsp; {format_br(cr_km, casas_decimais=0)} km × {brl(cr_val_km)}/km",
+                        "Valor por KM", f"{brl(cr_val_km)}/km"),
             unsafe_allow_html=True,
         )
 
@@ -11716,7 +12449,8 @@ with aba_calc:
         st.markdown(
             _build_card(frete_bruto_ton, liquido_ton, margem_ton,
                         "cmp-ton-header", "cmp-liquido-ton",
-                        f"🏋️ Por Tonelada &nbsp;·&nbsp; {format_br(cr_qtde_ton, casas_decimais=3)} ton × {brl(cr_val_ton)}/ton"),
+                        f"🏋️ Por Tonelada &nbsp;·&nbsp; {format_br(cr_qtde_ton, casas_decimais=3)} ton × {brl(cr_val_ton)}/ton",
+                        "Valor por Tonelada", f"{brl(cr_val_ton)}/ton"),
             unsafe_allow_html=True,
         )
 
