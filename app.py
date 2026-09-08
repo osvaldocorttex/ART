@@ -1,4 +1,5 @@
 import sqlite3
+import calendar
 from datetime import date, datetime, timedelta
 import contextlib
 import hashlib
@@ -908,6 +909,23 @@ def normalizar_data_iso(valor):
         return None
 
 
+def somar_um_mes(data_ref):
+    """Soma 1 mês a uma data, ajustando para o último dia do mês quando necessário
+    (ex.: 31/01 -> 28 ou 29/02)."""
+    if data_ref is None:
+        return None
+    if isinstance(data_ref, str):
+        iso = normalizar_data_iso(data_ref)
+        if not iso:
+            return None
+        data_ref = datetime.strptime(iso, "%Y-%m-%d").date()
+    ano_novo = data_ref.year + (1 if data_ref.month == 12 else 0)
+    mes_novo = 1 if data_ref.month == 12 else data_ref.month + 1
+    ultimo_dia_mes_novo = calendar.monthrange(ano_novo, mes_novo)[1]
+    dia_novo = min(data_ref.day, ultimo_dia_mes_novo)
+    return date(ano_novo, mes_novo, dia_novo)
+
+
 def texto_celula_editor(valor):
     if valor is None:
         return ""
@@ -986,6 +1004,7 @@ def excluir_peca_manutencao(peca_id):
             (manutencao_id,),
         ).fetchone()[0]
         c.execute("UPDATE manutencoes SET valor_pecas=? WHERE id=?", (float(total_pecas or 0), manutencao_id))
+    limpar_cache_manutencao()
     return True
 
 
@@ -1001,6 +1020,7 @@ def excluir_manutencao_completa(manutencao_id):
         c.execute("DELETE FROM manutencoes_anexos WHERE manutencao_id=?", (int(manutencao_id),))
         c.execute("DELETE FROM manutencoes_pecas WHERE manutencao_id=?", (int(manutencao_id),))
         c.execute("DELETE FROM manutencoes WHERE id=?", (int(manutencao_id),))
+    limpar_cache_manutencao()
 
     for anexo in anexos:
         caminho = str(anexo["caminho_arquivo"] or "").strip()
@@ -1091,9 +1111,12 @@ def movimentos_fornecedor(c, fornecedor_id):
     qtd_pecas = c.execute("SELECT COUNT(*) FROM manutencoes_pecas WHERE fornecedor_id=?", (fornecedor_id,)).fetchone()[0]
     if qtd_pecas:
         usos.append(f"Peças de manutenção: {qtd_pecas}")
-    qtd_cp = c.execute("SELECT COUNT(*) FROM contas_pagar WHERE fornecedor=?", (str(fornecedor_id),)).fetchone()[0]
-    if qtd_cp:
-        usos.append(f"Contas a pagar: {qtd_cp}")
+    row_nome_forn = c.execute("SELECT nome FROM fornecedores WHERE id=?", (fornecedor_id,)).fetchone()
+    nome_forn = str(row_nome_forn["nome"] or "").strip() if row_nome_forn else ""
+    if nome_forn:
+        qtd_cp = c.execute("SELECT COUNT(*) FROM contas_pagar WHERE fornecedor=?", (nome_forn,)).fetchone()[0]
+        if qtd_cp:
+            usos.append(f"Contas a pagar: {qtd_cp}")
     return usos
 
 
@@ -1179,12 +1202,97 @@ def _carregar_rotas_ref_exec_raw():
         return pd.read_sql("SELECT origem, destino, valor_ton FROM rotas", c)
 
 
+@cache_data_compat(ttl=15, show_spinner=False)
+def _carregar_manutencoes_periodo_raw(data_ini_iso: str, data_fim_iso: str):
+    with conn() as c:
+        return pd.read_sql(
+            """SELECT m.*, f.nome as fornecedor_nome FROM manutencoes m
+               JOIN fornecedores f ON m.oficina_id = f.id
+               WHERE m.data_entrada BETWEEN ? AND ?
+               ORDER BY m.data_entrada DESC""",
+            c,
+            params=(data_ini_iso, data_fim_iso),
+        )
+
+
+@cache_data_compat(ttl=30, show_spinner=False)
+def _carregar_placas_manutencao_raw():
+    with conn() as c:
+        return pd.read_sql(
+            """SELECT DISTINCT UPPER(TRIM(m.veiculo_placa)) as placa,
+                      COALESCE(v.descricao, '') as descricao
+               FROM manutencoes m
+               LEFT JOIN veiculos v ON UPPER(TRIM(v.placa)) = UPPER(TRIM(m.veiculo_placa))
+               WHERE m.veiculo_placa IS NOT NULL AND TRIM(m.veiculo_placa) <> ''
+               ORDER BY placa ASC""",
+            c,
+        )
+
+
+@cache_data_compat(ttl=20, show_spinner=False)
+def _carregar_controle_trocas_raw():
+    with conn() as c:
+        return pd.read_sql("SELECT * FROM controle_trocas ORDER BY data_servico DESC", c)
+
+
+def limpar_cache_trocas():
+    func = globals().get("_carregar_controle_trocas_raw")
+    clear_func = getattr(func, "clear", None)
+    if callable(clear_func):
+        try:
+            clear_func()
+        except Exception:
+            pass
+
+
+@cache_data_compat(ttl=15, show_spinner=False)
+def _carregar_contas_pagar_raw():
+    with conn() as c:
+        return pd.read_sql("SELECT * FROM contas_pagar ORDER BY data_vencimento ASC, id DESC", c)
+
+
+@cache_data_compat(ttl=15, show_spinner=False)
+def _carregar_contas_receber_raw():
+    with conn() as c:
+        return pd.read_sql("SELECT * FROM contas_receber ORDER BY data_vencimento ASC, id DESC", c)
+
+
+@cache_data_compat(ttl=15, show_spinner=False)
+def _carregar_abastecimentos_periodo_raw(data_ini_iso: str, data_fim_iso: str):
+    with conn() as c:
+        return pd.read_sql(
+            """SELECT *
+               FROM abastecimentos
+               WHERE date(data) BETWEEN ? AND ?
+               ORDER BY date(data) ASC, id ASC""",
+            c,
+            params=(data_ini_iso, data_fim_iso),
+        )
+
+
+def limpar_cache_manutencao():
+    for nome_func in ("_carregar_manutencoes_periodo_raw", "_carregar_placas_manutencao_raw"):
+        func = globals().get(nome_func)
+        clear_func = getattr(func, "clear", None)
+        if callable(clear_func):
+            try:
+                clear_func()
+            except Exception:
+                pass
+
+
 def limpar_cache_app():
     funcoes_cache = [
         "_carregar_bootstrap_app",
         "_carregar_historico_parametros_raw",
         "_carregar_viagens_periodo_raw",
         "_carregar_rotas_ref_exec_raw",
+        "_carregar_manutencoes_periodo_raw",
+        "_carregar_placas_manutencao_raw",
+        "_carregar_controle_trocas_raw",
+        "_carregar_contas_pagar_raw",
+        "_carregar_contas_receber_raw",
+        "_carregar_abastecimentos_periodo_raw",
     ]
     for nome_func in funcoes_cache:
         func = globals().get(nome_func)
@@ -3330,15 +3438,15 @@ with aba_usuarios:
                 row_alt = mapa_usuarios[usuario_alt_sel]
                 placas_atuais_alt = carregar_placas_usuario(int(row_alt["id"]))
                 abas_atuais_alt = carregar_abas_usuario(int(row_alt["id"]))
-                with st.form("form_admin_alterar_usuario"):
-                    usuario_alt_nome = st.text_input("Usuário", value=str(row_alt["usuario"] or ""), key="admin_usuario_alt_nome")
-                    senha_alt = st.text_input("Nova senha (deixe em branco para manter)", type="password", key="admin_usuario_alt_senha")
-                    admin_alt = st.checkbox("Administrador", value=bool(int(row_alt["is_admin"] or 0) == 1), key="admin_usuario_alt_admin")
-                    ativo_alt = st.checkbox("Ativo", value=bool(int(row_alt["ativo"] or 0) == 1), key="admin_usuario_alt_ativo")
+                with st.form(f"form_admin_alterar_usuario_{int(row_alt['id'])}"):
+                    usuario_alt_nome = st.text_input("Usuário", value=str(row_alt["usuario"] or ""), key=f"admin_usuario_alt_nome_{int(row_alt['id'])}")
+                    senha_alt = st.text_input("Nova senha (deixe em branco para manter)", type="password", key=f"admin_usuario_alt_senha_{int(row_alt['id'])}")
+                    admin_alt = st.checkbox("Administrador", value=bool(int(row_alt["is_admin"] or 0) == 1), key=f"admin_usuario_alt_admin_{int(row_alt['id'])}")
+                    ativo_alt = st.checkbox("Ativo", value=bool(int(row_alt["ativo"] or 0) == 1), key=f"admin_usuario_alt_ativo_{int(row_alt['id'])}")
                     somente_leitura_alt = st.checkbox(
                         "Somente leitura (restrito por placa e abas)",
                         value=bool(int(row_alt["somente_leitura"] or 0) == 1),
-                        key="admin_usuario_alt_somente_leitura",
+                        key=f"admin_usuario_alt_somente_leitura_{int(row_alt['id'])}",
                     )
                     st.caption("Válido apenas quando o usuário não é administrador.")
                     placas_alt = st.multiselect(
@@ -3346,14 +3454,14 @@ with aba_usuarios:
                         apenas_placas,
                         default=[p for p in placas_atuais_alt if p in apenas_placas],
                         format_func=rotulo_placa_com_descricao,
-                        key="admin_usuario_alt_placas",
+                        key=f"admin_usuario_alt_placas_{int(row_alt['id'])}",
                     )
                     abas_alt = st.multiselect(
                         "Abas liberadas para este usuário",
                         [chave for chave, _ in ABAS_SISTEMA],
                         default=[a for a in abas_atuais_alt if a in dict(ABAS_SISTEMA)],
                         format_func=lambda chave: dict(ABAS_SISTEMA).get(chave, chave),
-                        key="admin_usuario_alt_abas",
+                        key=f"admin_usuario_alt_abas_{int(row_alt['id'])}",
                     )
                     if st.form_submit_button("✏️ Alterar usuário", type="primary"):
                         ok, msg = atualizar_usuario_sistema(
@@ -4874,11 +4982,82 @@ with aba2:
                     else:
                         r = reg_sel.iloc[0]
                         st.markdown("### ✏️ Editar Viagem Executada")
+
+                        ce4, ce5, ce6 = st.columns(3)
+                        origem_atual_ed = str(r["origem"] or "").strip()
+                        destino_atual_ed = str(r["destino"] or "").strip()
+                        opcoes_origem_ed = list(lista_cidades) if isinstance(lista_cidades, list) else []
+                        if origem_atual_ed and origem_atual_ed not in opcoes_origem_ed:
+                            opcoes_origem_ed = [origem_atual_ed] + opcoes_origem_ed
+                        idx_origem_ed = opcoes_origem_ed.index(origem_atual_ed) if origem_atual_ed in opcoes_origem_ed else 0
+                        origem_ed = ce4.selectbox("Origem", options=opcoes_origem_ed, index=idx_origem_ed, key=f"exec_origem_ed_{int(r['id'])}")
+
+                        opcoes_destino_ed = []
+                        if origem_ed:
+                            with conn() as c:
+                                rows_destino_ed = c.execute(
+                                    "SELECT destino FROM rotas WHERE origem=? UNION SELECT origem FROM rotas WHERE destino=?",
+                                    (origem_ed, origem_ed),
+                                ).fetchall()
+                            opcoes_destino_ed = sorted({
+                                str(row[0]).strip() for row in rows_destino_ed
+                                if row[0] and str(row[0]).strip() != origem_ed
+                            })
+                        destino_padrao_ed = destino_atual_ed if origem_ed == origem_atual_ed else None
+                        if destino_padrao_ed and destino_padrao_ed not in opcoes_destino_ed:
+                            opcoes_destino_ed = [destino_padrao_ed] + opcoes_destino_ed
+                        destino_key_ed = f"exec_destino_ed_{int(r['id'])}"
+                        if destino_key_ed not in st.session_state:
+                            st.session_state[destino_key_ed] = destino_padrao_ed
+                        elif st.session_state[destino_key_ed] not in opcoes_destino_ed:
+                            st.session_state[destino_key_ed] = destino_padrao_ed if destino_padrao_ed in opcoes_destino_ed else None
+                        destino_ed = ce5.selectbox(
+                            "Destino",
+                            options=opcoes_destino_ed,
+                            index=None,
+                            key=destino_key_ed,
+                        )
+                        if origem_ed and not opcoes_destino_ed:
+                            ce5.caption("Nenhuma rota cadastrada para esta origem em KM Rotas.")
+                        placa_atual_ed = str(r["veiculo_placa"] or "").strip()
+                        opcoes_veiculo_ed = list(lista_veiculos_full) if isinstance(lista_veiculos_full, list) else []
+                        rotulo_placa_manual = f"{placa_atual_ed} - (placa manual)" if placa_atual_ed else None
+                        if rotulo_placa_manual and rotulo_placa_manual not in opcoes_veiculo_ed:
+                            opcoes_veiculo_ed = [rotulo_placa_manual] + opcoes_veiculo_ed
+                        idx_veiculo_ed = 0
+                        for i_opt, opt_veic in enumerate(opcoes_veiculo_ed):
+                            if str(opt_veic).split(" - ")[0].strip().upper() == placa_atual_ed.upper():
+                                idx_veiculo_ed = i_opt
+                                break
+                        if opcoes_veiculo_ed:
+                            veic_sel_ed = ce6.selectbox(
+                                "Veículo",
+                                options=opcoes_veiculo_ed,
+                                index=idx_veiculo_ed,
+                                key=f"exec_veic_ed_{int(r['id'])}",
+                            )
+                            placa_ed = str(veic_sel_ed).split(" - ")[0].strip()
+                        else:
+                            placa_ed = ce6.text_input("Placa", value=placa_atual_ed)
+
                         with st.form("form_edicao_viagem_exec"):
                             ce1, ce2, ce3, ce4 = st.columns(4)
                             data_ed = ce1.date_input("Data carregamento", value=pd.to_datetime(r["data"], errors="coerce").date(), format="DD/MM/YYYY")
                             hora_carregamento_ed = ce2.text_input("Hora carregamento", value=str(r.get("hora_carregamento", "") or ""), placeholder="HH:MM")
-                            cliente_ed = ce3.text_input("Cliente", value=str(r["cliente"] or ""))
+                            cliente_atual_ed = str(r["cliente"] or "").strip()
+                            opcoes_cliente_ed = list(lista_clientes) if isinstance(lista_clientes, list) else []
+                            if cliente_atual_ed and cliente_atual_ed not in opcoes_cliente_ed:
+                                opcoes_cliente_ed = [cliente_atual_ed] + opcoes_cliente_ed
+                            if opcoes_cliente_ed:
+                                idx_cliente_ed = opcoes_cliente_ed.index(cliente_atual_ed) if cliente_atual_ed in opcoes_cliente_ed else 0
+                                cliente_ed = ce3.selectbox(
+                                    "Cliente",
+                                    options=opcoes_cliente_ed,
+                                    index=idx_cliente_ed,
+                                    key=f"exec_cliente_ed_{int(r['id'])}",
+                                )
+                            else:
+                                cliente_ed = ce3.text_input("Cliente", value=cliente_atual_ed)
                             nf_ed = ce4.text_input("N.NF", value=str(r["nf"] or ""))
                             ce_data1, ce_data2, ce_data3, ce_data4 = st.columns(4)
                             data_chegada_default = pd.to_datetime(r.get("data_chegada"), errors="coerce")
@@ -4940,40 +5119,6 @@ with aba2:
                             )
                             st.caption("Regra aplicada: as primeiras 24h da chegada não contam; depois, a estadia começa no próximo marco de 08:00 e soma 1 a cada novo dia às 08:00.")
 
-                            ce4, ce5, ce6 = st.columns(3)
-                            origem_atual_ed = str(r["origem"] or "").strip()
-                            destino_atual_ed = str(r["destino"] or "").strip()
-                            opcoes_origem_ed = list(lista_cidades) if isinstance(lista_cidades, list) else []
-                            opcoes_destino_ed = list(lista_cidades) if isinstance(lista_cidades, list) else []
-                            if origem_atual_ed and origem_atual_ed not in opcoes_origem_ed:
-                                opcoes_origem_ed = [origem_atual_ed] + opcoes_origem_ed
-                            if destino_atual_ed and destino_atual_ed not in opcoes_destino_ed:
-                                opcoes_destino_ed = [destino_atual_ed] + opcoes_destino_ed
-                            idx_origem_ed = opcoes_origem_ed.index(origem_atual_ed) if origem_atual_ed in opcoes_origem_ed else 0
-                            idx_destino_ed = opcoes_destino_ed.index(destino_atual_ed) if destino_atual_ed in opcoes_destino_ed else 0
-                            origem_ed = ce4.selectbox("Origem", options=opcoes_origem_ed, index=idx_origem_ed, key=f"exec_origem_ed_{int(r['id'])}")
-                            destino_ed = ce5.selectbox("Destino", options=opcoes_destino_ed, index=idx_destino_ed, key=f"exec_destino_ed_{int(r['id'])}")
-                            placa_atual_ed = str(r["veiculo_placa"] or "").strip()
-                            opcoes_veiculo_ed = list(lista_veiculos_full) if isinstance(lista_veiculos_full, list) else []
-                            rotulo_placa_manual = f"{placa_atual_ed} - (placa manual)" if placa_atual_ed else None
-                            if rotulo_placa_manual and rotulo_placa_manual not in opcoes_veiculo_ed:
-                                opcoes_veiculo_ed = [rotulo_placa_manual] + opcoes_veiculo_ed
-                            idx_veiculo_ed = 0
-                            for i_opt, opt_veic in enumerate(opcoes_veiculo_ed):
-                                if str(opt_veic).split(" - ")[0].strip().upper() == placa_atual_ed.upper():
-                                    idx_veiculo_ed = i_opt
-                                    break
-                            if opcoes_veiculo_ed:
-                                veic_sel_ed = ce6.selectbox(
-                                    "Veículo",
-                                    options=opcoes_veiculo_ed,
-                                    index=idx_veiculo_ed,
-                                    key=f"exec_veic_ed_{int(r['id'])}",
-                                )
-                                placa_ed = str(veic_sel_ed).split(" - ")[0].strip()
-                            else:
-                                placa_ed = ce6.text_input("Placa", value=placa_atual_ed)
-
                             ce7, ce8, ce9, ce10 = st.columns(4)
                             tipo_cobranca_ed = ce7.selectbox("Tipo Cálculo", ["TONELADA", "KM"], index=0 if str(r["tipo_cobranca"]).upper() != "KM" else 1)
                             km_ed = ce8.number_input("KM", min_value=0.0, value=float(r["km"] or 0.0), step=1.0)
@@ -5024,7 +5169,7 @@ with aba2:
                             btn_excluir_viagem = b2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
 
                         if btn_atualizar_viagem:
-                            if not origem_ed.strip() or not destino_ed.strip() or not placa_ed.strip():
+                            if not origem_ed.strip() or not str(destino_ed or "").strip() or not placa_ed.strip():
                                 st.warning("Preencha origem, destino e placa para atualizar.")
                             else:
                                 tipo_sql = str(tipo_cobranca_ed).upper().strip()
@@ -5088,12 +5233,29 @@ with aba2:
                                 st.rerun()
 
                         if btn_excluir_viagem:
-                            with conn() as c:
-                                c.execute("DELETE FROM viagens WHERE id=?", (int(st.session_state.viagens_exec_id_editando),))
-                            limpar_cache_viagens()
-                            alerta_gravado("✅ Viagem excluída com sucesso!")
-                            st.session_state.viagens_exec_id_editando = None
+                            st.session_state["viagem_exec_excluir_confirmar_id"] = int(st.session_state.viagens_exec_id_editando)
                             st.rerun()
+
+                        if st.session_state.get("viagem_exec_excluir_confirmar_id") == int(r["id"]):
+                            st.warning(f"Confirma a exclusão da viagem ID {int(r['id'])}? Essa ação não pode ser desfeita.")
+                            col_conf_exc, col_cancel_exc = st.columns(2)
+                            if col_conf_exc.button(
+                                "✅ Confirmar exclusão", type="primary", use_container_width=True,
+                                key=f"btn_viagem_exec_confirmar_exclusao_{int(r['id'])}",
+                            ):
+                                with conn() as c:
+                                    c.execute("DELETE FROM viagens WHERE id=?", (int(st.session_state.viagens_exec_id_editando),))
+                                limpar_cache_viagens()
+                                st.session_state["viagem_exec_excluir_confirmar_id"] = None
+                                alerta_gravado("✅ Viagem excluída com sucesso!")
+                                st.session_state.viagens_exec_id_editando = None
+                                st.rerun()
+                            if col_cancel_exc.button(
+                                "❌ Cancelar", use_container_width=True,
+                                key=f"btn_viagem_exec_cancelar_exclusao_{int(r['id'])}",
+                            ):
+                                st.session_state["viagem_exec_excluir_confirmar_id"] = None
+                                st.rerun()
 
                 c_h3, c_h4 = st.columns(2)
                 if c_h3.button("🖨️ Imprimir Estadias", use_container_width=True, key="btn_print_viagens_estadias"):
@@ -5948,8 +6110,9 @@ with aba4:
                     
                         if st.form_submit_button("💾 Gravar", key="btn_manut_entrada_gravar"):
                             with conn() as c:
-                                c.execute("""INSERT INTO manutencoes (data_entrada, veiculo_placa, oficina_id, defeito, km_servico, num_os) 
+                                c.execute("""INSERT INTO manutencoes (data_entrada, veiculo_placa, oficina_id, defeito, km_servico, num_os)
                                              VALUES (?,?,?,?,?,?)""", (d_e.isoformat(), v_m, dict_fornecedores_manutencao[o_m], def_m, k_m, num_os))
+                            limpar_cache_manutencao()
                             alerta_gravado()
                             st.rerun()
     
@@ -6050,6 +6213,7 @@ with aba4:
                                                VALUES (?, ?, ?, ?)""",
                                             (manut_id, anexo["nome_arquivo"], anexo["caminho_arquivo"], datetime.now().isoformat()),
                                         )
+                                limpar_cache_manutencao()
                                 alerta_gravado()
                                 st.rerun()
     
@@ -6058,16 +6222,7 @@ with aba4:
         st.subheader("📋 Histórico e Auditoria")
     
         # Filtros: fornecedor e placa
-        with conn() as c:
-            df_placas_manut = pd.read_sql(
-                """SELECT DISTINCT UPPER(TRIM(m.veiculo_placa)) as placa,
-                          COALESCE(v.descricao, '') as descricao
-                   FROM manutencoes m
-                   LEFT JOIN veiculos v ON UPPER(TRIM(v.placa)) = UPPER(TRIM(m.veiculo_placa))
-                   WHERE m.veiculo_placa IS NOT NULL AND TRIM(m.veiculo_placa) <> ''
-                   ORDER BY placa ASC""", c
-            )
-        df_placas_manut = filtrar_df_por_placas_liberadas(df_placas_manut, "placa")
+        df_placas_manut = filtrar_df_por_placas_liberadas(_carregar_placas_manutencao_raw(), "placa")
 
         # Monta dict label -> placa para o selectbox
         mapa_placa_manut = {}
@@ -6085,30 +6240,20 @@ with aba4:
             key="filtro_placa_manutencao",
         )
 
-        with conn() as c:
-            # Construir query com filtros opcionais de fornecedor e placa
-            query_base = """SELECT m.*, f.nome as fornecedor_nome FROM manutencoes m
-                            JOIN fornecedores f ON m.oficina_id = f.id
-                            WHERE m.data_entrada BETWEEN ? AND ?"""
-            params = [filtro_ini.isoformat(), filtro_fim.isoformat()]
+        df_m = _carregar_manutencoes_periodo_raw(filtro_ini.isoformat(), filtro_fim.isoformat()).copy()
 
-            if fornecedor_manut_selecionado != "Todos os fornecedores":
-                fornecedor_id = dict_fornecedores_manutencao[fornecedor_manut_selecionado]
-                query_base += " AND m.oficina_id = ?"
-                params.append(fornecedor_id)
+        if fornecedor_manut_selecionado != "Todos os fornecedores":
+            fornecedor_id = dict_fornecedores_manutencao[fornecedor_manut_selecionado]
+            df_m = df_m[df_m["oficina_id"] == fornecedor_id]
 
-            placas_manut_selecionadas = [
-                mapa_placa_manut[label]
-                for label in labels_placas_selecionadas
-                if label in mapa_placa_manut
-            ]
-            if placas_manut_selecionadas:
-                placeholders_placas = ",".join(["?"] * len(placas_manut_selecionadas))
-                query_base += f" AND UPPER(TRIM(m.veiculo_placa)) IN ({placeholders_placas})"
-                params.extend(placas_manut_selecionadas)
-
-            query_base += " ORDER BY m.data_entrada DESC"
-            df_m = pd.read_sql(query_base, c, params=params)
+        placas_manut_selecionadas = [
+            mapa_placa_manut[label]
+            for label in labels_placas_selecionadas
+            if label in mapa_placa_manut
+        ]
+        if placas_manut_selecionadas:
+            placas_manut_upper = {str(p).strip().upper() for p in placas_manut_selecionadas}
+            df_m = df_m[df_m["veiculo_placa"].fillna("").astype(str).str.strip().str.upper().isin(placas_manut_upper)]
         df_m = filtrar_df_por_placas_liberadas(df_m, "veiculo_placa")
 
         total_periodo_manut = 0.0
@@ -6581,6 +6726,7 @@ with aba4:
                                                VALUES (?, ?, ?, ?)""",
                                             (int(r["id"]), caminho["nome_arquivo"], caminho["caminho_arquivo"], datetime.now().isoformat()),
                                         )
+                                limpar_cache_manutencao()
                                 st.session_state[ed_key] = False
                                 st.rerun()
                             if b_col2.form_submit_button("❌ CANCELAR", use_container_width=True):
@@ -6673,13 +6819,25 @@ with aba5:
             if col_btn2.button("🔴 Excluir Oficinas Selecionadas", type="primary", key="btn_del_oficina"):
                 ids_para_excluir = df_ed_of[df_ed_of["Excluir"] == True]["id"].tolist()
                 if ids_para_excluir:
-                    with conn() as c:
-                        for id_of in ids_para_excluir:
-                            c.execute("DELETE FROM oficinas WHERE id=?", (id_of,))
-                    st.warning("Oficinas removidas.")
+                    st.session_state["oficinas_excluir_confirmar_ids"] = ids_para_excluir
                     st.rerun()
                 else:
                     st.info("Marque a lixeira (🗑️) das oficinas que deseja remover.")
+
+            if st.session_state.get("oficinas_excluir_confirmar_ids"):
+                qtd_of_excluir = len(st.session_state["oficinas_excluir_confirmar_ids"])
+                st.warning(f"Confirma a exclusão de {qtd_of_excluir} oficina(s)? Essa ação não pode ser desfeita.")
+                col_of_conf, col_of_cancel = st.columns(2)
+                if col_of_conf.button("✅ Confirmar exclusão", type="primary", use_container_width=True, key="btn_oficina_confirmar_exclusao"):
+                    with conn() as c:
+                        for id_of in st.session_state["oficinas_excluir_confirmar_ids"]:
+                            c.execute("DELETE FROM oficinas WHERE id=?", (id_of,))
+                    st.session_state["oficinas_excluir_confirmar_ids"] = None
+                    st.warning("Oficinas removidas.")
+                    st.rerun()
+                if col_of_cancel.button("❌ Cancelar", use_container_width=True, key="btn_oficina_cancelar_exclusao"):
+                    st.session_state["oficinas_excluir_confirmar_ids"] = None
+                    st.rerun()
         else:
             st.info("Nenhuma oficina cadastrada no sistema.")
 
@@ -6788,10 +6946,22 @@ with aba6:
                 if qtd_mov_cidade:
                     st.error(f"Não é possível excluir '{nome_cidade_excluir}': existem {qtd_mov_cidade} movimento(s) de viagem usando essa cidade.")
                 else:
+                    st.session_state["cidade_excluir_confirmar_id"] = int(id_cidade_excluir)
+                    st.rerun()
+
+            if st.session_state.get("cidade_excluir_confirmar_id") == id_cidade_excluir:
+                nome_cidade_confirmar = str(df_cidades.loc[df_cidades["id"] == id_cidade_excluir, "nome"].iloc[0])
+                st.warning(f"Confirma a exclusão da cidade '{nome_cidade_confirmar}'?")
+                col_cid_conf, col_cid_cancel = st.columns(2)
+                if col_cid_conf.button("✅ Confirmar exclusão", type="primary", use_container_width=True, key="btn_cidade_confirmar_exclusao"):
                     with conn() as c:
                         c.execute("DELETE FROM cidades WHERE id=?", (int(id_cidade_excluir),))
                     limpar_cache_bootstrap()
+                    st.session_state["cidade_excluir_confirmar_id"] = None
                     alerta_gravado("✅ Cidade excluída com sucesso!")
+                    st.rerun()
+                if col_cid_cancel.button("❌ Cancelar", use_container_width=True, key="btn_cidade_cancelar_exclusao"):
+                    st.session_state["cidade_excluir_confirmar_id"] = None
                     st.rerun()
         else:
             st.info("Nenhuma cidade cadastrada.")
@@ -7036,14 +7206,30 @@ with aba7:
                                    OR (origem = ? AND destino = ?)""",
                                 (r["origem"], r["destino"], r["destino"], r["origem"]),
                             ).fetchone()
-                            pode_excluir = check["total"] == 0
-                            if pode_excluir:
-                                c.execute("DELETE FROM rotas WHERE id=?", (int(st.session_state.rota_id_editando),))
-                        if not pode_excluir:
+                        if check["total"] > 0:
                             st.error("⚠️ Não foi possível excluir esta rota. Motivo: Existem fretes cadastrados usando esta rota no histórico.")
                         else:
+                            st.session_state["rota_excluir_confirmar_id"] = int(r["id"])
+                            st.rerun()
+
+                    if st.session_state.get("rota_excluir_confirmar_id") == int(r["id"]):
+                        st.warning(f"Confirma a exclusão da rota {r['origem']} → {r['destino']}?")
+                        col_rota_conf, col_rota_cancel = st.columns(2)
+                        if col_rota_conf.button(
+                            "✅ Confirmar exclusão", type="primary", use_container_width=True,
+                            key=f"btn_rota_confirmar_exclusao_{int(r['id'])}",
+                        ):
+                            with conn() as c:
+                                c.execute("DELETE FROM rotas WHERE id=?", (int(st.session_state.rota_id_editando),))
+                            st.session_state["rota_excluir_confirmar_id"] = None
                             alerta_gravado("✅ Rota excluída com sucesso!")
                             st.session_state.rota_id_editando = None
+                            st.rerun()
+                        if col_rota_cancel.button(
+                            "❌ Cancelar", use_container_width=True,
+                            key=f"btn_rota_cancelar_exclusao_{int(r['id'])}",
+                        ):
+                            st.session_state["rota_excluir_confirmar_id"] = None
                             st.rerun()
         else:
             st.info("Nenhuma rota cadastrada.")
@@ -7374,7 +7560,21 @@ with aba9:
                     placa_abs = str(veic_abs).split(" - ")[0].strip()
                 else:
                     placa_abs = col_b.text_input("Placa", value=abs_placa_default, key=f"abs_placa_manual_incluir_{abs_form_nonce}").upper().strip()
-                local_abs = col_c.text_input("Local do Abastecimento", value=str(abs_form_defaults.get("local") or ""), key=f"abs_local_incluir_{abs_form_nonce}")
+                local_padrao_abs = str(abs_form_defaults.get("local") or "").strip()
+                opcoes_local_abs = [str(f["nome"]).strip() for f in fornecedores_db if str(f.get("nome") or "").strip()]
+                if local_padrao_abs and local_padrao_abs not in opcoes_local_abs:
+                    opcoes_local_abs = [local_padrao_abs] + opcoes_local_abs
+                if opcoes_local_abs:
+                    idx_local_abs = opcoes_local_abs.index(local_padrao_abs) if local_padrao_abs in opcoes_local_abs else None
+                    local_abs = col_c.selectbox(
+                        "Local do Abastecimento",
+                        options=opcoes_local_abs,
+                        index=idx_local_abs,
+                        placeholder="Selecione o fornecedor",
+                        key=f"abs_local_incluir_{abs_form_nonce}",
+                    )
+                else:
+                    local_abs = col_c.text_input("Local do Abastecimento", value=local_padrao_abs, key=f"abs_local_incluir_{abs_form_nonce}")
                 doc_nf_abs = col_d.text_input("Documento / NF", value=str(abs_form_defaults.get("doc_nf") or ""), key=f"abs_doc_nf_incluir_{abs_form_nonce}")
 
                 col_e, col_f, col_g, col_h, col_i = st.columns(5)
@@ -7412,7 +7612,7 @@ with aba9:
                         st.session_state["abs_focus_label"] = "Placa"
                         st.session_state["abs_expandir_cadastro"] = True
                         st.rerun()
-                    elif not local_abs.strip():
+                    elif not str(local_abs or "").strip():
                         st.session_state["abs_validacao_msg"] = "Informe o local do abastecimento para incluir o registro."
                         st.session_state["abs_focus_label"] = "Local do Abastecimento"
                         st.session_state["abs_expandir_cadastro"] = True
@@ -7458,15 +7658,7 @@ with aba9:
 
         st.markdown("---")
     
-        with conn() as c:
-            df_abs = pd.read_sql(
-                """SELECT *
-                   FROM abastecimentos
-                   WHERE date(data) BETWEEN ? AND ?
-                   ORDER BY date(data) ASC, id ASC""",
-                c,
-                params=(filtro_ini.isoformat(), filtro_fim.isoformat()),
-            )
+        df_abs = _carregar_abastecimentos_periodo_raw(filtro_ini.isoformat(), filtro_fim.isoformat())
         df_abs = filtrar_df_por_placas_liberadas(df_abs, "veiculo_placa")
 
         if not df_abs.empty:
@@ -7509,14 +7701,12 @@ with aba9:
             filtro_tipos_abs = f_abs_tipo.multiselect(
                 "Filtrar por tipo de combustível",
                 options=tipos_filtro_abs,
-                default=tipos_filtro_abs,
                 help="Por padrão, todos os tipos ficam selecionados.",
                 key="filtro_tipos_abastecimento",
             )
             filtro_locais_abs = f_abs_local.multiselect(
                 "Filtrar por local/posto",
                 options=locais_filtro_abs,
-                default=locais_filtro_abs,
                 help="Por padrão, todos os locais ficam selecionados.",
                 key="filtro_locais_abastecimento",
             )
@@ -7795,7 +7985,20 @@ with aba9:
                                 placa_ed_abs = str(veic_abs_ed).split(" - ")[0].strip().upper()
                             else:
                                 placa_ed_abs = c2.text_input("Placa", value=placa_atual_abs).upper().strip()
-                            local_ed = c3.text_input("Local do Abastecimento", value=str(r["local"] or ""))
+                            local_atual_ed_abs = str(r["local"] or "").strip()
+                            opcoes_local_ed_abs = [str(f["nome"]).strip() for f in fornecedores_db if str(f.get("nome") or "").strip()]
+                            if local_atual_ed_abs and local_atual_ed_abs not in opcoes_local_ed_abs:
+                                opcoes_local_ed_abs = [local_atual_ed_abs] + opcoes_local_ed_abs
+                            if opcoes_local_ed_abs:
+                                idx_local_ed_abs = opcoes_local_ed_abs.index(local_atual_ed_abs) if local_atual_ed_abs in opcoes_local_ed_abs else 0
+                                local_ed = c3.selectbox(
+                                    "Local do Abastecimento",
+                                    options=opcoes_local_ed_abs,
+                                    index=idx_local_ed_abs,
+                                    key=f"abs_local_ed_{int(st.session_state.abastecimento_id_editando)}",
+                                )
+                            else:
+                                local_ed = c3.text_input("Local do Abastecimento", value=local_atual_ed_abs)
                             doc_nf_ed = c4.text_input("Documento / NF", value=str(r["doc_nf"] or ""))
 
                             c5, c6, c7, c8, c9 = st.columns(5)
@@ -7867,16 +8070,35 @@ with aba9:
                                             int(st.session_state.abastecimento_id_editando),
                                         ),
                                     )
+                                limpar_cache_app()
                                 alerta_gravado()
                                 st.session_state.abastecimento_id_editando = None
                                 st.rerun()
 
                         if btn_excluir:
-                            with conn() as c:
-                                c.execute("DELETE FROM abastecimentos WHERE id=?", (int(st.session_state.abastecimento_id_editando),))
-                            alerta_gravado("✅ Abastecimento excluído com sucesso!")
-                            st.session_state.abastecimento_id_editando = None
+                            st.session_state["abastecimento_excluir_confirmar_id"] = int(st.session_state.abastecimento_id_editando)
                             st.rerun()
+
+                        if st.session_state.get("abastecimento_excluir_confirmar_id") == int(r["id"]):
+                            st.warning("Confirma a exclusão deste abastecimento?")
+                            col_abs_conf, col_abs_cancel = st.columns(2)
+                            if col_abs_conf.button(
+                                "✅ Confirmar exclusão", type="primary", use_container_width=True,
+                                key=f"btn_abastecimento_confirmar_exclusao_{int(r['id'])}",
+                            ):
+                                with conn() as c:
+                                    c.execute("DELETE FROM abastecimentos WHERE id=?", (int(st.session_state.abastecimento_id_editando),))
+                                limpar_cache_app()
+                                st.session_state["abastecimento_excluir_confirmar_id"] = None
+                                alerta_gravado("✅ Abastecimento excluído com sucesso!")
+                                st.session_state.abastecimento_id_editando = None
+                                st.rerun()
+                            if col_abs_cancel.button(
+                                "❌ Cancelar", use_container_width=True,
+                                key=f"btn_abastecimento_cancelar_exclusao_{int(r['id'])}",
+                            ):
+                                st.session_state["abastecimento_excluir_confirmar_id"] = None
+                                st.rerun()
         else:
             st.info("Sem abastecimentos no período filtrado.")
 
@@ -8566,6 +8788,7 @@ with aba13:
                                     updated_tipos = c.execute("UPDATE tipos_servico_troca SET nome=? WHERE nome=?", (novo_nome_clean, tipo_servico_para_alterar)).rowcount
                                     updated_controle = c.execute("UPDATE controle_trocas SET tipo_servico=? WHERE tipo_servico=?", (novo_nome_clean, tipo_servico_para_alterar)).rowcount
                                     if updated_tipos > 0:
+                                        limpar_cache_trocas()
                                         alerta_gravado(f"✅ Tipo de serviço alterado com sucesso. ({updated_tipos} tipo(s), {updated_controle} movimento(s) atualizados)")
                                         alterou_tipo_servico = True
                                     else:
@@ -8608,14 +8831,13 @@ with aba13:
                         c.execute("""INSERT INTO controle_trocas (tipo_servico, data_servico, veiculo_placa, descricao_veiculo, km_atual, km_proxima, detalhes, data_vencimento, dias_alerta) 
                                      VALUES (?,?,?,?,?,?,?,?,?)""", 
                                   (serv_t, dt_t.isoformat(), placa_t, descricao_t, km_t, km_prox, det_t, dt_venc_t.isoformat(), int(dias_alerta_t)))
+                    limpar_cache_trocas()
                     alerta_gravado()
                     st.rerun()
 
         with col_hist:
             st.markdown("### 📋 Histórico de Trocas")
-            with conn() as c:
-                df_t = pd.read_sql("SELECT * FROM controle_trocas ORDER BY data_servico DESC", c)
-            df_t = filtrar_df_por_placas_liberadas(df_t, "veiculo_placa")
+            df_t = filtrar_df_por_placas_liberadas(_carregar_controle_trocas_raw(), "veiculo_placa")
 
             if not df_t.empty:
                 df_t["veiculo_label_filtro"] = df_t.apply(
@@ -8685,7 +8907,27 @@ with aba13:
                                 st.session_state[ed_key_t] = True
                                 st.rerun()
                             if b2.button("🗑️ EXCLUIR", key=f"btn_del_t_{r['id']}", type="primary", use_container_width=True):
-                                with conn() as c: c.execute("DELETE FROM controle_trocas WHERE id=?", (r['id'],))
+                                st.session_state["troca_excluir_confirmar_id"] = int(r["id"])
+                                st.rerun()
+
+                        if st.session_state.get("troca_excluir_confirmar_id") == int(r["id"]):
+                            st.warning("Confirma a exclusão deste registro de troca?")
+                            col_troca_conf, col_troca_cancel = st.columns(2)
+                            if col_troca_conf.button(
+                                "✅ Confirmar exclusão", type="primary", use_container_width=True,
+                                key=f"btn_troca_confirmar_exclusao_{int(r['id'])}",
+                            ):
+                                with conn() as c:
+                                    c.execute("DELETE FROM controle_trocas WHERE id=?", (int(r["id"]),))
+                                limpar_cache_trocas()
+                                st.session_state["troca_excluir_confirmar_id"] = None
+                                alerta_gravado("✅ Registro excluído com sucesso!")
+                                st.rerun()
+                            if col_troca_cancel.button(
+                                "❌ Cancelar", use_container_width=True,
+                                key=f"btn_troca_cancelar_exclusao_{int(r['id'])}",
+                            ):
+                                st.session_state["troca_excluir_confirmar_id"] = None
                                 st.rerun()
                         else:
                             # --- EDIÇÃO ---
@@ -8737,6 +8979,7 @@ with aba13:
                                                      tipo_servico=?, data_servico=?, veiculo_placa=?, descricao_veiculo=?, km_atual=?, km_proxima=?, detalhes=?, data_vencimento=?, dias_alerta=? 
                                                      WHERE id=?""", 
                                                   (new_serv, new_dt_s.isoformat(), new_placa, new_desc, new_km_a, new_km_p, new_det, new_dt_v.isoformat(), int(new_dias_alerta), r['id']))
+                                    limpar_cache_trocas()
                                     st.session_state[ed_key_t] = False
                                     alerta_gravado()
                                     st.rerun()
@@ -9190,7 +9433,8 @@ with aba15:
 
             with st.form("form_fornecedor", clear_on_submit=True):
                 c1, c2, c3 = st.columns(3)
-                cod_forn = c1.text_input("Código Fornecedor", value=proximo_codigo).strip().upper()
+                c1.text_input("Código Fornecedor", value=proximo_codigo, disabled=True, help="Gerado automaticamente (auto incremento).")
+                cod_forn = proximo_codigo
                 nome_forn = c2.text_input("Nome do Fornecedor").strip()
                 cnpj_forn = c3.text_input("CNPJ").strip()
 
@@ -9320,23 +9564,41 @@ with aba15:
                 if not ids_excluir_forn:
                     st.warning("Marque pelo menos um fornecedor na coluna Excluir.")
                 else:
+                    st.session_state["fornecedores_excluir_confirmar_ids"] = ids_excluir_forn
+                    st.rerun()
+
+            if st.session_state.get("fornecedores_excluir_confirmar_ids"):
+                qtd_forn_excluir = len(st.session_state["fornecedores_excluir_confirmar_ids"])
+                st.warning(f"Confirma a exclusão de {qtd_forn_excluir} fornecedor(es)? Essa ação não pode ser desfeita.")
+                col_forn_conf, col_forn_cancel = st.columns(2)
+                if col_forn_conf.button("✅ Confirmar exclusão", type="primary", use_container_width=True, key="btn_fornecedor_confirmar_exclusao"):
                     bloqueados = []
                     excluidos = 0
                     with conn() as c:
-                        for _, r in df_forn_ed2[df_forn_ed2["Excluir"] == True].iterrows():
-                            fornecedor_id = int(r["id"])
+                        for fornecedor_id in st.session_state["fornecedores_excluir_confirmar_ids"]:
+                            fornecedor_id = int(fornecedor_id)
                             usos = movimentos_fornecedor(c, fornecedor_id)
+                            linha_forn = df_forn_ed2[df_forn_ed2["id"] == fornecedor_id]
+                            rotulo_forn = (
+                                f"{linha_forn.iloc[0]['codigo']} - {linha_forn.iloc[0]['nome']}"
+                                if not linha_forn.empty else f"ID {fornecedor_id}"
+                            )
                             if usos:
-                                bloqueados.append(f"{r['codigo']} - {r['nome']} ({'; '.join(usos)})")
+                                bloqueados.append(f"{rotulo_forn} ({'; '.join(usos)})")
                                 continue
                             c.execute("DELETE FROM fornecedores WHERE id=?", (fornecedor_id,))
                             excluidos += 1
 
                     limpar_cache_bootstrap()
+                    st.session_state["fornecedores_excluir_confirmar_ids"] = None
                     if excluidos:
                         st.success(f"{excluidos} fornecedor(es) deletado(s) com sucesso.")
                     if bloqueados:
                         st.warning("Não foi possível deletar fornecedor(es) com movimento: " + " | ".join(bloqueados))
+                    st.rerun()
+                if col_forn_cancel.button("❌ Cancelar", use_container_width=True, key="btn_fornecedor_cancelar_exclusao"):
+                    st.session_state["fornecedores_excluir_confirmar_ids"] = None
+                    st.rerun()
                     st.rerun()
 
     # =========================
@@ -10159,20 +10421,26 @@ with aba22:
             st.success(_msg_clientes)
             st.toast(_msg_clientes, icon="✅")
 
-        with st.form("cli_f", clear_on_submit=True):
-            desc_cli = st.text_input("Descrição Cliente").strip().upper()
-            if st.form_submit_button("💾 Gravar", key="btn_cliente_cadastro_gravar"):
-                if not desc_cli:
-                    st.warning("Informe a descrição do cliente.")
-                else:
-                    with conn() as c:
-                        cur_cliente = c.execute("INSERT OR IGNORE INTO clientes (descricao) VALUES (?)", (desc_cli,))
-                    if cur_cliente.rowcount == 0:
-                        st.warning("Esse cliente já está cadastrado.")
+        if "cliente_id_editando" not in st.session_state:
+            st.session_state.cliente_id_editando = None
+
+        if st.session_state.cliente_id_editando is None:
+            with st.form("cli_f", clear_on_submit=True):
+                desc_cli = st.text_input("Descrição Cliente", key="cli_desc_novo").strip().upper()
+                if st.form_submit_button("💾 Gravar", key="btn_cliente_cadastro_gravar"):
+                    if not desc_cli:
+                        st.warning("Informe a descrição do cliente.")
                     else:
-                        limpar_cache_bootstrap()
-                        st.session_state.msg_clientes = "✅ Gravado com sucesso!"
-                        st.rerun()
+                        with conn() as c:
+                            cur_cliente = c.execute("INSERT OR IGNORE INTO clientes (descricao) VALUES (?)", (desc_cli,))
+                        if cur_cliente.rowcount == 0:
+                            st.warning("Esse cliente já está cadastrado.")
+                        else:
+                            limpar_cache_bootstrap()
+                            st.session_state.msg_clientes = "✅ Gravado com sucesso!"
+                            st.rerun()
+        else:
+            st.info("✏️ Você está editando um cliente. Finalize ou cancele a edição abaixo para cadastrar um novo.")
 
         with conn() as c:
             df_clientes = pd.read_sql("SELECT id, descricao FROM clientes ORDER BY descricao", c)
@@ -10185,9 +10453,6 @@ with aba22:
                 use_container_width=True,
                 hide_index=True,
             )
-
-            if "cliente_id_editando" not in st.session_state:
-                st.session_state.cliente_id_editando = None
 
             id_cliente_sel = st.selectbox(
                 "Escolha um cliente para editar",
@@ -10212,7 +10477,11 @@ with aba22:
                     r_cli = reg_sel_cli.iloc[0]
                     st.markdown("### ✏️ Editar Cliente")
                     with st.form("form_edicao_cliente"):
-                        desc_cli_ed = st.text_input("Descrição Cliente", value=str(r_cli["descricao"] or "")).strip().upper()
+                        desc_cli_ed = st.text_input(
+                            "Descrição Cliente",
+                            value=str(r_cli["descricao"] or ""),
+                            key=f"cliente_desc_ed_{int(r_cli['id'])}",
+                        ).strip().upper()
                         b_cli1, b_cli2 = st.columns(2)
                         btn_atualizar_cliente = b_cli1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
                         btn_excluir_cliente = b_cli2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
@@ -10240,11 +10509,22 @@ with aba22:
                                 st.error("Já existe outro cliente com essa descrição.")
 
                     if btn_excluir_cliente:
-                        with conn() as c:
-                            c.execute("DELETE FROM clientes WHERE id=?", (int(st.session_state.cliente_id_editando),))
-                        alerta_gravado("✅ Cliente excluído com sucesso!")
-                        st.session_state.cliente_id_editando = None
+                        st.session_state["cliente_excluir_confirmar_id"] = int(st.session_state.cliente_id_editando)
                         st.rerun()
+
+                    if st.session_state.get("cliente_excluir_confirmar_id") == int(r_cli["id"]):
+                        st.warning(f"Confirma a exclusão do cliente '{r_cli['descricao']}'?")
+                        col_cli_conf, col_cli_cancel = st.columns(2)
+                        if col_cli_conf.button("✅ Confirmar exclusão", type="primary", use_container_width=True, key="btn_cliente_confirmar_exclusao"):
+                            with conn() as c:
+                                c.execute("DELETE FROM clientes WHERE id=?", (int(st.session_state.cliente_id_editando),))
+                            st.session_state["cliente_excluir_confirmar_id"] = None
+                            alerta_gravado("✅ Cliente excluído com sucesso!")
+                            st.session_state.cliente_id_editando = None
+                            st.rerun()
+                        if col_cli_cancel.button("❌ Cancelar", use_container_width=True, key="btn_cliente_cancelar_exclusao"):
+                            st.session_state["cliente_excluir_confirmar_id"] = None
+                            st.rerun()
 
     else:
         st.info("🔒 Você não tem permissão para visualizar esta aba.")
@@ -10257,20 +10537,26 @@ with aba23:
             st.success(_msg_categorias)
             st.toast(_msg_categorias, icon="✅")
 
-        with st.form("cat_f", clear_on_submit=True):
-            desc_cat = st.text_input("Descrição Categoria").strip()
-            if st.form_submit_button("💾 Gravar", key="btn_categoria_cadastro_gravar"):
-                if not desc_cat:
-                    st.warning("Informe a descrição da categoria.")
-                else:
-                    with conn() as c:
-                        cur_categoria = c.execute("INSERT OR IGNORE INTO categorias (descricao) VALUES (?)", (desc_cat,))
-                    if cur_categoria.rowcount == 0:
-                        st.warning("Essa categoria já está cadastrada.")
+        if "categoria_id_editando" not in st.session_state:
+            st.session_state.categoria_id_editando = None
+
+        if st.session_state.categoria_id_editando is None:
+            with st.form("cat_f", clear_on_submit=True):
+                desc_cat = st.text_input("Descrição Categoria", key="cat_desc_novo").strip()
+                if st.form_submit_button("💾 Gravar", key="btn_categoria_cadastro_gravar"):
+                    if not desc_cat:
+                        st.warning("Informe a descrição da categoria.")
                     else:
-                        limpar_cache_bootstrap()
-                        st.session_state.msg_categorias = "✅ Gravado com sucesso!"
-                        st.rerun()
+                        with conn() as c:
+                            cur_categoria = c.execute("INSERT OR IGNORE INTO categorias (descricao) VALUES (?)", (desc_cat,))
+                        if cur_categoria.rowcount == 0:
+                            st.warning("Essa categoria já está cadastrada.")
+                        else:
+                            limpar_cache_bootstrap()
+                            st.session_state.msg_categorias = "✅ Gravado com sucesso!"
+                            st.rerun()
+        else:
+            st.info("✏️ Você está editando uma categoria. Finalize ou cancele a edição abaixo para cadastrar uma nova.")
 
         with conn() as c:
             df_categorias = pd.read_sql("SELECT id, descricao FROM categorias ORDER BY descricao", c)
@@ -10283,9 +10569,6 @@ with aba23:
                 use_container_width=True,
                 hide_index=True,
             )
-
-            if "categoria_id_editando" not in st.session_state:
-                st.session_state.categoria_id_editando = None
 
             id_categoria_sel = st.selectbox(
                 "Escolha uma categoria para editar",
@@ -10301,12 +10584,25 @@ with aba23:
                 st.session_state.categoria_id_editando = None
                 st.rerun()
             if c_cat3.button("🗑️ Excluir", key="btn_categoria_excluir_direto", use_container_width=True):
-                with conn() as c:
-                    c.execute("DELETE FROM categorias WHERE id=?", (int(id_categoria_sel),))
-                limpar_cache_bootstrap()
-                st.session_state.categoria_id_editando = None
-                alerta_gravado("✅ Categoria excluída com sucesso!")
+                st.session_state["categoria_excluir_confirmar_id"] = int(id_categoria_sel)
                 st.rerun()
+
+            if st.session_state.get("categoria_excluir_confirmar_id") in df_categorias["id"].tolist():
+                id_cat_confirmar = st.session_state["categoria_excluir_confirmar_id"]
+                nome_cat_confirmar = df_categorias.loc[df_categorias["id"] == id_cat_confirmar, "descricao"].iloc[0]
+                st.warning(f"Confirma a exclusão da categoria '{nome_cat_confirmar}'?")
+                col_cat_conf, col_cat_cancel = st.columns(2)
+                if col_cat_conf.button("✅ Confirmar exclusão", type="primary", use_container_width=True, key="btn_categoria_confirmar_exclusao"):
+                    with conn() as c:
+                        c.execute("DELETE FROM categorias WHERE id=?", (int(id_cat_confirmar),))
+                    limpar_cache_bootstrap()
+                    st.session_state["categoria_excluir_confirmar_id"] = None
+                    st.session_state.categoria_id_editando = None
+                    alerta_gravado("✅ Categoria excluída com sucesso!")
+                    st.rerun()
+                if col_cat_cancel.button("❌ Cancelar", use_container_width=True, key="btn_categoria_cancelar_exclusao"):
+                    st.session_state["categoria_excluir_confirmar_id"] = None
+                    st.rerun()
 
             if st.session_state.categoria_id_editando is not None:
                 reg_sel_cat = df_categorias[df_categorias["id"] == st.session_state.categoria_id_editando]
@@ -10317,7 +10613,11 @@ with aba23:
                     r_cat = reg_sel_cat.iloc[0]
                     st.markdown("### ✏️ Editar Categoria")
                     with st.form("form_edicao_categoria"):
-                        desc_cat_ed = st.text_input("Descrição Categoria", value=str(r_cat["descricao"] or "")).strip()
+                        desc_cat_ed = st.text_input(
+                            "Descrição Categoria",
+                            value=str(r_cat["descricao"] or ""),
+                            key=f"categoria_desc_ed_{int(r_cat['id'])}",
+                        ).strip()
                         b_cat1, b_cat2 = st.columns(2)
                         btn_atualizar_categoria = b_cat1.form_submit_button("💾 Atualizar", use_container_width=True, type="primary")
                         btn_excluir_categoria = b_cat2.form_submit_button("🗑️ Excluir Registro", use_container_width=True)
@@ -10336,7 +10636,7 @@ with aba23:
                                     if desc_cat_ed != desc_antiga_cat:
                                         c.execute("UPDATE contas_pagar SET categoria=? WHERE categoria=?", (desc_cat_ed, desc_antiga_cat))
                                         c.execute("UPDATE contas_receber SET categoria=? WHERE categoria=?", (desc_cat_ed, desc_antiga_cat))
-                                limpar_cache_bootstrap()
+                                limpar_cache_app()
                                 alerta_gravado()
                                 st.session_state.categoria_id_editando = None
                                 st.rerun()
@@ -10344,11 +10644,7 @@ with aba23:
                                 st.error("Já existe outra categoria com essa descrição.")
 
                     if btn_excluir_categoria:
-                        with conn() as c:
-                            c.execute("DELETE FROM categorias WHERE id=?", (int(st.session_state.categoria_id_editando),))
-                        limpar_cache_bootstrap()
-                        alerta_gravado("✅ Categoria excluída com sucesso!")
-                        st.session_state.categoria_id_editando = None
+                        st.session_state["categoria_excluir_confirmar_id"] = int(st.session_state.categoria_id_editando)
                         st.rerun()
 
     # =========================
@@ -10530,10 +10826,7 @@ with aba17:
             st.success(_cp_flash_msg)
             st.toast(_cp_flash_msg, icon="✅")
 
-        with conn() as c:
-            df_cp = pd.read_sql(
-                "SELECT * FROM contas_pagar ORDER BY data_vencimento ASC, id DESC", c
-            )
+        df_cp = _carregar_contas_pagar_raw()
         df_cp = filtrar_df_por_placas_liberadas(df_cp, "veiculo_placa")
 
         df_cp = _garantir_colunas(df_cp, {
@@ -10589,7 +10882,14 @@ with aba17:
                 st.markdown("**Dados da Conta**")
                 fa1, fa2 = st.columns(2)
                 cp_descricao = fa1.text_input("Descrição *", placeholder="Ex: Pagamento seguro caminhão").strip()
-                cp_fornecedor = fa2.text_input("Fornecedor / Beneficiário", placeholder="Ex: Seguradora XYZ").strip()
+                opcoes_fornecedor_cp = [str(f["nome"]).strip() for f in fornecedores_db if str(f.get("nome") or "").strip()]
+                cp_fornecedor = fa2.selectbox(
+                    "Fornecedor / Beneficiário",
+                    options=opcoes_fornecedor_cp,
+                    index=None,
+                    placeholder="Selecione o fornecedor",
+                    key="cp_fornecedor_form",
+                ) or ""
 
                 fb1, fb2, fb3 = st.columns(3)
                 cp_categoria = fb1.selectbox("Categoria", CATEGORIAS_CP)
@@ -10673,13 +10973,15 @@ with aba17:
             if cp_filtro_valor_txt and cp_filtro_valor is None:
                 st.warning("Informe um valor válido para filtrar em Contas a Pagar.")
 
-            df_cp_f = df_cp.copy()
+            df_cp_status_sel = df_cp.copy()
             if "Pendentes" in cp_filtro_status:
-                df_cp_f = df_cp_f[df_cp_f["status"] == "PENDENTE"]
+                df_cp_status_sel = df_cp_status_sel[df_cp_status_sel["status"] == "PENDENTE"]
             elif "Vencidas" in cp_filtro_status:
-                df_cp_f = df_cp_f[df_cp_f["status"] == "VENCIDO"]
+                df_cp_status_sel = df_cp_status_sel[df_cp_status_sel["status"] == "VENCIDO"]
             elif "Pagas" in cp_filtro_status:
-                df_cp_f = df_cp_f[df_cp_f["status"] == "PAGO"]
+                df_cp_status_sel = df_cp_status_sel[df_cp_status_sel["status"] == "PAGO"]
+
+            df_cp_f = df_cp_status_sel.copy()
             if cp_filtro_cat != "Todas":
                 df_cp_f = df_cp_f[df_cp_f["categoria"] == cp_filtro_cat]
             mask_cp_venc = df_cp_f["data_vencimento"].apply(
@@ -10785,7 +11087,90 @@ with aba17:
                 )
                 components.html(html_cp_print, height=1000, scrolling=True)
 
+            st.markdown("---")
+            st.markdown("#### 🔁 Replicar Lançamentos para o Próximo Mês")
+            st.caption(
+                "Marque os lançamentos que se repetem todo mês (aluguel, salário, seguro, etc.) e replique de uma vez só. "
+                "As datas de Emissão e Vencimento avançam 1 mês; os demais dados (valor, categoria, fornecedor, placa) são copiados iguais "
+                "e o novo lançamento entra como pendente (sem data de pagamento)."
+            )
+            st.caption(f"Mostrando apenas os lançamentos com status **{cp_filtro_status}** (independente dos demais filtros acima).")
+            mapa_cp_replica = {
+                (
+                    f"ID {int(r['id'])} | {str(r.get('descricao') or '')} | Venc. "
+                    f"{r['data_vencimento'].strftime('%d/%m/%Y') if pd.notna(r['data_vencimento']) else '-'} | {brl(float(r.get('valor') or 0))}"
+                ): int(r["id"])
+                for _, r in df_cp_status_sel.sort_values(by="id", ascending=False).iterrows()
+            }
+            cp_replica_sel = st.multiselect(
+                "Marque os lançamentos para replicar",
+                options=list(mapa_cp_replica.keys()),
+                key="cp_replica_marcados",
+            )
+            if st.button("🔁 Replicar Marcados para o Próximo Mês", key="btn_cp_replicar_marcados", use_container_width=True):
+                if not cp_replica_sel:
+                    st.warning("Marque pelo menos um lançamento para replicar.")
+                else:
+                    ids_cp_replica = [mapa_cp_replica[x] for x in cp_replica_sel]
+                    novos_ids_cp = []
+                    with conn() as c:
+                        placeholders_cp_replica = ",".join(["?"] * len(ids_cp_replica))
+                        linhas_replica_cp = c.execute(
+                            f"SELECT * FROM contas_pagar WHERE id IN ({placeholders_cp_replica})",
+                            ids_cp_replica,
+                        ).fetchall()
+                        for linha_raw in linhas_replica_cp:
+                            linha = dict(linha_raw)
+                            nova_emissao = somar_um_mes(linha.get("data_emissao"))
+                            nova_vencimento = somar_um_mes(linha.get("data_vencimento"))
+                            c.execute(
+                                """INSERT INTO contas_pagar
+                                   (descricao, fornecedor, categoria, n_documento, data_emissao,
+                                    data_vencimento, valor, data_pagamento, forma_pagamento, observacao, data_cadastro, veiculo_placa)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    linha.get("descricao"),
+                                    linha.get("fornecedor"),
+                                    linha.get("categoria"),
+                                    linha.get("n_documento"),
+                                    nova_emissao.isoformat() if nova_emissao else None,
+                                    nova_vencimento.isoformat() if nova_vencimento else None,
+                                    linha.get("valor"),
+                                    None,
+                                    linha.get("forma_pagamento"),
+                                    linha.get("observacao"),
+                                    datetime.now().isoformat(),
+                                    linha.get("veiculo_placa"),
+                                ),
+                            )
+                            novos_ids_cp.append(int(c.execute("SELECT last_insert_rowid()").fetchone()[0]))
+
+                    # Confere no banco se os novos lançamentos realmente foram gravados antes de avisar sucesso
+                    qtd_confirmada_cp = 0
+                    if novos_ids_cp:
+                        with conn() as c:
+                            placeholders_verif_cp = ",".join(["?"] * len(novos_ids_cp))
+                            qtd_confirmada_cp = c.execute(
+                                f"SELECT COUNT(*) FROM contas_pagar WHERE id IN ({placeholders_verif_cp})",
+                                novos_ids_cp,
+                            ).fetchone()[0]
+
+                    if qtd_confirmada_cp > 0 and qtd_confirmada_cp == len(ids_cp_replica):
+                        alerta_gravado(f"✅ {qtd_confirmada_cp} lançamento(s) replicado(s) com sucesso para o próximo mês!")
+                        st.rerun()
+                    elif qtd_confirmada_cp > 0:
+                        limpar_cache_app()
+                        st.warning(
+                            f"⚠️ Apenas {qtd_confirmada_cp} de {len(ids_cp_replica)} lançamento(s) foram gravados. "
+                            "Confira a lista abaixo e replique novamente os que faltaram, se necessário."
+                        )
+                        st.rerun()
+                    else:
+                        st.error("❌ Não foi possível confirmar a gravação dos lançamentos replicados. Nada foi salvo — tente novamente.")
+
+            st.markdown("---")
             st.markdown("#### ⚡ Gerenciar Lançamento")
+            st.caption(f"Mostrando apenas os lançamentos com status **{cp_filtro_status}** (independente dos demais filtros acima).")
             if "cp_editando_id" not in st.session_state:
                 st.session_state.cp_editando_id = None
             if "cp_duplicando_id" not in st.session_state:
@@ -10793,7 +11178,7 @@ with aba17:
 
             opcoes_cp_sel = {
                 f"ID {int(r['id'])} | {_CP_STATUS_ICON.get(r['status'], r['status'])} | {str(r.get('descricao') or '')} | Venc. {r['data_vencimento'].strftime('%d/%m/%Y') if pd.notna(r['data_vencimento']) else '-'} | {brl(float(r.get('valor') or 0))}": int(r["id"])
-                for _, r in df_cp_f.iterrows()
+                for _, r in df_cp_status_sel.sort_values("data_emissao", na_position="last").iterrows()
             }
             cp_sel_label = st.selectbox(
                 "Selecione um lançamento:",
@@ -10880,7 +11265,17 @@ with aba17:
                     with st.form(f"form_dup_cp_{cp_id_sel}"):
                         d1, d2 = st.columns(2)
                         cp_d_desc = d1.text_input("Descrição", value=cp_row.get("descricao") or "").strip()
-                        cp_d_forn = d2.text_input("Fornecedor", value=cp_row.get("fornecedor") or "").strip()
+                        cp_d_forn_atual = str(cp_row.get("fornecedor") or "").strip()
+                        opcoes_forn_dup_cp = [str(f["nome"]).strip() for f in fornecedores_db if str(f.get("nome") or "").strip()]
+                        if cp_d_forn_atual and cp_d_forn_atual not in opcoes_forn_dup_cp:
+                            opcoes_forn_dup_cp = [cp_d_forn_atual] + opcoes_forn_dup_cp
+                        cp_d_forn = d2.selectbox(
+                            "Fornecedor",
+                            options=opcoes_forn_dup_cp,
+                            index=opcoes_forn_dup_cp.index(cp_d_forn_atual) if cp_d_forn_atual in opcoes_forn_dup_cp else None,
+                            placeholder="Selecione o fornecedor",
+                            key=f"cp_d_forn_{cp_id_sel}",
+                        ) or ""
 
                         d3, d4, d5 = st.columns(3)
                         _dup_cat_idx = CATEGORIAS_CP.index(cp_row.get("categoria")) if cp_row.get("categoria") in CATEGORIAS_CP else 0
@@ -10958,7 +11353,17 @@ with aba17:
                     with st.form(f"form_edit_cp_{cp_id_sel}"):
                         e1, e2 = st.columns(2)
                         cp_e_desc = e1.text_input("Descrição", value=cp_row.get("descricao") or "").strip()
-                        cp_e_forn = e2.text_input("Fornecedor", value=cp_row.get("fornecedor") or "").strip()
+                        cp_e_forn_atual = str(cp_row.get("fornecedor") or "").strip()
+                        opcoes_forn_edit_cp = [str(f["nome"]).strip() for f in fornecedores_db if str(f.get("nome") or "").strip()]
+                        if cp_e_forn_atual and cp_e_forn_atual not in opcoes_forn_edit_cp:
+                            opcoes_forn_edit_cp = [cp_e_forn_atual] + opcoes_forn_edit_cp
+                        cp_e_forn = e2.selectbox(
+                            "Fornecedor",
+                            options=opcoes_forn_edit_cp,
+                            index=opcoes_forn_edit_cp.index(cp_e_forn_atual) if cp_e_forn_atual in opcoes_forn_edit_cp else None,
+                            placeholder="Selecione o fornecedor",
+                            key=f"cp_e_forn_{cp_id_sel}",
+                        ) or ""
 
                         e3, e4, e5 = st.columns(3)
                         _cat_idx = CATEGORIAS_CP.index(cp_row.get("categoria")) if cp_row.get("categoria") in CATEGORIAS_CP else 0
@@ -11031,10 +11436,7 @@ with aba_cr:
             st.success(_cr_flash_msg)
             st.toast(_cr_flash_msg, icon="✅")
 
-        with conn() as c:
-            df_cr = pd.read_sql(
-                "SELECT * FROM contas_receber ORDER BY data_vencimento ASC, id DESC", c
-            )
+        df_cr = _carregar_contas_receber_raw()
         df_cr = filtrar_df_por_placas_liberadas(df_cr, "veiculo_placa")
 
         df_cr = _garantir_colunas(df_cr, {
@@ -11090,7 +11492,13 @@ with aba_cr:
                 st.markdown("**Dados da Conta**")
                 ga1, ga2 = st.columns(2)
                 cr_descricao = ga1.text_input("Descrição *", placeholder="Ex: Frete entrega cliente ABC").strip()
-                cr_cliente = ga2.text_input("Cliente *", placeholder="Ex: Empresa ABC Ltda").strip()
+                cr_cliente = ga2.selectbox(
+                    "Cliente *",
+                    options=lista_clientes,
+                    index=None,
+                    placeholder="Selecione o cliente",
+                    key="cr_cliente_form",
+                ) or ""
 
                 gb1, gb2, gb3 = st.columns(3)
                 cr_categoria = gb1.selectbox("Categoria", CATEGORIAS_CR)
@@ -11383,7 +11791,17 @@ with aba_cr:
                     with st.form(f"form_dup_cr_{cr_id_sel}"):
                         dr1, dr2 = st.columns(2)
                         cr_d_desc = dr1.text_input("Descrição", value=cr_row.get("descricao") or "").strip()
-                        cr_d_cli = dr2.text_input("Cliente", value=cr_row.get("cliente") or "").strip()
+                        cr_d_cli_atual = str(cr_row.get("cliente") or "").strip()
+                        opcoes_cli_dup_cr = list(lista_clientes) if isinstance(lista_clientes, list) else []
+                        if cr_d_cli_atual and cr_d_cli_atual not in opcoes_cli_dup_cr:
+                            opcoes_cli_dup_cr = [cr_d_cli_atual] + opcoes_cli_dup_cr
+                        cr_d_cli = dr2.selectbox(
+                            "Cliente",
+                            options=opcoes_cli_dup_cr,
+                            index=opcoes_cli_dup_cr.index(cr_d_cli_atual) if cr_d_cli_atual in opcoes_cli_dup_cr else None,
+                            placeholder="Selecione o cliente",
+                            key=f"cr_d_cli_{cr_id_sel}",
+                        ) or ""
 
                         dr3, dr4, dr5 = st.columns(3)
                         _cr_dup_cat_idx = CATEGORIAS_CR.index(cr_row.get("categoria")) if cr_row.get("categoria") in CATEGORIAS_CR else 0
@@ -11461,7 +11879,17 @@ with aba_cr:
                     with st.form(f"form_edit_cr_{cr_id_sel}"):
                         re1, re2 = st.columns(2)
                         cr_e_desc = re1.text_input("Descrição", value=cr_row.get("descricao") or "").strip()
-                        cr_e_cli = re2.text_input("Cliente", value=cr_row.get("cliente") or "").strip()
+                        cr_e_cli_atual = str(cr_row.get("cliente") or "").strip()
+                        opcoes_cli_edit_cr = list(lista_clientes) if isinstance(lista_clientes, list) else []
+                        if cr_e_cli_atual and cr_e_cli_atual not in opcoes_cli_edit_cr:
+                            opcoes_cli_edit_cr = [cr_e_cli_atual] + opcoes_cli_edit_cr
+                        cr_e_cli = re2.selectbox(
+                            "Cliente",
+                            options=opcoes_cli_edit_cr,
+                            index=opcoes_cli_edit_cr.index(cr_e_cli_atual) if cr_e_cli_atual in opcoes_cli_edit_cr else None,
+                            placeholder="Selecione o cliente",
+                            key=f"cr_e_cli_{cr_id_sel}",
+                        ) or ""
 
                         re3, re4, re5 = st.columns(3)
                         _cr_cat_idx = CATEGORIAS_CR.index(cr_row.get("categoria")) if cr_row.get("categoria") in CATEGORIAS_CR else 0
@@ -11557,9 +11985,8 @@ with aba_fluxo:
                 f"considerando a data de **{fluxo_base}**."
             )
 
-            with conn() as c:
-                df_fluxo_cp = pd.read_sql("SELECT * FROM contas_pagar", c)
-                df_fluxo_cr = pd.read_sql("SELECT * FROM contas_receber", c)
+            df_fluxo_cp = _carregar_contas_pagar_raw()
+            df_fluxo_cr = _carregar_contas_receber_raw()
             df_fluxo_cp = filtrar_df_por_placas_liberadas(df_fluxo_cp, "veiculo_placa")
             df_fluxo_cr = filtrar_df_por_placas_liberadas(df_fluxo_cr, "veiculo_placa")
 
