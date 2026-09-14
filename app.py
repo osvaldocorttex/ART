@@ -12053,6 +12053,111 @@ with aba_fluxo:
             m2.metric("🧾 Contas a Pagar no Período", brl(total_pagar_fluxo), delta=f"{len(df_cp_periodo)} lançamento(s)", delta_color="inverse")
             m3.metric("📌 Saldo do Período", brl(saldo_fluxo), delta="Receber - Pagar", delta_color="normal" if saldo_fluxo >= 0 else "inverse")
 
+            components.html(
+                """
+                <script>
+                (function () {
+                    const doc = window.parent.document;
+                    const tabs = Array.from(doc.querySelectorAll('button[role="tab"]'));
+                    const alvo = tabs.find((tab) => (tab.innerText || '').trim() === '🏠 Dashboard Executivo');
+                    if (!alvo) return;
+                    document.body.innerHTML = `
+                        <button style="width:100%;border:1px solid #2f6f95;border-radius:6px;padding:0.55rem 0.8rem;background:#2f6f95;color:white;font-weight:700;cursor:pointer;font-size:14px;">
+                            🏠 Abrir Dashboard Executivo
+                        </button>`;
+                    document.body.querySelector('button').addEventListener('click', () => alvo.click());
+                })();
+                </script>
+                """,
+                height=44,
+            )
+
+            st.markdown("### 📊 Dashboard do Fluxo de Caixa")
+            st.caption("Visão resumida das entradas, saídas e categorias do período filtrado.")
+
+            df_dashboard_fluxo = []
+            if not df_cr_periodo.empty:
+                df_dashboard_fluxo.append(pd.DataFrame({
+                    "Data": df_cr_periodo[col_data_cr],
+                    "Tipo": "Entrada",
+                    "Categoria": df_cr_periodo["categoria"].fillna("").replace("", "Sem categoria"),
+                    "Valor": df_cr_periodo["valor"],
+                }))
+            if not df_cp_periodo.empty:
+                df_dashboard_fluxo.append(pd.DataFrame({
+                    "Data": df_cp_periodo[col_data_cp],
+                    "Tipo": "Saída",
+                    "Categoria": df_cp_periodo["categoria"].fillna("").replace("", "Sem categoria"),
+                    "Valor": df_cp_periodo["valor"],
+                }))
+
+            if df_dashboard_fluxo:
+                df_dashboard_fluxo = pd.concat(df_dashboard_fluxo, ignore_index=True)
+                df_dashboard_fluxo["Data"] = pd.to_datetime(df_dashboard_fluxo["Data"], errors="coerce")
+                df_dashboard_fluxo["Mês"] = df_dashboard_fluxo["Data"].dt.strftime("%m/%Y")
+
+                mensal_fluxo = (
+                    df_dashboard_fluxo.dropna(subset=["Data"])
+                    .assign(Mês_ordem=lambda df: df["Data"].dt.to_period("M").astype(str))
+                    .groupby(["Mês_ordem", "Mês", "Tipo"], as_index=False)["Valor"].sum()
+                    .sort_values("Mês_ordem")
+                )
+                mensal_fluxo = mensal_fluxo.pivot_table(
+                    index=["Mês_ordem", "Mês"],
+                    columns="Tipo",
+                    values="Valor",
+                    aggfunc="sum",
+                    fill_value=0,
+                ).reset_index()
+                mensal_fluxo["Entrada"] = mensal_fluxo.get("Entrada", 0.0)
+                mensal_fluxo["Saída"] = mensal_fluxo.get("Saída", 0.0)
+                mensal_fluxo["Saldo"] = mensal_fluxo["Entrada"] - mensal_fluxo["Saída"]
+                mensal_fluxo = mensal_fluxo.melt(
+                    id_vars=["Mês_ordem", "Mês"],
+                    value_vars=["Entrada", "Saída", "Saldo"],
+                    var_name="Tipo",
+                    value_name="Valor",
+                )
+                mensal_fluxo["Valor"] = mensal_fluxo["Valor"].round(2)
+                grafico_mensal, grafico_categorias = st.columns([1.6, 1])
+                with grafico_mensal:
+                    fig_mensal_fluxo = px.line(
+                        mensal_fluxo,
+                        x="Mês",
+                        y="Valor",
+                        color="Tipo",
+                        markers=True,
+                        line_shape="spline",
+                        title="Evolução mensal do caixa",
+                        labels={"Valor": "Valor (R$)", "Mês": "Período", "Tipo": "Movimento"},
+                        color_discrete_map={"Entrada": "#45B97C", "Saída": "#F07872", "Saldo": "#4F8FC0"},
+                    )
+                    fig_mensal_fluxo.update_traces(line={"width": 3}, marker={"size": 9})
+                    fig_mensal_fluxo.update_layout(
+                        legend_title_text="",
+                        margin=dict(l=10, r=10, t=55, b=10),
+                        hovermode="x unified",
+                        yaxis={"gridcolor": "#e9eef2", "zeroline": True, "zerolinecolor": "#9aa8b2"},
+                    )
+                    st.plotly_chart(fig_mensal_fluxo, use_container_width=True, config={"displayModeBar": False})
+                with grafico_categorias:
+                    fig_categorias_fluxo = px.bar(
+                        mensal_fluxo,
+                        x="Mês",
+                        y="Valor",
+                        color="Tipo",
+                        text="Valor",
+                        barmode="group",
+                        title="Resumo mês a mês",
+                        labels={"Valor": "Valor (R$)", "Mês": "Período", "Tipo": "Movimento"},
+                        color_discrete_map={"Entrada": "#45B97C", "Saída": "#F07872", "Saldo": "#4F8FC0"},
+                    )
+                    fig_categorias_fluxo.update_traces(texttemplate="R$ %{text:,.2f}", textposition="outside", hovertemplate="%{x} - %{fullData.name}: R$ %{y:,.2f}<extra></extra>")
+                    fig_categorias_fluxo.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=55, b=10), yaxis={"gridcolor": "#e9eef2", "zeroline": True, "zerolinecolor": "#9aa8b2"})
+                    st.plotly_chart(fig_categorias_fluxo, use_container_width=True, config={"displayModeBar": False})
+            else:
+                st.info("Sem dados suficientes para montar os gráficos do dashboard.")
+
             if saldo_fluxo < 0:
                 st.error(f"Saldo negativo no período: **{brl(saldo_fluxo)}**.")
             else:
